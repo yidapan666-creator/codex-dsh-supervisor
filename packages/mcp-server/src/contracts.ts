@@ -27,6 +27,32 @@ const tokenDeltaSchema = z.object({
   cacheWriteTokens: z.number().int(),
 })
 
+/** Bounded summary of edit/write and targeted verification activity since the prior observation. */
+export const editWriteActivitySchema = z.object({
+  edits: z.object({
+    /** Distinct project files touched by successful mutating tool calls. */
+    total: z.number().int().nonnegative(),
+    /** Bounded sample of those file paths, project-focused and sanitized. */
+    files: z.array(z.string()),
+  }),
+  verification: z.object({
+    /** Distinct targeted verification commands attempted (for example `pnpm verify`). */
+    total: z.number().int().nonnegative(),
+    /** Bounded sample of compact command labels. */
+    commands: z.array(z.string()),
+  }),
+})
+export type EditWriteActivity = z.infer<typeof editWriteActivitySchema>
+
+/** Task-scope project activity attached to terminal observations. */
+export const projectActivitySchema = editWriteActivitySchema.extend({
+  steps: z.number().int().nonnegative(),
+  toolCalls: z.number().int().nonnegative(),
+  toolCallsByName: z.record(z.string(), z.number().int().nonnegative()),
+  tokenUsage: tokenDeltaSchema,
+})
+export type ProjectActivity = z.infer<typeof projectActivitySchema>
+
 export const progressHeartbeatSchema = z.object({
   fromAsOfSeq: z.number().int().min(-1),
   toAsOfSeq: z.number().int().min(-1),
@@ -48,6 +74,7 @@ export const progressHeartbeatSchema = z.object({
     step: z.number().int().nonnegative().optional(),
     toolName: z.string().optional(),
   }).optional(),
+  projectActivity: editWriteActivitySchema,
 })
 export type ProgressHeartbeat = z.infer<typeof progressHeartbeatSchema>
 
@@ -88,6 +115,7 @@ export const observationSchema = z.object({
     sessionStats: z.unknown().optional(),
     subagent: z.unknown().optional(),
   }).optional(),
+  projectActivity: projectActivitySchema.optional(),
   progress: progressHeartbeatSchema.optional(),
   asOfSeq: z.number().int().min(-1),
   boundarySeq: z.number().int().min(-1),
@@ -123,6 +151,8 @@ export interface PendingQuestion {
 
 export interface TaskRuntimeState {
   hostInstanceId: string
+  /** Authoritative session cwd, used only to make project-activity paths relative and contained. */
+  cwd?: string
   events: readonly DshEvent[]
   workerState: WorkerState
   pendingApproval?: PendingApproval

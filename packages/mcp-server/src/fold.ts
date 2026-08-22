@@ -1,6 +1,8 @@
+import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import {
   TASK_PACKET_END, TASK_PACKET_START,
-  type DshEvent, type Observation, type ProgressHeartbeat, type TaskPacket, type TaskRuntimeState,
+  type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
+  type ProjectActivity, type TaskPacket, type TaskRuntimeState,
 } from './contracts.js'
 
 function textBlocks(content: unknown): string {
@@ -53,6 +55,158 @@ export function parseTaskPacket(events: readonly DshEvent[]): TaskPacket | undef
  */
 export function taskBoundarySeq(events: readonly DshEvent[]): number | undefined {
   return taskPacketBoundary(events)?.seq
+}
+
+// Project-activity summarization: the compact, bounded view of what a worker
+// changed and verified. It counts distinct file paths from *successful* mutating
+// tool calls (a failed edit did not change the project) and distinct targeted
+// verification commands (a failed verification attempt is still worth reporting).
+// Only sanitized path/label strings are surfaced — never file contents, tool
+// outputs, or full tool arguments.
+
+/** Mutating tools and the argument key that names their target project path. */
+const MUTATING_TOOLS: Record<string, { pathKey: string; mutatingCommands?: ReadonlySet<string> }> = {
+  edit: { pathKey: 'file_path' },
+  write: { pathKey: 'file_path' },
+  str_replace_editor: {
+    pathKey: 'path',
+    mutatingCommands: new Set(['create', 'str_replace', 'insert']),
+  },
+}
+
+/** Command first-tokens treated as targeted verification (build, test, typecheck, lint). */
+const VERIFICATION_TOKENS = new Set([
+  'pnpm', 'npm', 'yarn', 'npx', 'bun', 'deno', 'tsc', 'vitest', 'jest', 'mocha',
+  'eslint', 'prettier', 'make', 'gradle', 'mvn', 'ant', 'cargo', 'go', 'dotnet',
+  'pytest', 'mypy', 'ruff',
+])
+const VERIFICATION_ACTIONS = new Set(['build', 'check', 'lint', 'pack', 'run', 'test', 'typecheck', 'verify'])
+
+const MAX_PATH_LABEL = 200
+const MAX_ACTIVITY_FILES = 10
+const MAX_ACTIVITY_COMMANDS = 5
+const MAX_COMMAND_LABEL = 60
+
+/** Strip control characters and bound the length of any surfaced label. */
+function cleanLabel(value: string, max: number): string | undefined {
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
+  if (cleaned === '') return undefined
+  return cleaned.slice(0, max)
+}
+
+function projectRelativePath(workspaceCwd: string | undefined, raw: string): string | undefined {
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
+  if (cleaned === '' || cleaned.length > 4_096) return undefined
+  if (workspaceCwd === undefined) {
+    if (isAbsolute(cleaned)) return undefined
+    const normalized = normalize(cleaned)
+    if (normalized === '..' || normalized.startsWith(`..${sep}`)) return undefined
+    return cleanLabel(normalized, MAX_PATH_LABEL)
+  }
+  const target = isAbsolute(cleaned) ? cleaned : resolve(workspaceCwd, cleaned)
+  const suffix = relative(workspaceCwd, target)
+  if (suffix === '' || isAbsolute(suffix) || suffix === '..' || suffix.startsWith(`..${sep}`)) return undefined
+  return cleanLabel(suffix, MAX_PATH_LABEL)
+}
+
+function mutatingFilePath(name: string, argsText: string, workspaceCwd: string | undefined): string | undefined {
+  const spec = MUTATING_TOOLS[name]
+  if (spec === undefined) return undefined
+  let args: Record<string, unknown>
+  try { args = JSON.parse(argsText) as Record<string, unknown> } catch { return undefined }
+  if (spec.mutatingCommands !== undefined) {
+    const command = args.command
+    if (typeof command !== 'string' || !spec.mutatingCommands.has(command)) return undefined
+  }
+  const raw = args[spec.pathKey]
+  return typeof raw === 'string' ? projectRelativePath(workspaceCwd, raw) : undefined
+}
+
+function verificationCommandLabel(name: string, argsText: string): string | undefined {
+  if (name !== 'bash') return undefined
+  let args: Record<string, unknown>
+  try { args = JSON.parse(argsText) as Record<string, unknown> } catch { return undefined }
+  const command = args.command
+  if (typeof command !== 'string') return undefined
+  const tokens = command.trim().split(/\s+/)
+  const first = tokens[0]?.toLowerCase()
+  if (first === undefined || !VERIFICATION_TOKENS.has(first)) return undefined
+  // Never copy a full shell command into model context. Keep only the known
+  // verification executable and, when present, one generic action verb.
+  const action = tokens.slice(1).map(token => token.toLowerCase()).find(token => VERIFICATION_ACTIONS.has(token))
+  return cleanLabel(action === undefined ? first : `${first} ${action}`, MAX_COMMAND_LABEL)
+}
+
+/** callIds whose first correlated tool/result succeeded, indexed once per scope. */
+function successfulCallIds(events: readonly DshEvent[], fromSeq: number, toSeq: number): Set<string> {
+  const okById = new Map<string, boolean>()
+  for (const event of events) {
+    if (event.seq < fromSeq || event.seq > toSeq) continue
+    if (event.type !== 'tool/result') continue
+    const data = event.data as {
+      message?: { source?: { callId?: unknown }; content?: Array<{ type?: unknown; isError?: unknown }> }
+      error?: unknown
+    }
+    const callId = data.message?.source?.callId
+    if (typeof callId !== 'string' || okById.has(callId)) continue
+    const resultBlock = data.message?.content?.find(block => block.type === 'tool-result')
+    okById.set(callId, data.error === undefined && resultBlock?.isError === false)
+  }
+  const successful = new Set<string>()
+  for (const [callId, ok] of okById) if (ok) successful.add(callId)
+  return successful
+}
+
+/**
+ * Compact project-activity summary over events in [fromSeq, toSeq]: distinct
+ * project files touched by successful edit/write calls, distinct targeted
+ * verification commands, completed steps, tool-call totals, and token usage.
+ * All surfaced strings are bounded and sanitized; no payloads or outputs.
+ */
+export function projectActivityIn(
+  events: readonly DshEvent[],
+  fromSeq: number,
+  toSeq: number,
+  workspaceCwd?: string,
+): ProjectActivity {
+  const successful = successfulCallIds(events, fromSeq, toSeq)
+  const editFiles = new Set<string>()
+  const verificationCommands = new Set<string>()
+  let steps = 0
+  let toolCalls = 0
+  const toolCallsByName: Record<string, number> = {}
+  for (const event of events) {
+    if (event.seq < fromSeq || event.seq > toSeq) continue
+    if (event.type === 'step/end') {
+      steps += 1
+      continue
+    }
+    if (event.type !== 'tool/call') continue
+    toolCalls += 1
+    const data = event.data as { name?: unknown; arguments?: unknown; callId?: unknown }
+    const name = typeof data.name === 'string' ? data.name : 'unknown'
+    toolCallsByName[name] = (toolCallsByName[name] ?? 0) + 1
+    if (typeof data.arguments !== 'string') continue
+    if (typeof data.callId === 'string' && successful.has(data.callId)) {
+      const path = mutatingFilePath(name, data.arguments, workspaceCwd)
+      if (path !== undefined) editFiles.add(path)
+    }
+    const command = verificationCommandLabel(name, data.arguments)
+    if (command !== undefined) verificationCommands.add(command)
+  }
+  return {
+    edits: { total: editFiles.size, files: [...editFiles].slice(0, MAX_ACTIVITY_FILES) },
+    verification: { total: verificationCommands.size, commands: [...verificationCommands].slice(0, MAX_ACTIVITY_COMMANDS) },
+    steps,
+    toolCalls,
+    toolCallsByName,
+    tokenUsage: subtractTokens(tokensAt(events, toSeq), tokensAt(events, fromSeq)),
+  }
+}
+
+/** The delta-scoped edit/write + verification summary used by the heartbeat. */
+function editWriteActivity(activity: ProjectActivity): EditWriteActivity {
+  return { edits: activity.edits, verification: activity.verification }
 }
 
 interface TokenBuckets {
@@ -179,6 +333,7 @@ export function progressHeartbeat(state: TaskRuntimeState, requestedFromAsOfSeq:
     lastActivity = activityFor(event, toolNames)
     if (lastActivity !== undefined) break
   }
+  const activity = projectActivityIn(state.events, fromAsOfSeq, asOfSeq, state.cwd)
   return {
     fromAsOfSeq,
     toAsOfSeq: asOfSeq,
@@ -188,7 +343,8 @@ export function progressHeartbeat(state: TaskRuntimeState, requestedFromAsOfSeq:
       delta: delta.filter(event => event.type === 'step/end').length,
     },
     tools: { totalCalls: toolCalls.length, deltaCalls: deltaToolCalls.length, deltaByName },
-    tokenDelta: subtractTokens(tokensAt(state.events, asOfSeq), tokensAt(state.events, fromAsOfSeq)),
+    tokenDelta: activity.tokenUsage,
+    projectActivity: editWriteActivity(activity),
     ...lastActivity === undefined ? {} : { lastActivity },
   }
 }
@@ -268,6 +424,7 @@ function handoffObservation(
       files: Array.isArray(args.files) ? args.files.filter((item): item is string => typeof item === 'string') : [],
       verification: Array.isArray(args.verification) ? args.verification as Observation['verification'] : [],
       artifacts: output.artifacts as Observation['artifacts'],
+      projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
       ...typeof args.blocker === 'string' ? { blocker: args.blocker } : {},
       ...typeof args.failureSignature === 'string' ? { failureSignature: args.failureSignature } : {},
       ...Array.isArray(args.attemptedHypotheses)
@@ -314,6 +471,7 @@ function exhaustedFailureObservation(
       boundarySeq: turnEnd.seq,
       stage: 'recovery-budget-exhausted',
       summary: `Reported failure recovery budget exhausted (${String(output.count)}/${String(output.budget)}).`,
+      projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
       ...typeof output.failureSignature === 'string' ? { failureSignature: output.failureSignature } : {},
     }
   }

@@ -20,9 +20,7 @@ export interface HostLaunchConfig {
   cwd?: string
 }
 
-export interface SessionSnapshot extends TaskRuntimeState {
-  cwd?: string | undefined
-}
+export type SessionSnapshot = TaskRuntimeState
 
 function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; error: { code: string; message: string } } }): T {
   if (!response.result.ok) throw new Error(`${response.result.error.code}: ${response.result.error.message}`)

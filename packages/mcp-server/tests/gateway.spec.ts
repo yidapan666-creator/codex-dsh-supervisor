@@ -1,9 +1,10 @@
 import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import { GatewayManager, attachChildObservations, resolveWriterDomain } from '../src/gateway.js'
+import { DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveWriterDomain } from '../src/gateway.js'
 import { HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
@@ -187,5 +188,108 @@ describe('writer admission', () => {
       manager.task({ taskId: 's2', objective: 'write two' }),
     ])
     expect(results.every(result => result.status === 'fulfilled')).toBe(true)
+  })
+})
+
+describe('Web-visible task identity', () => {
+  it('puts the human objective before the durable packet so DSH Web shows a useful title', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    await manager.task({ taskId: 's1', objective: 'Improve progress observability', writerMode: 'read_only' })
+    const queued = api.rows.get('s1')?.events.at(-1)
+    const text = ((queued?.data as { content?: Array<{ text?: string }> } | undefined)?.content ?? [])
+      .map(block => block.text ?? '').join('\n')
+    expect(text.startsWith('Improve progress observability\n\n')).toBe(true)
+    expect(text).toContain(TASK_PACKET_START)
+  })
+})
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+const s1Packet = (seq: number): DshEvent => event('user/message', seq, {
+  content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify({
+    schemaVersion: 1, taskId: 's1', completionToken: 'token', objective: 'ship it', writerMode: 'writer',
+  })}\n${TASK_PACKET_END}` }],
+})
+const toolCall = (seq: number, callId: string, name: string, args: object): DshEvent =>
+  event('tool/call', seq, { turn: 1, step: 1, callId, name, arguments: JSON.stringify(args) })
+const toolResult = (seq: number, callId: string): DshEvent =>
+  event('tool/result', seq, {
+    turn: 1, step: 1,
+    message: { source: { callId }, content: [{ type: 'tool-result', isError: false, content: [] }] },
+  })
+
+/** A fully completed session whose packet names 's1': valid handoff + turn end. */
+function s1CompletedEvents(): DshEvent[] {
+  const args = {
+    taskId: 's1', completionToken: 'token', status: 'completed', stage: 'done', summary: 'verified', files: [], verification: [],
+  }
+  return [
+    s1Packet(1),
+    event('turn/start', 2, { turn: 1 }),
+    toolCall(3, 'c1', 'supervisor_handoff', args),
+    event('tool/result', 4, {
+      turn: 1, step: 1,
+      message: { source: { callId: 'c1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, artifacts: [] }) }] }] },
+    }),
+    event('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+}
+
+describe('wait cadence', () => {
+  it('defaults the wait window to the five-minute aggregated cadence', () => {
+    expect(DEFAULT_WAIT_TIMEOUT_MS).toBe(300_000)
+  })
+
+  it('does not return early on ordinary progress; it aggregates at the window boundary', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [s1Packet(1)] })
+    const manager = managerWith(api, sameDomain)
+    const started = Date.now()
+    const pending = manager.wait({ taskId: 's1', timeoutMs: 150 })
+    await sleep(30)
+    // Ordinary event churn arrives while waiting: a running turn, a successful
+    // edit, and a completed step. The old behavior returned immediately with
+    // WAITING/PROGRESS; the cadence must wait out the window instead.
+    api.setEvents('s1', [
+      s1Packet(1),
+      event('turn/start', 2, { turn: 1 }),
+      toolCall(3, 'e1', 'edit', { file_path: 'src/a.ts', old_string: 'x', new_string: 'y' }),
+      toolResult(4, 'e1'),
+      event('step/end', 5, { turn: 1, step: 1 }),
+    ])
+    const observed = await pending
+    expect(Date.now() - started).toBeGreaterThanOrEqual(120)
+    expect(observed.status).toBe('WAITING')
+    expect(observed.workerState).toBe('IDLE')
+    expect(observed.wait).toEqual({ reason: 'TIMEOUT', timeoutMs: 150 })
+    expect(observed.progress?.projectActivity).toEqual({
+      edits: { total: 1, files: ['src/a.ts'] },
+      verification: { total: 0, commands: [] },
+    })
+    expect(observed.progress?.steps).toEqual({ completed: 1, delta: 1 })
+  })
+
+  it('returns immediately for a terminal completed state', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1CompletedEvents() })
+    const manager = managerWith(api, sameDomain)
+    const started = Date.now()
+    const observed = await manager.wait({ taskId: 's1', timeoutMs: 5_000 })
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(observed.status).toBe('COMPLETED')
+    expect(observed.projectActivity).toMatchObject({ toolCalls: 1, steps: 0 })
+  })
+
+  it('returns immediately for a pending approval', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [s1Packet(1), event('turn/start', 2, { turn: 1 })] })
+    const manager = managerWith(api, sameDomain)
+    api.pushMux({ rpcId: 'r1', payload: { type: 'approval/requested', sessionId: 's1', approvalId: 'a1', toolName: 'terminal' } } as unknown as RpcRequest<MuxFrame>)
+    await sleep(30)
+    const started = Date.now()
+    const observed = await manager.wait({ taskId: 's1', timeoutMs: 5_000 })
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(observed.status).toBe('APPROVAL_REQUIRED')
   })
 })

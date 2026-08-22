@@ -17,7 +17,9 @@ dsh plugin --profile web add $(pwd)/packages/dsh-supervisor-tools
 dsh web --host 127.0.0.1 --port 8080 --no-open
 ```
 
-Copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path. Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
+Copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
+
+`DSH_HOST_LAUNCH` must be explicitly configured for automatic Host startup. It is optional JSON such as `{"argv":["dsh","web","--host","127.0.0.1","--port","8080","--no-open"]}`. When absent, a connection failure never launches a Host (start DSH yourself, as in the command above). When present, launch is detached with ignored stdio, and MCP never retains a kill capability.
 
 ## Development against the unreleased DSH network-client seam
 
@@ -29,7 +31,11 @@ node scripts/link-local-dsh.mjs /path/to/deepseek-harness
 
 The link is local-only; no machine path is committed into package metadata. The `dist/cli.js` entry probes the seam first and prints this explanation instead of a raw module-resolution error when it is missing. Once the public DSH client additions are released, a normal package install replaces the link.
 
-`DSH_HOST_LAUNCH` is optional JSON such as `{"argv":["dsh","web","--host","127.0.0.1","--port","8080","--no-open"]}`. When absent, connection failure never launches a Host. When present, launch is detached with ignored stdio, and MCP never retains a kill capability.
+## Supervision cadence
+
+`dsh_wait` runs a five-minute aggregated progress cadence: by default it returns about one observation every 300000 ms, and it returns early only for a material supervisor boundary — for example a terminal state, approval/question, checkpoint, blocker, or escalation. Ordinary event churn never triggers rapid repeated wait calls. Each cadence observation aggregates progress since the previous `asOfSeq` — step delta, tool counts, token deltas — plus a compact, bounded `projectActivity` summary of the distinct project files touched by successful edits/writes and the targeted verification commands attempted (for example `pnpm verify`). Terminal observations carry the task-scope totals. No raw logs, diffs, or tool outputs are ever included.
+
+The queued prompt starts with the human-readable objective and embeds the durable task packet afterward. This keeps protocol validation unchanged while making new supervised sessions recognizable by task name in the DSH Web sidebar.
 
 ## Release status
 

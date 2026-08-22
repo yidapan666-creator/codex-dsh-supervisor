@@ -25,8 +25,12 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
     capabilities: { tools: {} },
     instructions: 'Supervise DSH root sessions through these lifecycle tools. Accept COMPLETED only when dsh_wait '
       + 'returns it: the runtime requires a valid matching supervisor_handoff result followed by that turn ending. '
-      + 'Carry asOfSeq into afterAsOfSeq only as an observation cursor; DSH since is not a resume cursor. Distinguish '
-      + 'WAITING progress from timeout and from workerState; surface compact progress to the user and recap steps, tools, and token deltas at terminal state. '
+      + 'Carry asOfSeq into afterAsOfSeq only as an observation cursor; DSH since is not a resume cursor. '
+      + 'dsh_wait runs the five-minute aggregated cadence: one observation about every 300000 ms, returning early only '
+      + 'for a material supervisor boundary (for example terminal, approval/question, checkpoint, blocker, or escalation). A WAITING/TIMEOUT return carries aggregated '
+      + 'progress — step/tool/token deltas plus compact project edit/verification activity — since the prior observation; do not '
+      + 're-poll on ordinary event churn. Surface compact progress to the user and recap steps, tools, token deltas, project activity, '
+      + 'and verification results at terminal state. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
       + 'or take over completed child work. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '
       + 'Never stop the independently owned DSH Host. '
@@ -52,7 +56,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.task(input)))
 
   server.registerTool('dsh_wait', {
-    description: 'Wait for a boundary or compact progress heartbeat. Surface progress to the user; terminal reports must recap steps, tools, and token deltas. afterAsOfSeq is only an observation cursor, never DSH since.',
+    description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early only for a material supervisor boundary, such as terminal state, approval/question, checkpoint, blocker, or escalation. A WAITING/TIMEOUT return is the cadence observation: aggregate progress since afterAsOfSeq, including step/tool/token deltas and compact project edit/verification activity. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',
     inputSchema: z.object({ taskId: z.string(), afterAsOfSeq: z.number().int().min(-1).optional(), timeoutMs: z.number().int().min(0).max(300_000).optional() }),
     outputSchema: observationSchema,
   }, guarded(input => manager.wait(input)))

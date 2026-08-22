@@ -85,6 +85,9 @@ export interface GatewayConfig {
   defaultReasoningEffort?: string
 }
 
+/** The five-minute aggregated progress cadence used by {@link GatewayManager.wait}. */
+export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
+
 export class GatewayManager {
   private readonly connections = new Map<string, HostConnection>()
   private readonly knownUrls: string[]
@@ -262,8 +265,11 @@ export class GatewayManager {
       ...input.verification === undefined ? {} : { verification: input.verification },
       ...input.escalationConditions === undefined ? {} : { escalationConditions: input.escalationConditions },
     }
-    const prompt = `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
-      + `${input.objective}\n\n`
+    // Put the human objective first so DSH Web gives the session a meaningful
+    // title instead of "<dsh-supervised-task>…". The durable packet remains in
+    // the same message and parseTaskPacket deliberately accepts it anywhere.
+    const prompt = `${input.objective}\n\n`
+      + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
       + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching taskId '
       + 'and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
       + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature.'
@@ -300,7 +306,11 @@ export class GatewayManager {
   }
 
   async wait(input: { taskId: string; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
-    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 30_000, 0), 300_000)
+    // The default is the five-minute aggregated progress cadence: ordinary event
+    // churn never returns early, so the supervisor issues about one long dsh_wait
+    // observation per window. Only a material boundary (terminal state, approval,
+    // question, checkpoint, blocker, escalation) returns before the window expires.
+    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, 0), 300_000)
     const connection = await this.locate(input.taskId)
     const deadline = Date.now() + timeoutMs
     let progressFromAsOfSeq = input.afterAsOfSeq
@@ -323,7 +333,6 @@ export class GatewayManager {
       progressFromAsOfSeq ??= observation.asOfSeq
       const observed = progressObservation(observation, snapshot, progressFromAsOfSeq)
       if (observation.status !== 'WAITING') return observed
-      if (observation.asOfSeq > progressFromAsOfSeq) return observed
       const remaining = deadline - Date.now()
       if (remaining <= 0) return timeoutObservation(observed, timeoutMs)
       await connection.waitForChange(Math.min(remaining, 1_000))

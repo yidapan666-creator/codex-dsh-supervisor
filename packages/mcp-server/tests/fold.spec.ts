@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { deriveObservation, progressHeartbeat, progressObservation, timeoutObservation } from '../src/fold.js'
-import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type TaskRuntimeState } from '../src/contracts.js'
+import { deriveObservation, progressHeartbeat, progressObservation, projectActivityIn, timeoutObservation } from '../src/fold.js'
+import { observationSchema, progressHeartbeatSchema, TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type TaskRuntimeState } from '../src/contracts.js'
 
 const packet = { schemaVersion: 1, taskId: 's1', completionToken: 'token', objective: 'ship it', writerMode: 'writer' }
 const event = (type: string, seq: number, data: unknown): DshEvent => ({ type, seq, time: seq, data })
@@ -149,6 +149,10 @@ describe('authoritative completion fold', () => {
         cacheReadTokens: 0,
         cacheWriteTokens: 1,
       },
+      projectActivity: {
+        edits: { total: 0, files: [] },
+        verification: { total: 0, commands: [] },
+      },
       lastActivity: { seq: 7, time: 7, kind: 'step', step: 1 },
     })
     expect(progressObservation(deriveObservation(runtime), runtime, 3)).toMatchObject({
@@ -162,5 +166,159 @@ describe('authoritative completion fold', () => {
     const observed = progressObservation(deriveObservation(runtime), runtime, 0)
     expect(observed.wait).toBeUndefined()
     expect(timeoutObservation(observed, 50).wait).toEqual({ reason: 'TIMEOUT', timeoutMs: 50 })
+  })
+})
+
+describe('project activity summarization', () => {
+  const toolCall = (seq: number, callId: string, name: string, args: object): DshEvent =>
+    event('tool/call', seq, { turn: 1, step: 1, callId, name, arguments: JSON.stringify(args) })
+  const toolResult = (seq: number, callId: string, ok = true): DshEvent =>
+    event('tool/result', seq, {
+      turn: 1, step: 1,
+      message: { source: { callId }, content: [{ type: 'tool-result', isError: !ok, content: [] }] },
+    })
+
+  it('counts distinct successful edit/write paths and targeted verification commands', () => {
+    const events = [
+      toolCall(1, 'e1', 'edit', { file_path: 'packages/a/src/x.ts', old_string: 'a', new_string: 'b' }),
+      toolResult(2, 'e1'),
+      toolCall(3, 'e2', 'write', { file_path: 'packages/a/src/y.ts', content: 'body' }),
+      toolResult(4, 'e2'),
+      toolCall(5, 'e3', 'edit', { file_path: 'packages/a/src/x.ts', old_string: 'b', new_string: 'c' }),
+      toolResult(6, 'e3'),
+      // A failed edit is a tool call but not a project change.
+      toolCall(7, 'e4', 'edit', { file_path: 'packages/b/broken.ts', old_string: 'x', new_string: 'y' }),
+      toolResult(8, 'e4', false),
+      toolCall(9, 'v1', 'bash', { command: 'pnpm verify' }),
+      toolResult(10, 'v1'),
+      toolCall(11, 'v2', 'bash', { command: 'vitest run packages/a' }),
+      toolResult(12, 'v2'),
+      // git status is not targeted verification.
+      toolCall(13, 'v3', 'bash', { command: 'git status' }),
+      toolResult(14, 'v3'),
+      // Reads are not project changes.
+      toolCall(15, 'r1', 'read', { file_path: 'packages/a/src/x.ts' }),
+      toolResult(16, 'r1'),
+      event('step/end', 17, { turn: 1, step: 2 }),
+    ]
+    const activity = projectActivityIn(events, 1, 17)
+    expect(activity.edits).toEqual({ total: 2, files: ['packages/a/src/x.ts', 'packages/a/src/y.ts'] })
+    expect(activity.verification).toEqual({ total: 2, commands: ['pnpm verify', 'vitest run'] })
+    expect(activity.steps).toBe(1)
+    expect(activity.toolCalls).toBe(8)
+    expect(activity.toolCallsByName).toEqual({ edit: 3, write: 1, bash: 3, read: 1 })
+    expect(activity.tokenUsage).toEqual({ uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })
+  })
+
+  it('counts str_replace_editor mutations but not views as edits', () => {
+    const events = [
+      toolCall(1, 's1', 'str_replace_editor', { command: 'str_replace', path: 'src/main.ts', old_str: 'a', new_str: 'b' }),
+      toolResult(2, 's1'),
+      toolCall(3, 's2', 'str_replace_editor', { command: 'view', path: 'src/main.ts' }),
+      toolResult(4, 's2'),
+      toolCall(5, 's3', 'str_replace_editor', { command: 'create', path: 'src/new.ts', file_text: 'x' }),
+      toolResult(6, 's3'),
+    ]
+    const activity = projectActivityIn(events, 1, 6)
+    expect(activity.edits).toEqual({ total: 2, files: ['src/main.ts', 'src/new.ts'] })
+    expect(activity.toolCalls).toBe(3)
+  })
+
+  it('fails closed on result blocks marked isError even without a top-level error', () => {
+    const events = [
+      toolCall(1, 'e1', 'edit', { file_path: 'src/rejected.ts', old_string: 'a', new_string: 'b' }),
+      toolResult(2, 'e1', false),
+    ]
+    expect(projectActivityIn(events, 1, 2).edits).toEqual({ total: 0, files: [] })
+  })
+
+  it('keeps surfaced edit paths relative to the authoritative cwd and rejects escapes', () => {
+    const events = [
+      toolCall(1, 'e1', 'edit', { file_path: '/repo/src/inside.ts', old_string: 'a', new_string: 'b' }),
+      toolResult(2, 'e1'),
+      toolCall(3, 'e2', 'edit', { file_path: '../outside.ts', old_string: 'a', new_string: 'b' }),
+      toolResult(4, 'e2'),
+      toolCall(5, 'e3', 'write', { file_path: '/private/secret.txt', content: 'x' }),
+      toolResult(6, 'e3'),
+    ]
+    expect(projectActivityIn(events, 1, 6, '/repo').edits).toEqual({
+      total: 1,
+      files: ['src/inside.ts'],
+    })
+  })
+
+  it('caps the surfaced file and command samples while keeping totals', () => {
+    const events: DshEvent[] = []
+    for (let index = 1; index <= 12; index++) {
+      events.push(toolCall(index * 2 - 1, `e${index}`, 'edit', { file_path: `src/file${index}.ts`, old_string: 'a', new_string: 'b' }))
+      events.push(toolResult(index * 2, `e${index}`))
+    }
+    const activity = projectActivityIn(events, 1, 24)
+    expect(activity.edits.total).toBe(12)
+    expect(activity.edits.files).toHaveLength(10)
+  })
+
+  it('sanitizes labels: control characters stripped and labels bounded', () => {
+    const events = [
+      toolCall(1, 'e1', 'edit', { file_path: 'src/bad\npath\u0000.ts', old_string: 'a', new_string: 'b' }),
+      toolResult(2, 'e1'),
+      toolCall(3, 'v1', 'bash', { command: `pnpm verify ${'x'.repeat(200)}` }),
+      toolResult(4, 'v1'),
+    ]
+    const activity = projectActivityIn(events, 1, 4)
+    expect(activity.edits.files).toEqual(['src/bad path .ts'])
+    expect(activity.verification.commands).toEqual(['pnpm verify'])
+  })
+
+  it('scopes the heartbeat project activity to the delta window', () => {
+    const events = [
+      start,
+      toolCall(1, 'e1', 'edit', { file_path: 'a.ts', old_string: 'x', new_string: 'y' }),
+      toolResult(2, 'e1'),
+      toolCall(3, 'e2', 'write', { file_path: 'b.ts', content: 'z' }),
+      toolResult(4, 'e2'),
+    ]
+    const runtime = state(events, { workerState: 'RUNNING' })
+    const heartbeat = progressHeartbeat(runtime, 2)
+    expect(heartbeat.projectActivity).toEqual({
+      edits: { total: 1, files: ['b.ts'] },
+      verification: { total: 0, commands: [] },
+    })
+  })
+
+  it('attaches task-scope project activity to a terminal handoff observation', () => {
+    const events = [
+      start,
+      event('turn/start', 1, { turn: 1 }),
+      toolCall(2, 'e1', 'edit', { file_path: 'src/gateway.ts', old_string: 'a', new_string: 'b' }),
+      toolResult(3, 'e1'),
+      toolCall(4, 'v1', 'bash', { command: 'pnpm verify' }),
+      toolResult(5, 'v1'),
+      event('tool/call', 6, {
+        turn: 1, step: 2, callId: 'h1', name: 'supervisor_handoff',
+        arguments: JSON.stringify({ taskId: 's1', completionToken: 'token', status: 'completed', stage: 'done', summary: 'verified', files: ['src/gateway.ts'], verification: [] }),
+      }),
+      event('tool/result', 7, {
+        turn: 1, step: 2,
+        message: { source: { callId: 'h1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, artifacts: [] }) }] }] },
+      }),
+      event('turn/end', 8, { turn: 1, reason: { kind: 'completed' } }),
+    ]
+    const observed = deriveObservation(state(events))
+    expect(observed.status).toBe('COMPLETED')
+    expect(observed.projectActivity).toMatchObject({
+      edits: { total: 1, files: ['src/gateway.ts'] },
+      verification: { total: 1, commands: ['pnpm verify'] },
+      steps: 0,
+      toolCalls: 3,
+      toolCallsByName: { edit: 1, bash: 1, supervisor_handoff: 1 },
+    })
+  })
+
+  it('keeps heartbeat and terminal observations valid against the MCP output schemas', () => {
+    const runtime = state(handoffEvents(), { workerState: 'IDLE' })
+    expect(progressHeartbeatSchema.safeParse(progressHeartbeat(runtime, 0)).success).toBe(true)
+    expect(observationSchema.safeParse(deriveObservation(runtime)).success).toBe(true)
+    expect(observationSchema.safeParse(progressObservation(deriveObservation(runtime), runtime, 0)).success).toBe(true)
   })
 })
