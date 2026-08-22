@@ -1,0 +1,14 @@
+[mcp_servers.dsh_gate]
+command = "node"
+args = ["/absolute/path/to/dsh-gate/packages/mcp-server/dist/index.js"]
+startup_timeout_sec = 20
+tool_timeout_sec = 310
+
+[mcp_servers.dsh_gate.tools.dsh_answer_approval]
+approval_mode = "prompt"
+
+[mcp_servers.dsh_gate.env]
+DSH_HOST_URL = "http://127.0.0.1:8080"
+DSH_WORKER_PROVIDER = "deepseek-official"
+DSH_WORKER_MODEL = "deepseek-v4-flash"
+DSH_WORKER_REASONING_EFFORT = "high"

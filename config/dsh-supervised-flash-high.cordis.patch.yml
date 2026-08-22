@@ -1,0 +1,12 @@
+# Apply this as the DSH profile's final patch layer when the local package is
+# installed as a plain dependency rather than through its bundled patch.
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash
+
+- insert:
+    - id: dsh-gate-supervisor-tools
+      name: '@dsh-gate/supervisor-tools'
+      config:
+        maxReportedFailuresPerSignature: 2

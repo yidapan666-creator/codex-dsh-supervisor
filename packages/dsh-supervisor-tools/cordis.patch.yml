@@ -1,0 +1,12 @@
+# Host-plane supervisor protocol tools. The MCP process is only a network
+# client; this bundle remains loaded for the independent DSH Host lifetime.
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash
+
+- insert:
+    - id: dsh-gate-supervisor-tools
+      name: '@dsh-gate/supervisor-tools'
+      config:
+        maxReportedFailuresPerSignature: 2
