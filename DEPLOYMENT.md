@@ -34,7 +34,7 @@ The generic DSH network-client seam does not exist in any published DSH
 release. This project consumes it from a public fork at **exactly one commit**:
 
 - fork: `https://github.com/yidapan666-creator/deepseek-harness.git`
-- commit: `a36bb20300a905e849554451cbc14d02735ed8f6`
+- commit: `7212c955438c70c9a2d168f67e85a8014b8d4488`
 - branch (informational only): `codex/mcp-network-client`
 
 The **commit SHA, never the branch**, is the compatibility contract. Bootstrap

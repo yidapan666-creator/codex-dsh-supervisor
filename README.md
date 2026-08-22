@@ -28,7 +28,7 @@ For the full operator guide — prerequisites, the compatibility contract and up
 `@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, the generic network-client and reconnect-controller exports. Those exports are not part of any published DSH release; they are consumed from the public fork at exactly one commit:
 
 - fork: `https://github.com/yidapan666-creator/deepseek-harness.git`
-- commit: `a36bb20300a905e849554451cbc14d02735ed8f6`
+- commit: `7212c955438c70c9a2d168f67e85a8014b8d4488`
 
 The **commit SHA is the compatibility contract** — bootstrap fetches by SHA (never a moving branch), doctor refuses a checkout whose `HEAD` differs or whose remote does not identify the fork, and a dirty checkout is refused without destructive recovery. The link itself is created by the existing `scripts/link-local-dsh.mjs`, reused by bootstrap; it is local-only, and no machine path is committed into package metadata. `dist/cli.js` probes the seam first and prints a clear diagnostic instead of a raw module-resolution error when it is missing.
 
@@ -48,7 +48,7 @@ The queued prompt starts with the human-readable objective and embeds the durabl
 
 The source is licensed under MIT and prepared for public hosting at `yidapan666-creator/dsh-gate`: the DSH dependency is a public fork commit pinned by SHA, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the bootstrap-managed link. Publication as **npm packages is a separate, still-blocked decision**: both packages keep `"private": true`, and a clean package install cannot build or run until the upstream DSH network-client seam is published (the fork pin works for source deployments, not for registry consumers).
 
-The remaining upstream limitation is npm publication: both packages stay private until the generic `@deepseek-ai/dsh-client-connection/network-client` exports are published upstream. The public fork pin at `a36bb20300a905e849554451cbc14d02735ed8f6` makes source deployments reproducible today; it is not an upstream merge and no merge is claimed.
+The remaining upstream limitation is npm publication: both packages stay private until the generic `@deepseek-ai/dsh-client-connection/network-client` exports are published upstream. The public fork pin at `7212c955438c70c9a2d168f67e85a8014b8d4488` makes source deployments reproducible today; it is not an upstream merge and no merge is claimed.
 
 Source installation, build, tests, packaging checks, and the protocol contract are covered by the documented verification workflow.
 

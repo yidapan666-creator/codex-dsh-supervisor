@@ -9,7 +9,7 @@ pnpm bootstrap   # pinned DSH fork checkout, install, build, link, plugin instal
 pnpm verify      # typecheck + tests + build
 ```
 
-`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, which is not published. The bootstrap fetches the pinned public fork commit (`a36bb20300a905e849554451cbc14d02735ed8f6` — see `DEPLOYMENT.md` for the contract and update policy), builds it, and reuses `scripts/link-local-dsh.mjs` to link the seam into `packages/mcp-server/node_modules`. A development checkout already at the pinned commit can be used directly:
+`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, which is not published. The bootstrap fetches the pinned public fork commit (`7212c955438c70c9a2d168f67e85a8014b8d4488` — see `DEPLOYMENT.md` for the contract and update policy), builds it, and reuses `scripts/link-local-dsh.mjs` to link the seam into `packages/mcp-server/node_modules`. A development checkout already at the pinned commit can be used directly:
 
 ```sh
 node scripts/dsh-gate.mjs bootstrap --dsh-repo /path/to/verified/deepseek-harness

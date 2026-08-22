@@ -25,7 +25,7 @@ export const DSH_FORK_URL = 'https://github.com/yidapan666-creator/deepseek-harn
  * contract; fetching is always by SHA. To update the pin, change this
  * constant, remove the managed checkout, and re-run bootstrap.
  */
-export const DSH_PINNED_COMMIT = 'a36bb20300a905e849554451cbc14d02735ed8f6'
+export const DSH_PINNED_COMMIT = '7212c955438c70c9a2d168f67e85a8014b8d4488'
 
 /** Informational only: the fork branch that carries the pinned commit. */
 export const DSH_FORK_BRANCH = 'codex/mcp-network-client'
