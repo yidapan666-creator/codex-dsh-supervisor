@@ -10,6 +10,7 @@ import {
   type SessionId,
   type SessionSummary,
 } from '@deepseek-ai/dsh-client-connection/network-client'
+import { taskBoundarySeq } from './fold.js'
 import type {
   DshEvent, PendingApproval, PendingQuestion, TaskRuntimeState, WorkerState,
 } from './contracts.js'
@@ -59,7 +60,6 @@ export function launchDetachedHost(config: HostLaunchConfig): Promise<void> {
 }
 
 export class HostConnection {
-  readonly api: IApiClient
   private readonly controller: ConnectionController
   private description: HostDescription | undefined
   private protocolError: string | undefined
@@ -72,8 +72,7 @@ export class HostConnection {
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly questions = new Map<string, PendingQuestion>()
 
-  constructor(readonly baseUrl: string) {
-    this.api = new WebApiClient(baseUrl)
+  constructor(readonly baseUrl: string, readonly api: IApiClient = new WebApiClient(baseUrl)) {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
         this.description = description
@@ -131,9 +130,27 @@ export class HostConnection {
 
   private onHost(envelope: RpcRequest<HostFrame>): void {
     const frame = envelope.payload
-    if (frame.type === 'host/session-status') this.running.set(frame.sessionId, frame.running)
-    if (frame.type === 'host/agent-error') this.hostErrors.set(frame.sessionId, frame.message)
+    if (frame.type === 'host/session-status') {
+      this.running.set(frame.sessionId, frame.running)
+      // The Host observing the agent running again is the authoritative recovery
+      // signal for a previously reported agent error; an idle session keeps it.
+      if (frame.running) this.hostErrors.delete(frame.sessionId)
+    } else if (frame.type === 'host/agent-error') {
+      this.hostErrors.set(frame.sessionId, frame.message)
+    } else if (frame.type === 'host/session-removed') {
+      this.dropSession(frame.sessionId)
+    }
     this.publish()
+  }
+
+  /** Drop all in-memory state for a session the Host no longer tracks. */
+  private dropSession(sessionId: string): void {
+    this.events.delete(sessionId)
+    this.historyAsOf.delete(sessionId)
+    this.running.delete(sessionId)
+    this.hostErrors.delete(sessionId)
+    this.approvals.delete(sessionId)
+    this.questions.delete(sessionId)
   }
 
   async ensureConnected(timeoutMs = 10_000): Promise<HostDescription> {
@@ -176,6 +193,9 @@ export class HostConnection {
     const row = items.find(item => item.sessionId === sessionId)
     if (row === undefined) throw new Error(`DSH session not found: ${sessionId}`)
     this.running.set(sessionId, row.running)
+    // session.list is the Host's current truth: a running row also clears a
+    // sticky agent error that arrived while this client was disconnected.
+    if (row.running) this.hostErrors.delete(sessionId)
     let projections = row.projections
     let beforeSeq: number | undefined
     let hasMore = true
@@ -201,6 +221,13 @@ export class HostConnection {
     }
     if (tailAsOf !== undefined) refreshedHistoryAsOf = Math.max(refreshedHistoryAsOf ?? -1, tailAsOf)
     if (refreshedHistoryAsOf !== undefined) this.historyAsOf.set(sessionId, refreshedHistoryAsOf)
+    // Bound the in-memory cache to the latest supervised task boundary: events
+    // older than it are never used by the fold and can be re-fetched from the
+    // authoritative Host. Sessions without a task packet keep their history.
+    const boundary = taskBoundarySeq([...store.values()])
+    if (boundary !== undefined) {
+      for (const seq of [...store.keys()]) if (seq < boundary) store.delete(seq)
+    }
     const description = await this.ensureConnected()
     const pendingApproval = this.approvals.get(sessionId)
     const pendingQuestion = this.questions.get(sessionId)

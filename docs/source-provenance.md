@@ -14,4 +14,4 @@ The detailed source-backed audit and reuse matrix live in `source-backed-reuse-r
 
 The artifact module identifies its adapted source in a code comment. All other external repositories in the audit are either direct dependencies through their published packages or design/test references; no tmux manager, process supervisor, workspace lock manager, workflow engine, event store, or worktree manager was copied.
 
-Before redistribution, retain the dependency licenses produced by the package manager and the MIT notice for the adapted multiAgents artifact logic. This private workspace does not assign a new license to the surrounding original code.
+Before redistribution, retain the dependency licenses produced by the package manager and the MIT notice for the adapted multiAgents artifact logic. No license has been chosen for the surrounding original code in this repository; an explicit license decision is required before any public release.

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { realpath } from 'node:fs/promises'
+import { lstat, realpath } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { deriveObservation, parseTaskPacket, progressObservation, timeoutObservation } from './fold.js'
 import {
@@ -14,6 +15,41 @@ function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; err
 
 function normalizedUrl(value: string): string {
   return new URL(value).origin
+}
+
+/**
+ * Identity of one writer domain for a cwd. Different subdirectories of the same
+ * Git worktree resolve to the same worktree root, so they share a writer domain;
+ * a non-Git directory falls back to its exact realpath. Cross-process writers are
+ * not serialized here: this resolves identity only within one GatewayManager.
+ */
+export async function resolveWriterDomain(cwd: string): Promise<string> {
+  const resolved = await realpath(cwd)
+  let candidate = resolved
+  while (true) {
+    try {
+      // A normal checkout has a .git directory; a linked worktree has a .git
+      // file. The nearest marker wins, matching Git's nested-worktree boundary.
+      await lstat(join(candidate, '.git'))
+      return candidate
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
+    }
+    const parent = dirname(candidate)
+    if (parent === candidate) break
+    candidate = parent
+  }
+  return resolved
+}
+
+export interface GatewayDependencies {
+  /** Overridable for tests; defaults to {@link resolveWriterDomain}. */
+  resolveWriterDomain?: (cwd: string) => Promise<string>
+  /** Overridable for tests; defaults to a real {@link HostConnection}. */
+  createConnection?: (baseUrl: string) => HostConnection
 }
 
 export function attachChildObservations<T extends { id: string }>(
@@ -52,9 +88,15 @@ export interface GatewayConfig {
 export class GatewayManager {
   private readonly connections = new Map<string, HostConnection>()
   private readonly knownUrls: string[]
+  private readonly resolveDomain: (cwd: string) => Promise<string>
+  private readonly createConnection: (baseUrl: string) => HostConnection
+  /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
+  private admissionTail: Promise<void> = Promise.resolve()
 
-  constructor(private readonly config: GatewayConfig) {
+  constructor(private readonly config: GatewayConfig, deps: GatewayDependencies = {}) {
     this.knownUrls = [...new Set(config.hostUrls.map(normalizedUrl))]
+    this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
+    this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
   }
 
   static fromEnvironment(env: NodeJS.ProcessEnv = process.env): GatewayManager {
@@ -78,7 +120,7 @@ export class GatewayManager {
     const baseUrl = normalizedUrl(url)
     const existing = this.connections.get(baseUrl)
     if (existing !== undefined) return existing
-    const connection = new HostConnection(baseUrl)
+    const connection = this.createConnection(baseUrl)
     this.connections.set(baseUrl, connection)
     if (!this.knownUrls.includes(baseUrl)) this.knownUrls.push(baseUrl)
     return connection
@@ -136,11 +178,21 @@ export class GatewayManager {
   }
 
   private async assertWriterAvailable(connection: HostConnection, taskId: string, cwd: string): Promise<void> {
-    const target = await realpath(cwd)
+    const target = await this.resolveDomain(cwd)
     for (const row of await connection.listSessions()) {
       if (row.sessionId === taskId || row.cwd === undefined) continue
       let candidate: string
-      try { candidate = await realpath(row.cwd) } catch { continue }
+      try {
+        candidate = await this.resolveDomain(row.cwd)
+      } catch (error) {
+        const code = error instanceof Error && 'code' in error
+          ? (error as NodeJS.ErrnoException).code
+          : undefined
+        // A deleted/stale cwd cannot be the current writer domain. Any other
+        // resolution failure is ambiguous, so writer admission fails closed.
+        if (code === 'ENOENT' || code === 'ENOTDIR') continue
+        throw error
+      }
       if (candidate !== target) continue
       const snapshot = await connection.refreshSession(row.sessionId)
       const packet = parseTaskPacket(snapshot.events)
@@ -150,6 +202,22 @@ export class GatewayManager {
         throw new Error(`working tree already has writer session ${row.sessionId}; use read_only or an independent worktree`)
       }
     }
+  }
+
+  /**
+   * Run one writer admission (availability check through durable task packet) while
+   * no other admission for this GatewayManager is in flight. This closes the
+   * in-process check-then-act race: a concurrent writer admission waits until the
+   * previous packet is durable, then observes it. Distinct GatewayManager processes
+   * and distinct Hosts are not serialized.
+   */
+  private async exclusiveWriterAdmission<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const previous = this.admissionTail
+    this.admissionTail = previous.then(() => gate)
+    await previous
+    try { return await fn() } finally { release() }
   }
 
   async task(input: {
@@ -169,8 +237,8 @@ export class GatewayManager {
     const connection = await this.locate(input.taskId)
     const snapshot = await connection.refreshSession(input.taskId)
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
+    const sessionCwd = snapshot.cwd
     const writerMode = input.writerMode ?? 'writer'
-    if (writerMode === 'writer') await this.assertWriterAvailable(connection, input.taskId, snapshot.cwd)
 
     const models = unwrap(await connection.api.sessions.models({ sessionId: input.taskId as SessionId }))
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
@@ -199,27 +267,36 @@ export class GatewayManager {
       + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching taskId '
       + 'and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
       + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature.'
-    unwrap(await connection.api.sessions.prompt({
-      sessionId: input.taskId as SessionId,
-      mode: 'queue',
-      content: [{ type: 'text', text: prompt }],
-    }))
-    const packetDeadline = Date.now() + 10_000
-    let refreshed = await connection.refreshSession(input.taskId)
-    while (parseTaskPacket(refreshed.events)?.completionToken !== packet.completionToken) {
-      if (Date.now() >= packetDeadline) throw new Error('task prompt was accepted but its durable task packet was not observed')
-      await connection.waitForChange(250)
-      refreshed = await connection.refreshSession(input.taskId)
+    const queueAndConfirm = async (): Promise<Record<string, unknown>> => {
+      unwrap(await connection.api.sessions.prompt({
+        sessionId: input.taskId as SessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: prompt }],
+      }))
+      const packetDeadline = Date.now() + 10_000
+      let refreshed = await connection.refreshSession(input.taskId)
+      while (parseTaskPacket(refreshed.events)?.completionToken !== packet.completionToken) {
+        if (Date.now() >= packetDeadline) throw new Error('task prompt was accepted but its durable task packet was not observed')
+        await connection.waitForChange(250)
+        refreshed = await connection.refreshSession(input.taskId)
+      }
+      return {
+        schemaVersion: 1,
+        hostInstanceId: refreshed.hostInstanceId,
+        taskId: input.taskId,
+        objective: input.objective,
+        writerMode,
+        accepted: true,
+        asOfSeq: refreshed.events.at(-1)?.seq ?? -1,
+      }
     }
-    return {
-      schemaVersion: 1,
-      hostInstanceId: refreshed.hostInstanceId,
-      taskId: input.taskId,
-      objective: input.objective,
-      writerMode,
-      accepted: true,
-      asOfSeq: refreshed.events.at(-1)?.seq ?? -1,
+    if (writerMode === 'writer') {
+      return this.exclusiveWriterAdmission(async () => {
+        await this.assertWriterAvailable(connection, input.taskId, sessionCwd)
+        return queueAndConfirm()
+      })
     }
+    return queueAndConfirm()
   }
 
   async wait(input: { taskId: string; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {

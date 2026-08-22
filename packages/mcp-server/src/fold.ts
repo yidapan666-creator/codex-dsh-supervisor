@@ -46,6 +46,15 @@ export function parseTaskPacket(events: readonly DshEvent[]): TaskPacket | undef
   return taskPacketBoundary(events)?.packet
 }
 
+/**
+ * Sequence of the latest durable task-packet boundary, or undefined when the
+ * session history has no valid packet. Used to bound the in-memory event cache:
+ * events older than the boundary are never needed by the fold.
+ */
+export function taskBoundarySeq(events: readonly DshEvent[]): number | undefined {
+  return taskPacketBoundary(events)?.seq
+}
+
 interface TokenBuckets {
   uncachedInputTokens: number
   outputTokens: number

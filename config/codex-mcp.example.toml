@@ -1,6 +1,7 @@
 [mcp_servers.dsh_gate]
 command = "node"
-args = ["/absolute/path/to/dsh-gate/packages/mcp-server/dist/index.js"]
+# Replace <workspace-root> with the absolute path of this checkout.
+args = ["<workspace-root>/packages/mcp-server/dist/cli.js"]
 startup_timeout_sec = 20
 tool_timeout_sec = 310
 

@@ -1,10 +1,15 @@
 # Codex ↔ DeepSeek Harness: source-backed reuse and architecture review
 
-Date: 2026-08-20
+Date: 2026-08-20 (design review; implementation carried out later)
 
-Decision status: proposed; implementation intentionally not started
+Decision status: adopted with deviations — this document is the historical design review. The implementation
+in this repository follows the architecture below (a small MCP translation surface, one independent DSH Web
+Host, durable supervisor handoffs, and a bounded failure budget) with the deviations recorded in the README
+and `docs/protocol.md`: the MCP surface is named `dsh-gate`, the task packet carries `writerMode` instead of
+the proposed `accessMode`, and the DSH-core patch from section M remains a local, unreleased generic
+compatibility patch rather than an upstream merge.
 
-Target workspace: `/Users/yida/Documents/ChatGPT/dsh-gate`
+Target workspace: the repository root (this checkout)
 
 ## Executive decision
 
@@ -16,7 +21,7 @@ Do not use DSH's subprocess SDK JSON-RPC protocol, terminal scraping, Codex App 
 
 ## Audit basis and freshness
 
-- The implementation authority inspected was the actual local checkout at `/Users/yida/deepseek-harness`, branch `master`, commit `47f943859bef60e4160492346772ded9b24f765a`, packages `0.1.0-rc.5`, MIT.
+- The implementation authority inspected was the actual local checkout of the DeepSeek Harness repository, branch `master`, commit `47f943859bef60e4160492346772ded9b24f765a`, packages `0.1.0-rc.5`, MIT.
 - On 2026-08-20, upstream DSH HEAD was `141eb6fef83422698aef7a981029e843e8161534` (`0.1.0-rc.8`). I separately cloned it and rechecked the relevant API, event, subagent, fetch-client, WebSocket-client, reconnect, and repeat-guard files. The integration seams described below are unchanged; upstream still does not publicly expose a configurable remote network client, `host.describe.version` remains a placeholder, and `protocolVersion`/`hostInstanceId` remain reserved rather than implemented.
 - The local checkout is clean but its tracking ref is stale relative to that audited upstream HEAD. After design approval, implementation should first branch from/reconcile to `141eb6f…`, not silently patch the older rc.5 baseline. No fetch, reset, or DSH source change was performed during this review.
 - DSH explicitly describes itself as a rapidly changing developer preview, so the adapter must pin a compatible DSH version and negotiate an API protocol revision rather than assume semver compatibility. [DSH repository](https://github.com/deepseek-ai/deepseek-harness)

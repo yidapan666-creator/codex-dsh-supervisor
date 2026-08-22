@@ -22,8 +22,9 @@ Codex must surface aggregated progress during long runs and repeat root step/too
 
 ## Safety boundaries
 
-- One nonterminal writer task is allowed per real working-tree path. Read-only roots may coexist. Parallel writers require distinct existing Git worktrees; there is no extra workspace lock manager.
-- Artifact admission starts from the authoritative `session.list` cwd, resolves both cwd and target with `realpath`, requires path containment, and rejects absolute paths, traversal, symlinks, hardlinks, and non-regular files before hashing.
+- One nonterminal writer task is allowed per real working tree: the writer domain is the nearest ancestor carrying a `.git` worktree marker, so different subdirectories of one worktree share a domain and linked worktrees remain distinct; a non-Git directory falls back to its exact `realpath`. Read-only roots may coexist. Parallel writers require distinct existing Git worktrees; there is no workspace lock manager. Writer admission (availability check through durable task packet) is serialized within one MCP process, closing the in-process check-then-act race; admission across separate MCP processes or Hosts is not serialized.
+- Artifact admission starts from the authoritative `session.list` cwd, requires path containment, rejects absolute paths, traversal, symlinks, hardlinks, and non-regular files, and hashes through a validated open file handle (so the file fstat'ed is the file hashed) with per-artifact and total byte limits; admission is sequential and never loads an artifact wholly into memory.
+- A reported `host/agent-error` is surfaced as `FAILED/HOST_FAILED` but is not sticky: it is cleared when the Host reports the agent running again, when `session.list` shows the row running, or when the session is removed. The in-memory event cache is pruned to the latest supervised task packet boundary on every refresh, bounding retained history across supervised tasks.
 - The anti-stuck mechanism counts exact worker-reported `failureSignature` values since the latest durable task packet and concludes the turn when the configured recovery budget is exhausted (two reports by default). Semantic equivalence remains the worker's judgment.
 
 ## Telemetry

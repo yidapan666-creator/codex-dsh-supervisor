@@ -4,8 +4,11 @@
   "private": true,
   "type": "module",
   "bin": {
-    "dsh-gate-mcp": "dist/index.js"
+    "dsh-gate-mcp": "dist/cli.js"
   },
+  "files": [
+    "dist"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
