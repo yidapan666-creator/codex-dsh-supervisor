@@ -12,9 +12,8 @@ try {
     ? (error as NodeJS.ErrnoException).code
     : undefined
   const hint = code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND'
-    ? '\n\nThe DSH network-client seam this server needs is not published yet. Until the generic '
-      + 'upstream release lands, run the local development link described in README.md: '
-      + 'pnpm link:dsh -- /path/to/deepseek-harness'
+    ? '\n\nThe DSH network-client seam this server needs is not linked yet. Run the '
+      + 'reproducible bootstrap described in DEPLOYMENT.md: pnpm bootstrap'
     : ''
   process.stderr.write(
     `[dsh-gate] cannot load ${NETWORK_CLIENT_SPECIFIER}: ${error instanceof Error ? error.message : String(error)}${hint}\n`,

@@ -6,8 +6,9 @@ Decision status: adopted with deviations — this document is the historical des
 in this repository follows the architecture below (a small MCP translation surface, one independent DSH Web
 Host, durable supervisor handoffs, and a bounded failure budget) with the deviations recorded in the README
 and `docs/protocol.md`: the MCP surface is named `dsh-gate`, the task packet carries `writerMode` instead of
-the proposed `accessMode`, and the DSH-core patch from section M remains a local, unreleased generic
-compatibility patch rather than an upstream merge.
+the proposed `accessMode`, and the DSH-core patch from section M is consumed as the public fork pin
+`a36bb20300a905e849554451cbc14d02735ed8f6` (see `source-provenance.md` and `DEPLOYMENT.md`) rather than a
+local patch or an upstream merge.
 
 Target workspace: the repository root (this checkout)
 

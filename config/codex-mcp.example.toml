@@ -1,6 +1,17 @@
+# Codex MCP example configuration for dsh-gate.
+#
+# Before using: run `pnpm bootstrap` once inside the dsh-gate checkout (see
+# DEPLOYMENT.md). It fetches the pinned DSH fork commit, builds and links the
+# exact network client, installs the supervisor plugin into the isolated
+# project-local DSH home (`.dsh-state/`), and never starts the DSH Host.
+# `pnpm doctor` verifies the deployment; `pnpm host:start` starts the
+# independent DSH Web Host on http://127.0.0.1:8080.
+#
+# Replace <workspace-root> with the absolute path of this checkout. No other
+# machine-specific value is needed.
+
 [mcp_servers.dsh_gate]
 command = "node"
-# Replace <workspace-root> with the absolute path of this checkout.
 args = ["<workspace-root>/packages/mcp-server/dist/cli.js"]
 startup_timeout_sec = 20
 tool_timeout_sec = 310
@@ -13,3 +24,8 @@ DSH_HOST_URL = "http://127.0.0.1:8080"
 DSH_WORKER_PROVIDER = "deepseek-official"
 DSH_WORKER_MODEL = "deepseek-v4-flash"
 DSH_WORKER_REASONING_EFFORT = "high"
+
+# Optional: let the MCP server auto-launch the Host when it is not reachable.
+# The launch is detached and MCP never retains a kill capability; stop the
+# Host explicitly with `pnpm host:stop`.
+# DSH_HOST_LAUNCH = '{"argv":["node","<workspace-root>/scripts/dsh-gate.mjs","host","start"]}'

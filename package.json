@@ -1,6 +1,12 @@
 {
   "name": "dsh-gate-workspace",
   "private": true,
+  "description": "A thin, durable Codex supervisor bridge for DeepSeek Harness",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git"
+  },
   "type": "module",
   "packageManager": "pnpm@11.19.0",
   "scripts": {
@@ -8,6 +14,11 @@
     "check": "pnpm -r check",
     "test": "vitest run",
     "link:dsh": "node scripts/link-local-dsh.mjs",
+    "bootstrap": "node scripts/dsh-gate.mjs bootstrap",
+    "doctor": "node scripts/dsh-gate.mjs doctor",
+    "host:start": "node scripts/dsh-gate.mjs host start",
+    "host:status": "node scripts/dsh-gate.mjs host status",
+    "host:stop": "node scripts/dsh-gate.mjs host stop",
     "verify": "pnpm check && pnpm test && pnpm build"
   },
   "devDependencies": {

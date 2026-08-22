@@ -4,6 +4,7 @@ dist/
 coverage/
 .dsh-host.json
 .dsh-handoff/
+.dsh-state/
 *.log
 *.tsbuildinfo
 .DS_Store

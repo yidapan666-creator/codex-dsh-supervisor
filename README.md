@@ -6,30 +6,33 @@ The workspace contains:
 
 - `@dsh-gate/mcp-server`: nine MCP tools over DSH's public network client and reconnect controller;
 - `@dsh-gate/supervisor-tools`: DSH-side handoff, artifact admission, and reported-failure budget tools;
-- two narrow operator skills and example Codex/DSH configuration.
+- two narrow operator skills, example Codex/DSH configuration, and a deterministic bootstrap/doctor/Host workflow.
 
-## Build and connect
-
-```sh
-pnpm install
-pnpm build
-dsh plugin --profile web add $(pwd)/packages/dsh-supervisor-tools
-dsh web --host 127.0.0.1 --port 8080 --no-open
-```
-
-Copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
-
-`DSH_HOST_LAUNCH` must be explicitly configured for automatic Host startup. It is optional JSON such as `{"argv":["dsh","web","--host","127.0.0.1","--port","8080","--no-open"]}`. When absent, a connection failure never launches a Host (start DSH yourself, as in the command above). When present, launch is detached with ignored stdio, and MCP never retains a kill capability.
-
-## Development against the unreleased DSH network-client seam
-
-`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, the generic network-client and reconnect-controller exports. Those exports are not yet part of any published DSH release; they currently exist only as a local, uncommitted compatibility patch on a DeepSeek Harness checkout. To build and run against such a checkout:
+## Deploy, verify, and start
 
 ```sh
-node scripts/link-local-dsh.mjs /path/to/deepseek-harness
+pnpm bootstrap      # fetch the pinned DSH fork commit, build & link the exact
+                    # network client, install the supervisor plugin into an
+                    # isolated project-local DSH home (.dsh-state/) — never starts the Host
+pnpm doctor         # verify pin, link, built artifacts, and plugin/profile
+pnpm host:start     # start the independent DSH Web Host on http://127.0.0.1:8080
+pnpm doctor --live  # additionally verify the running Host identity/protocol
 ```
 
-The link is local-only; no machine path is committed into package metadata. The `dist/cli.js` entry probes the seam first and prints this explanation instead of a raw module-resolution error when it is missing. Once the public DSH client additions are released, a normal package install replaces the link.
+Then copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path — the only machine-specific value. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
+
+For the full operator guide — prerequisites, the compatibility contract and update policy, Host independence, browser visibility, clean failure recovery, and the official-upstream-PR limitation — read **`DEPLOYMENT.md`**.
+
+## The pinned DSH fork commit
+
+`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, the generic network-client and reconnect-controller exports. Those exports are not part of any published DSH release; they are consumed from the public fork at exactly one commit:
+
+- fork: `https://github.com/yidapan666-creator/deepseek-harness.git`
+- commit: `a36bb20300a905e849554451cbc14d02735ed8f6`
+
+The **commit SHA is the compatibility contract** — bootstrap fetches by SHA (never a moving branch), doctor refuses a checkout whose `HEAD` differs or whose remote does not identify the fork, and a dirty checkout is refused without destructive recovery. The link itself is created by the existing `scripts/link-local-dsh.mjs`, reused by bootstrap; it is local-only, and no machine path is committed into package metadata. `dist/cli.js` probes the seam first and prints a clear diagnostic instead of a raw module-resolution error when it is missing.
+
+To update the pin: change `DSH_PINNED_COMMIT` in `scripts/dsh-gate-lib.mjs`, remove `.dsh-state/dsh`, and re-run `pnpm bootstrap`. See `DEPLOYMENT.md` for the policy and for why the fork commit is not claimed as an upstream merge.
 
 ## Supervision cadence
 
@@ -43,12 +46,10 @@ The queued prompt starts with the human-readable objective and embeds the durabl
 
 ## Release status
 
-The **source tree is ready for public source hosting** once the two human decisions below land: nothing in this repository depends on a known repository URL, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the documented local development link. Publication as **npm packages is a separate, still-blocked decision**: both packages keep `"private": true`, and a clean `pnpm install` cannot build or run until the upstream DSH seam is published. Known blockers, none of which can be resolved inside this repository:
+The source is licensed under MIT and prepared for public hosting at `yidapan666-creator/dsh-gate`: the DSH dependency is a public fork commit pinned by SHA, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the bootstrap-managed link. Publication as **npm packages is a separate, still-blocked decision**: both packages keep `"private": true`, and a clean package install cannot build or run until the upstream DSH network-client seam is published (the fork pin works for source deployments, not for registry consumers).
 
-1. **License decision (human).** No license has been chosen for this repository's original code. See `docs/source-provenance.md`.
-2. **Repository identity (human).** No public GitHub owner/repository name has been established; nothing here should be cited as the canonical home yet.
-3. **Upstream DSH network-client release (upstream).** Clean package installation cannot build or run until the generic `@deepseek-ai/dsh-client-connection/network-client` exports described above are published by DeepSeek Harness.
+The remaining upstream limitation is npm publication: both packages stay private until the generic `@deepseek-ai/dsh-client-connection/network-client` exports are published upstream. The public fork pin at `a36bb20300a905e849554451cbc14d02735ed8f6` makes source deployments reproducible today; it is not an upstream merge and no merge is claimed.
 
-Everything else — build, tests, packaging, and the protocol contract — is intended to be release-ready once those decisions land.
+Source installation, build, tests, packaging checks, and the protocol contract are covered by the documented verification workflow.
 
 See `docs/protocol.md` for state semantics, `docs/manual-e2e.md` for the acceptance path, `docs/benchmark.md` for the evaluation design, `docs/source-provenance.md` for source and license traceability, and `docs/source-backed-reuse-review.md` for the historical design review. For contributors: `CONTRIBUTING.md`. For vulnerability reporting: `SECURITY.md`.

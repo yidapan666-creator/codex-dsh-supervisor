@@ -2,6 +2,13 @@
   "name": "@dsh-gate/mcp-server",
   "version": "0.1.0",
   "private": true,
+  "description": "MCP supervision bridge from Codex to a durable DeepSeek Harness Host",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git",
+    "directory": "packages/mcp-server"
+  },
   "type": "module",
   "bin": {
     "dsh-gate-mcp": "dist/cli.js"

@@ -5,26 +5,21 @@
 ## Development setup
 
 ```sh
-pnpm install
-pnpm verify   # typecheck + tests + build
+pnpm bootstrap   # pinned DSH fork checkout, install, build, link, plugin install
+pnpm verify      # typecheck + tests + build
 ```
 
-The `@dsh-gate/mcp-server` package imports `@deepseek-ai/dsh-client-connection/network-client`, which is not yet published. Until the upstream DSH release lands, typechecking and building require the local development link described in the README:
+`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, which is not published. The bootstrap fetches the pinned public fork commit (`a36bb20300a905e849554451cbc14d02735ed8f6` — see `DEPLOYMENT.md` for the contract and update policy), builds it, and reuses `scripts/link-local-dsh.mjs` to link the seam into `packages/mcp-server/node_modules`. A development checkout already at the pinned commit can be used directly:
 
 ```sh
-node scripts/link-local-dsh.mjs /path/to/deepseek-harness
+node scripts/dsh-gate.mjs bootstrap --dsh-repo /path/to/verified/deepseek-harness
 ```
 
-Without the link, `pnpm verify` fails at the mcp-server typecheck. This is a known upstream blocker, not a local breakage to "fix" by vendoring DSH source.
+The bootstrap/doctor/Host workflow is documented in `DEPLOYMENT.md`; its focused tests live in `scripts/tests/`.
 
 ## Continuous integration (not enabled yet)
 
-No CI workflow is committed, because none could be green from a clean checkout: `pnpm verify` fails at the mcp-server typecheck until the upstream DSH network-client seam is published. Add a workflow (for example `pnpm install && pnpm verify` on a standard Node runner) exactly when either condition holds:
-
-- a clean checkout passes `pnpm verify` without the local development link; or
-- CI itself runs `node scripts/link-local-dsh.mjs` against an upstream DeepSeek Harness checkout before verifying.
-
-Until then, contributors run `pnpm verify` locally and report results in the handoff `verification` array.
+No CI workflow is committed. A standard Node runner can now make a clean checkout green with `pnpm bootstrap && pnpm verify` — bootstrap needs network access to the fork and the npm registry, and it must not be pointed at a pre-seeded state. Add a workflow when a maintainer confirms CI can reach those endpoints.
 
 ## Handoff and long reports
 
