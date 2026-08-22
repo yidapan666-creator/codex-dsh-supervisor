@@ -4,11 +4,11 @@
    checkout at the pinned commit, `node scripts/dsh-gate.mjs bootstrap
    --dsh-repo /path/to/verified/deepseek-harness`). Confirm `.dsh-state/`
    holds the managed checkout, the isolated `dsh-home`, and `install.json`;
-   confirm `pnpm doctor` passes all offline checks.
+   confirm `pnpm run doctor` passes all offline checks.
 2. Start DSH independently: `pnpm host:start` (spawns
    `dsh web --host 127.0.0.1 --port 8080 --no-open` with the project-local
    `DSH_HOME`). Leave it running; `pnpm host:status` shows the
-   `hostInstanceId`. `pnpm doctor --live` verifies `protocolVersion=1`.
+   `hostInstanceId`. `pnpm run doctor --live` verifies `protocolVersion=1`.
 3. Add the MCP config from `config/codex-mcp.example.toml` to Codex and restart MCP. Replace the `<workspace-root>` placeholder with this checkout's absolute path.
 4. Call `dsh_start_or_connect`, then `dsh_task`, and call `dsh_wait` with the default timeout. Expect about one `WAITING/TIMEOUT` observation per five-minute window, each aggregating `progress` since the previous `asOfSeq` (step delta, tool counts, token deltas, and the compact `projectActivity` edits/verification summary); do not re-poll on ordinary churn. Confirm an approval or a terminal handoff returns immediately, before the window expires. Carry the returned `asOfSeq` into the next `afterAsOfSeq`.
 5. Restart only MCP and call `dsh_start_or_connect` with the existing session id. Confirm the same `hostInstanceId` and transcript return — the Host outlived the MCP restart.

@@ -260,7 +260,7 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
 
   await writeInstallMetadata(paths, steps, gateSha, pnpm)
   log(`bootstrap complete — metadata at ${paths.installJson}`)
-  log(`next: pnpm doctor   (verify the deployment)`)
+  log(`next: pnpm run doctor   (verify the deployment)`)
   log(`      pnpm host:start   (start the independent DSH Web Host on ${DEFAULT_HOST_URL})`)
   return true
 }

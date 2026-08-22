@@ -4,7 +4,7 @@
 # DEPLOYMENT.md). It fetches the pinned DSH fork commit, builds and links the
 # exact network client, installs the supervisor plugin into the isolated
 # project-local DSH home (`.dsh-state/`), and never starts the DSH Host.
-# `pnpm doctor` verifies the deployment; `pnpm host:start` starts the
+# `pnpm run doctor` verifies the deployment; `pnpm host:start` starts the
 # independent DSH Web Host on http://127.0.0.1:8080.
 #
 # Replace <workspace-root> with the absolute path of this checkout. No other

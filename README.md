@@ -14,9 +14,9 @@ The workspace contains:
 pnpm bootstrap      # fetch the pinned DSH fork commit, build & link the exact
                     # network client, install the supervisor plugin into an
                     # isolated project-local DSH home (.dsh-state/) — never starts the Host
-pnpm doctor         # verify pin, link, built artifacts, and plugin/profile
+pnpm run doctor     # verify pin, link, built artifacts, and plugin/profile
 pnpm host:start     # start the independent DSH Web Host on http://127.0.0.1:8080
-pnpm doctor --live  # additionally verify the running Host identity/protocol
+pnpm run doctor --live  # additionally verify the running Host identity/protocol
 ```
 
 Then copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path — the only machine-specific value. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.

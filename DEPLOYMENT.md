@@ -118,9 +118,9 @@ remain in their existing gitignored locations.
 ## Verify with doctor
 
 ```sh
-pnpm doctor                    # all offline checks
-pnpm doctor --live             # also probe a live Host on 127.0.0.1:8080
-pnpm doctor --live --host http://127.0.0.1:9000
+pnpm run doctor                              # all offline checks
+pnpm run doctor --live                      # also probe a live Host on 127.0.0.1:8080
+pnpm run doctor --live --host http://127.0.0.1:9000
 ```
 
 Checks: install metadata, managed checkout (pin + fork identity + clean),
