@@ -34,6 +34,8 @@ Run the narrowest relevant verification after a coherent or high-risk edit batch
 
 Never stop the DSH Host when the MCP task ends. On MCP restart, reconnect to the configured Host and the same session id. Verify artifact hashes and paths from the returned manifest before relying on them.
 
+Worker handoff summaries stay at or below 2048 characters; detailed task reports arrive as admitted artifacts under `.dsh-handoff/<taskId>/` inside the session cwd (gitignored). Do not treat an over-limit summary as a failure to report detail — the worker should shorten the summary and pass the report path in `artifacts`.
+
 Keep authority separated: DSH handles safe local execution, Codex decides material engineering or architecture changes, and the human decides security-sensitive or external side effects.
 
 If the Host cannot be reached, report that connection failure. Do not silently start a Host unless `DSH_HOST_LAUNCH` was explicitly configured.

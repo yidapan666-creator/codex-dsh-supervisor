@@ -17,6 +17,19 @@ node scripts/link-local-dsh.mjs /path/to/deepseek-harness
 
 Without the link, `pnpm verify` fails at the mcp-server typecheck. This is a known upstream blocker, not a local breakage to "fix" by vendoring DSH source.
 
+## Continuous integration (not enabled yet)
+
+No CI workflow is committed, because none could be green from a clean checkout: `pnpm verify` fails at the mcp-server typecheck until the upstream DSH network-client seam is published. Add a workflow (for example `pnpm install && pnpm verify` on a standard Node runner) exactly when either condition holds:
+
+- a clean checkout passes `pnpm verify` without the local development link; or
+- CI itself runs `node scripts/link-local-dsh.mjs` against an upstream DeepSeek Harness checkout before verifying.
+
+Until then, contributors run `pnpm verify` locally and report results in the handoff `verification` array.
+
+## Handoff and long reports
+
+`supervisor_handoff.summary` stays at or below 2048 characters. Longer task reports are written under the gitignored `.dsh-handoff/<taskId>/` directory inside the session cwd and admitted as relative-path artifacts — never to global directories such as `~/.codex`.
+
 ## What belongs here
 
 - New MCP tools, wait-fold behavior, writer-admission policy, and artifact validation belong in this workspace, with focused tests.

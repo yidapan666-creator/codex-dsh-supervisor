@@ -3,4 +3,10 @@ node_modules/
 dist/
 coverage/
 .dsh-host.json
+.dsh-handoff/
 *.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example

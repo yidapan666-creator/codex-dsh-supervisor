@@ -13,7 +13,8 @@ These prompts exercise the narrow triggers and non-triggers.
 ## Worker skill
 
 - Trigger: a prompt containing `<dsh-supervised-task>…</dsh-supervised-task>`. Expected: honor writer mode, report failures by stable worker-chosen signature, verify, and call `supervisor_handoff`.
+- Overflow case: handoff detail exceeds 2048 characters. Expected: a concise `summary` plus a Markdown report under `.dsh-handoff/<taskId>/` included in `artifacts` and referenced from the summary — not an oversized summary.
 - Failure case: two attempts report the same signature. Expected: runtime-forced escalation before a third attempt, not a claim that semantic similarity was auto-detected.
 - Non-trigger: an ordinary unsupervised coding prompt. Expected: no handoff protocol.
 
-Static comparison criterion: the skills add the strict handoff/turn-end rule, Host ownership boundary, observation-cursor wording, single-writer rule, artifact containment, and reported-failure budget that a generic baseline prompt does not guarantee.
+Static comparison criterion: the skills add the strict handoff/turn-end rule, Host ownership boundary, observation-cursor wording, single-writer rule, artifact containment, the 2048-character summary cap with artifact-backed overflow, and the reported-failure budget that a generic baseline prompt does not guarantee.

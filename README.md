@@ -37,14 +37,18 @@ The link is local-only; no machine path is committed into package metadata. The 
 
 The queued prompt starts with the human-readable objective and embeds the durable task packet afterward. This keeps protocol validation unchanged while making new supervised sessions recognizable by task name in the DSH Web sidebar.
 
+## Long handoff details
+
+`supervisor_handoff.summary` is capped at 2048 characters. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<taskId>/` inside the session cwd (the directory is gitignored), pass the relative path in `artifacts`, and reference it from the concise summary. The handoff tool rejects over-limit summaries with exactly this instruction and never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
+
 ## Release status
 
-This repository is not yet releasable in public form. The known blockers, none of which can be resolved inside this repository:
+The **source tree is ready for public source hosting** once the two human decisions below land: nothing in this repository depends on a known repository URL, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the documented local development link. Publication as **npm packages is a separate, still-blocked decision**: both packages keep `"private": true`, and a clean `pnpm install` cannot build or run until the upstream DSH seam is published. Known blockers, none of which can be resolved inside this repository:
 
-1. **Upstream DSH network-client release.** Clean package installation cannot build or run until the generic `@deepseek-ai/dsh-client-connection/network-client` exports described above are published by DeepSeek Harness.
-2. **License decision.** No license has been chosen for this repository's original code. See `docs/source-provenance.md`.
-3. **Repository identity.** No public GitHub repository URL has been established; nothing here should be cited as the canonical home yet.
+1. **License decision (human).** No license has been chosen for this repository's original code. See `docs/source-provenance.md`.
+2. **Repository identity (human).** No public GitHub owner/repository name has been established; nothing here should be cited as the canonical home yet.
+3. **Upstream DSH network-client release (upstream).** Clean package installation cannot build or run until the generic `@deepseek-ai/dsh-client-connection/network-client` exports described above are published by DeepSeek Harness.
 
-Everything else — build, tests, packaging, and the protocol contract — is intended to be release-ready once those three decisions land.
+Everything else — build, tests, packaging, and the protocol contract — is intended to be release-ready once those decisions land.
 
 See `docs/protocol.md` for state semantics, `docs/manual-e2e.md` for the acceptance path, `docs/benchmark.md` for the evaluation design, `docs/source-provenance.md` for source and license traceability, and `docs/source-backed-reuse-review.md` for the historical design review. For contributors: `CONTRIBUTING.md`. For vulnerability reporting: `SECURITY.md`.

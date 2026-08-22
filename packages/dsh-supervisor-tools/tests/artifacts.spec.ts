@@ -94,4 +94,18 @@ describe('artifact admission', () => {
     expect(manifest.map(entry => entry.path)).toEqual(['a.txt', 'b.txt'])
     expect(manifest.reduce((total, entry) => total + entry.bytes, 0)).toBe(9)
   })
+
+  it('admits a long-handoff report under .dsh-handoff/<taskId>/ as a relative artifact', async () => {
+    const root = await tempRoot()
+    const reportDir = join(root, '.dsh-handoff', 'task-123')
+    await mkdir(reportDir, { recursive: true })
+    const content = '# detailed handoff report'
+    await writeFile(join(reportDir, 'report.md'), content)
+    const manifest = await admitArtifacts(root, ['.dsh-handoff/task-123/report.md'])
+    expect(manifest).toHaveLength(1)
+    expect(manifest[0]).toMatchObject({
+      path: '.dsh-handoff/task-123/report.md',
+      bytes: content.length,
+    })
+  })
 })

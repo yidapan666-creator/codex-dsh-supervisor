@@ -1,0 +1,14 @@
+# Normalize line endings and keep text files diffable across platforms.
+* text=auto
+
+*.md text eol=lf
+*.ts text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+
+# The lockfile is machine-generated; collapse it in language statistics.
+pnpm-lock.yaml linguist-generated=true

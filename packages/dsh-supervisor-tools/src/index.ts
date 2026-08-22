@@ -24,6 +24,25 @@ const HANDOFF_STATUSES = [
 ] as const
 const TASK_PACKET_START = '<dsh-supervised-task>'
 
+/** Maximum length of `supervisor_handoff.summary`. Longer reports must become artifacts. */
+export const HANDOFF_SUMMARY_LIMIT = 2_048
+
+/**
+ * Validate the handoff summary length. Returns undefined when the summary is at
+ * or below {@link HANDOFF_SUMMARY_LIMIT}, otherwise an actionable error message
+ * that tells the worker to write the detailed report under `.dsh-handoff/<taskId>/`
+ * inside the session cwd and reference it from a concise summary. The tool never
+ * writes handoff data itself; it only reports how to recover.
+ */
+export function handoffSummaryError(summary: string, taskId?: string): string | undefined {
+  if (summary.length <= HANDOFF_SUMMARY_LIMIT) return undefined
+  const reportDir = taskId === undefined || taskId.trim() === '' ? '.dsh-handoff/<taskId>/' : `.dsh-handoff/${taskId}/`
+  return `supervisor_handoff.summary exceeds ${HANDOFF_SUMMARY_LIMIT} characters (got ${summary.length}). `
+    + `Keep the summary at or below ${HANDOFF_SUMMARY_LIMIT} characters. When more detail is needed, write a `
+    + `Markdown report under ${reportDir} inside the session cwd (the directory is gitignored), include its `
+    + `relative path in the artifacts array, and reference it from the concise summary.`
+}
+
 function contentText(value: unknown): string {
   if (!Array.isArray(value)) return ''
   return value.flatMap((block) => {
@@ -72,6 +91,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     order: 195,
     text: 'You are supervised by an external runtime. Before ending a task, call '
       + '`supervisor_handoff` exactly once with the task id and completion token from the task packet. '
+      + 'Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a '
+      + 'Markdown report under `.dsh-handoff/<taskId>/` inside the session cwd, include its relative path in '
+      + '`artifacts`, and reference it from the concise summary. '
       + 'A normal turn ending without that valid handoff is not success. Report repeated failures through '
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
       + 'whether two failures are semantically the same remains your responsibility.',
@@ -167,7 +189,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args, exec) {
-      if (args.summary.length > 2_048) throw new Error('handoff summary exceeds 2048 characters')
+      const summaryError = handoffSummaryError(args.summary, args.taskId)
+      if (summaryError !== undefined) throw new Error(summaryError)
       if (exec.agent === undefined) throw new Error('supervisor_handoff requires an agent-owned session')
       const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       const handoff = {
