@@ -97,6 +97,7 @@ export const observationSchema = z.object({
     kind: failureKindSchema,
     message: z.string(),
     retryable: z.boolean(),
+    stale: z.boolean().optional(),
   }).optional(),
   wait: z.discriminatedUnion('reason', [
     z.object({ reason: z.literal('TIMEOUT'), timeoutMs: z.number().int().nonnegative() }),
@@ -119,22 +120,58 @@ export const observationSchema = z.object({
   progress: progressHeartbeatSchema.optional(),
   asOfSeq: z.number().int().min(-1),
   boundarySeq: z.number().int().min(-1),
+  sessionId: z.string(),
+  runId: z.string(),
 })
 export type Observation = z.infer<typeof observationSchema>
 
-export interface TaskPacket {
-  schemaVersion: 1
-  taskId: string
-  completionToken: string
-  objective: string
-  writerMode: 'writer' | 'read_only'
-  context?: string
-  allowedScope?: string[]
-  constraints?: string[]
-  acceptanceCriteria?: string[]
-  verification?: string[]
-  escalationConditions?: string[]
-}
+const packetTextSchema = z.string().max(32_768)
+const packetListSchema = z.array(z.string().max(4_096)).max(64)
+
+export const taskPacketV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  taskId: z.string().min(1).max(512),
+  completionToken: z.string().min(1).max(512),
+  objective: z.string().min(1).max(8_192),
+  writerMode: z.enum(['writer', 'read_only']),
+  context: packetTextSchema.optional(),
+  allowedScope: packetListSchema.optional(),
+  constraints: packetListSchema.optional(),
+  acceptanceCriteria: packetListSchema.optional(),
+  verification: packetListSchema.optional(),
+  escalationConditions: packetListSchema.optional(),
+}).strict()
+
+export const taskPacketV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  sessionId: z.string().min(1).max(512),
+  runId: z.string().uuid(),
+  completionToken: z.string().uuid(),
+  objective: z.string().min(1).max(8_192),
+  writerMode: z.enum(['writer', 'read_only']),
+  parentRunId: z.string().uuid().optional(),
+  baseline: z.object({
+    head: z.string().max(256).optional(),
+    statusSummary: z.string().max(4_096),
+  }).strict().optional(),
+  context: packetTextSchema.optional(),
+  allowedScope: packetListSchema.optional(),
+  constraints: packetListSchema.optional(),
+  acceptanceCriteria: packetListSchema.optional(),
+  verification: packetListSchema.optional(),
+  escalationConditions: packetListSchema.optional(),
+  authority: z.object({
+    maxDirectChildren: z.number().int().min(0).max(64).optional(),
+    preAuthorizedActions: packetListSchema.optional(),
+  }).strict().optional(),
+  /** Migration-only alias for workers that still read the v1 taskId field. */
+  taskId: z.string().min(1).max(512).optional(),
+}).strict()
+
+export const taskPacketSchema = z.discriminatedUnion('schemaVersion', [taskPacketV1Schema, taskPacketV2Schema])
+export type TaskPacketV1 = z.infer<typeof taskPacketV1Schema>
+export type TaskPacketV2 = z.infer<typeof taskPacketV2Schema>
+export type TaskPacket = z.infer<typeof taskPacketSchema>
 
 export interface PendingApproval {
   rpcId: string

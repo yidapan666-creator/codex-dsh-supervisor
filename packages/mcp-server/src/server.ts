@@ -31,6 +31,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'progress — step/tool/token deltas plus compact project edit/verification activity — since the prior observation; do not '
       + 're-poll on ordinary event churn. Surface compact progress to the user and recap steps, tools, token deltas, project activity, '
       + 'and verification results at terminal state. '
+      + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
       + 'or take over completed child work. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '
       + 'Never stop the independently owned DSH Host. '
@@ -45,54 +46,68 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.startOrConnect(input)))
 
   server.registerTool('dsh_task', {
-    description: 'Queue a supervised task packet. One writer per working tree is enforced; use an independent worktree for parallel writers.',
+    description: 'Queue one supervised run in a durable session. Returns a unique runId; every later wait/control call must carry sessionId + runId. One writer per working tree is enforced; use an independent worktree for parallel writers.',
     inputSchema: z.object({
-      taskId: z.string(), objective: z.string().min(1), writerMode: z.enum(['writer', 'read_only']).optional(),
+      sessionId: z.string(), taskId: z.string().optional(), objective: z.string().min(1), writerMode: z.enum(['writer', 'read_only']).optional(),
       provider: z.string().optional(), model: z.string().optional(), reasoningEffort: z.string().optional(),
       context: z.string().optional(), allowedScope: z.array(z.string()).optional(), constraints: z.array(z.string()).optional(),
       acceptanceCriteria: z.array(z.string()).optional(), verification: z.array(z.string()).optional(),
       escalationConditions: z.array(z.string()).optional(),
+      parentRunId: z.string().uuid().optional(),
+      baseline: z.object({ head: z.string().optional(), statusSummary: z.string() }).optional(),
+      authority: z.object({
+        maxDirectChildren: z.number().int().min(0).max(64).optional(),
+        preAuthorizedActions: z.array(z.string()).optional(),
+      }).optional(),
     }),
   }, guarded(input => manager.task(input)))
 
   server.registerTool('dsh_wait', {
     description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early only for a material supervisor boundary, such as terminal state, approval/question, checkpoint, blocker, or escalation. A WAITING/TIMEOUT return is the cadence observation: aggregate progress since afterAsOfSeq, including step/tool/token deltas and compact project edit/verification activity. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',
-    inputSchema: z.object({ taskId: z.string(), afterAsOfSeq: z.number().int().min(-1).optional(), timeoutMs: z.number().int().min(0).max(300_000).optional() }),
+    inputSchema: z.object({
+      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
+      afterAsOfSeq: z.number().int().min(-1).optional(), timeoutMs: z.number().int().min(0).max(300_000).optional(),
+    }),
     outputSchema: observationSchema,
   }, guarded(input => manager.wait(input)))
 
   server.registerTool('dsh_steer', {
     description: 'Send explicit user-authored new guidance to the active DSH root. Never use this to relay child completion/results, acknowledge settled children, wake root to take over child work, or synthesize supervisor nudges; DSH Host delivers child reports to root automatically.',
-    inputSchema: z.object({ taskId: z.string(), message: z.string().min(1) }),
-  }, guarded(input => manager.steer(input.taskId, input.message)))
+    inputSchema: z.object({ sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(), message: z.string().min(1) }),
+  }, guarded(input => manager.steer(input)))
 
   server.registerTool('dsh_answer_question', {
     description: 'Answer the current DSH user-question batch as one response.',
     inputSchema: z.object({
-      taskId: z.string(),
+      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
       answers: z.array(z.object({ id: z.string(), selected: z.array(z.string()), custom: z.string().optional() })),
     }),
-  }, guarded(input => manager.answerQuestion(input.taskId, input.answers)))
+  }, guarded(input => manager.answerQuestion(input)))
 
   server.registerTool('dsh_answer_approval', {
     description: 'Resolve the current DSH approval request.',
-    inputSchema: z.object({ taskId: z.string(), outcome: z.enum(['allowed-once', 'rejected']) }),
-  }, guarded(input => manager.answerApproval(input.taskId, input.outcome)))
+    inputSchema: z.object({
+      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
+      outcome: z.enum(['allowed-once', 'rejected']),
+    }),
+  }, guarded(input => manager.answerApproval(input)))
 
   server.registerTool('dsh_cancel', {
     description: 'Cancel the active DSH root turn without stopping the Host.',
-    inputSchema: z.object({ taskId: z.string() }),
-  }, guarded(input => manager.cancel(input.taskId)))
+    inputSchema: z.object({ sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional() }),
+  }, guarded(input => manager.cancel(input)))
 
   server.registerTool('dsh_agents', {
     description: 'Read-only direct-child observability with per-child telemetry. DSH root remains the manager and automatically receives child reports; listing a settled child never authorizes steering root.',
-    inputSchema: z.object({ taskId: z.string() }),
-  }, guarded(input => manager.agents(input.taskId)))
+    inputSchema: z.object({ sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional() }),
+  }, guarded(input => manager.agents(input)))
 
   server.registerTool('dsh_interrupt_agent', {
     description: 'Emergency interrupt for one continuable direct child. Use only on explicit human request or a clear safety/resource emergency, never for routine completion or orchestration; DSH root owns child control.',
-    inputSchema: z.object({ taskId: z.string(), childSessionId: z.string() }),
-  }, guarded(input => manager.interruptAgent(input.taskId, input.childSessionId)))
+    inputSchema: z.object({
+      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(), childSessionId: z.string(),
+    }),
+  }, guarded(input => manager.interruptAgent(input)))
 
   server.server.onclose = () => { manager.stopClients() }
 

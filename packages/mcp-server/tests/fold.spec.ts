@@ -33,6 +33,44 @@ describe('authoritative completion fold', () => {
     expect(complete).toMatchObject({ status: 'COMPLETED', boundarySeq: 4, asOfSeq: 4, taskId: 's1' })
   })
 
+  it('uses the accepted canonical v2 handoff result as the authoritative terminal payload', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+    }
+    const startV2 = event('user/message', 0, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+    })
+    const callArgs = {
+      sessionId: 's1', runId: packetV2.runId, completionToken: packetV2.completionToken,
+      status: 'completed', stage: 'untrusted-call-args', summary: 'call args', files: [], verification: [], artifacts: [],
+    }
+    const canonical = { ...callArgs, stage: 'verified', summary: 'canonical result' }
+    const observed = deriveObservation(state([
+      startV2,
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'v2-handoff', name: 'supervisor_handoff', arguments: JSON.stringify(callArgs),
+      }),
+      event('tool/result', 3, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'v2-handoff' }, content: [{
+          type: 'tool-result',
+          content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff: canonical, artifacts: [] }) }],
+        }] },
+      }),
+      event('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+    ]))
+    expect(observed).toMatchObject({
+      status: 'COMPLETED', sessionId: 's1', runId: packetV2.runId,
+      stage: 'verified', summary: 'canonical result',
+    })
+  })
+
   it('never guesses success from turn/end alone', () => {
     const observed = deriveObservation(state([
       start, event('turn/start', 1, { turn: 1 }), event('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),

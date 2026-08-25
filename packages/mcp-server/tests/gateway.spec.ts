@@ -5,6 +5,7 @@ import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/ne
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
 import { DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveWriterDomain } from '../src/gateway.js'
+import { parseTaskPacket } from '../src/fold.js'
 import { HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
@@ -202,6 +203,83 @@ describe('Web-visible task identity', () => {
       .map(block => block.text ?? '').join('\n')
     expect(text.startsWith('Improve progress observability\n\n')).toBe(true)
     expect(text).toContain(TASK_PACKET_START)
+  })
+
+  it('creates a distinct supervised run id for every task queued in one durable session', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    const firstPacket = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+    const second = await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+    const secondPacket = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+
+    expect(first).toMatchObject({ sessionId: 's1', runId: expect.any(String) })
+    expect(second).toMatchObject({ sessionId: 's1', runId: expect.any(String) })
+    expect(first.runId).not.toBe(second.runId)
+    expect(firstPacket).toMatchObject({ schemaVersion: 2, sessionId: 's1', runId: first.runId })
+    expect(secondPacket).toMatchObject({ schemaVersion: 2, sessionId: 's1', runId: second.runId })
+  })
+
+  it('parses the generated packet when the human objective contains packet-marker prose', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const objective = `Document why ${TASK_PACKET_START} is reserved protocol syntax`
+
+    const result = await manager.task({ sessionId: 's1', objective, writerMode: 'read_only' })
+
+    expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: result.runId,
+      objective,
+    })
+  })
+
+  it('rejects a stale wait instead of observing a newer run in the same session', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    const second = await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+
+    const observed = await manager.wait({
+      sessionId: 's1', runId: first.runId as string, timeoutMs: 0,
+    })
+
+    expect(observed).toMatchObject({
+      sessionId: 's1', runId: second.runId, status: 'FAILED',
+      failure: { kind: 'PROTOCOL_ERROR', stale: true },
+    })
+  })
+
+  it('rejects stale steering before it can append a message to the newer run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    const second = await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+    const before = api.rows.get('s1')?.events.length
+
+    await expect(manager.steer({
+      sessionId: 's1', runId: first.runId as string, message: 'late guidance',
+    })).rejects.toThrow(/stale run/i)
+
+    expect(second.runId).not.toBe(first.runId)
+    expect(api.rows.get('s1')?.events).toHaveLength(before ?? 0)
+  })
+
+  it('rejects a stale cancel before it can cancel the newer run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+
+    await expect(manager.cancel({ sessionId: 's1', runId: first.runId as string }))
+      .rejects.toThrow(/stale run/i)
   })
 })
 

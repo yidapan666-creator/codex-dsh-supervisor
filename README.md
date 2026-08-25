@@ -38,11 +38,13 @@ To update the pin: change `DSH_PINNED_COMMIT` in `scripts/dsh-gate-lib.mjs`, rem
 
 `dsh_wait` runs a five-minute aggregated progress cadence: by default it returns about one observation every 300000 ms, and it returns early only for a material supervisor boundary — for example a terminal state, approval/question, checkpoint, blocker, or escalation. Ordinary event churn never triggers rapid repeated wait calls. Each cadence observation aggregates progress since the previous `asOfSeq` — step delta, tool counts, token deltas — plus a compact, bounded `projectActivity` summary of the distinct project files touched by successful edits/writes and the targeted verification commands attempted (for example `pnpm verify`). Terminal observations carry the task-scope totals. No raw logs, diffs, or tool outputs are ever included.
 
+DSH session identity and supervised execution identity are separate. `dsh_start_or_connect` returns the durable `sessionId`; every `dsh_task` returns a new UUID `runId`. Wait, answer, steer, cancel, child-observation, and interrupt calls carry both values, so a delayed control for an older run is rejected before it can affect a newer turn in the same session.
+
 The queued prompt starts with the human-readable objective and embeds the durable task packet afterward. This keeps protocol validation unchanged while making new supervised sessions recognizable by task name in the DSH Web sidebar.
 
 ## Long handoff details
 
-`supervisor_handoff.summary` is capped at 2048 characters. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<taskId>/` inside the session cwd (the directory is gitignored), pass the relative path in `artifacts`, and reference it from the concise summary. The handoff tool rejects over-limit summaries with exactly this instruction and never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
+`supervisor_handoff.summary` is capped at 2048 characters. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<runId>/` (legacy v1: taskId) inside the session cwd, pass the relative path in `artifacts`, and reference it from the concise summary. The directory is gitignored. The handoff tool rejects over-limit summaries with exactly this instruction and never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
 
 ## Release status
 

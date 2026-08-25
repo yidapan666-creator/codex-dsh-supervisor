@@ -23,6 +23,8 @@ const HANDOFF_STATUSES = [
   'completed', 'blocked', 'major_checkpoint', 'escalation_required', 'failed',
 ] as const
 const TASK_PACKET_START = '<dsh-supervised-task>'
+const TASK_PACKET_END = '</dsh-supervised-task>'
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 /** Maximum length of `supervisor_handoff.summary`. Longer reports must become artifacts. */
 export const HANDOFF_SUMMARY_LIMIT = 2_048
@@ -52,6 +54,80 @@ function contentText(value: unknown): string {
     if (candidate.type === 'tool-result') return [contentText(candidate.content)]
     return []
   }).join('\n')
+}
+
+type HandoffIdentityArgs = {
+  taskId?: string | undefined
+  sessionId?: string | undefined
+  runId?: string | undefined
+  completionToken: string
+}
+
+type TaskIdentity = {
+  schemaVersion: 1 | 2
+  sessionId: string
+  runId?: string | undefined
+  completionToken: string
+}
+
+function latestTaskIdentity(events: readonly { type: string; data: unknown }[]): TaskIdentity | undefined {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (event?.type !== 'user/message') continue
+    const data = event.data as { content?: unknown; message?: { content?: unknown } }
+    const text = contentText(data.content ?? data.message?.content)
+    const end = text.lastIndexOf(TASK_PACKET_END)
+    if (end < 0) continue
+    let before = end
+    while (before >= 0) {
+      const start = text.lastIndexOf(TASK_PACKET_START, before)
+      if (start < 0) break
+      try {
+        const value = JSON.parse(text.slice(start + TASK_PACKET_START.length, end).trim()) as Record<string, unknown>
+        if (value.schemaVersion === 2
+          && typeof value.sessionId === 'string' && value.sessionId.length > 0
+          && typeof value.runId === 'string' && UUID_PATTERN.test(value.runId)
+          && typeof value.completionToken === 'string' && UUID_PATTERN.test(value.completionToken)
+          && typeof value.objective === 'string' && value.objective.length > 0
+          && (value.writerMode === 'writer' || value.writerMode === 'read_only')) {
+          return {
+            schemaVersion: 2,
+            sessionId: value.sessionId,
+            runId: value.runId,
+            completionToken: value.completionToken,
+          }
+        }
+        if (value.schemaVersion === 1
+          && typeof value.taskId === 'string' && value.taskId.length > 0
+          && typeof value.completionToken === 'string' && value.completionToken.length > 0
+          && typeof value.objective === 'string' && value.objective.length > 0
+          && (value.writerMode === 'writer' || value.writerMode === 'read_only')) {
+          return { schemaVersion: 1, sessionId: value.taskId, completionToken: value.completionToken }
+        }
+      } catch { /* Try an earlier opening marker in the same message. */ }
+      before = start - 1
+    }
+  }
+  return undefined
+}
+
+/** Validate a handoff against the latest durable task packet before concluding the turn. */
+export function handoffIdentityError(
+  events: readonly { type: string; data: unknown }[],
+  args: HandoffIdentityArgs,
+): string | undefined {
+  const identity = latestTaskIdentity(events)
+  if (identity === undefined) return 'supervisor_handoff found no valid latest dsh-gate task packet'
+  if (identity.schemaVersion === 2) {
+    if (args.sessionId !== identity.sessionId) return 'supervisor_handoff sessionId does not match the latest task packet'
+    if (args.runId !== identity.runId) return 'supervisor_handoff runId does not match the latest task packet'
+  } else if (args.taskId !== identity.sessionId) {
+    return 'supervisor_handoff taskId does not match the latest task packet'
+  }
+  if (args.completionToken !== identity.completionToken) {
+    return 'supervisor_handoff completionToken does not match the latest task packet'
+  }
+  return undefined
 }
 
 function latestTaskBoundary(events: readonly { type: string; data: unknown }[]): number {
@@ -90,9 +166,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     name: 'tool:supervisor-handoff',
     order: 195,
     text: 'You are supervised by an external runtime. Before ending a task, call '
-      + '`supervisor_handoff` exactly once with the task id and completion token from the task packet. '
+      + '`supervisor_handoff` exactly once. For a schemaVersion 2 packet, pass its sessionId, runId, and completionToken; '
+      + 'for a legacy schemaVersion 1 packet, pass taskId and completionToken. '
       + 'Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a '
-      + 'Markdown report under `.dsh-handoff/<taskId>/` inside the session cwd, include its relative path in '
+      + 'Markdown report under `.dsh-handoff/<runId>/` inside the session cwd, include its relative path in '
       + '`artifacts`, and reference it from the concise summary. '
       + 'A normal turn ending without that valid handoff is not success. Report repeated failures through '
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
@@ -142,10 +219,12 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.tools.register(defineTool({
     name: 'supervisor_handoff',
     description: 'Create the authoritative external-supervisor handoff and conclude this turn. Completion is valid '
-      + 'only when taskId and completionToken match the task packet and this successful tool result is followed by '
+      + 'only when the packet session/run identity and completionToken match and this successful tool result is followed by '
       + 'the corresponding turn/end event.',
     parameters: {
-      taskId: { type: 'string', required: true },
+      taskId: { type: 'string', description: 'Legacy schemaVersion 1 session/task id.' },
+      sessionId: { type: 'string', description: 'SchemaVersion 2 durable DSH session id.' },
+      runId: { type: 'string', description: 'SchemaVersion 2 supervised run id.' },
       completionToken: { type: 'string', required: true },
       status: { type: 'string', required: true, enum: [...HANDOFF_STATUSES] },
       stage: { type: 'string', required: true },
@@ -189,12 +268,16 @@ export function apply(ctx: Context, config: Config = {}): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args, exec) {
-      const summaryError = handoffSummaryError(args.summary, args.taskId)
-      if (summaryError !== undefined) throw new Error(summaryError)
       if (exec.agent === undefined) throw new Error('supervisor_handoff requires an agent-owned session')
+      const identityError = handoffIdentityError(exec.agent.session.events, args)
+      if (identityError !== undefined) throw new Error(identityError)
+      const summaryError = handoffSummaryError(args.summary, args.runId ?? args.taskId)
+      if (summaryError !== undefined) throw new Error(summaryError)
       const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       const handoff = {
-        taskId: args.taskId,
+        ...args.taskId === undefined ? {} : { taskId: args.taskId },
+        ...args.sessionId === undefined ? {} : { sessionId: args.sessionId },
+        ...args.runId === undefined ? {} : { runId: args.runId },
         completionToken: args.completionToken,
         status: args.status,
         stage: args.stage,

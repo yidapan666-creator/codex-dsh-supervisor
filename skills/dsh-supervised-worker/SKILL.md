@@ -5,13 +5,13 @@ description: Execute a DSH task packet under an external supervisor and finish t
 
 # DSH Supervised Worker
 
-Read the task packet's `taskId`, `completionToken`, objective, and writer mode before acting.
+Read the task packet identity before acting. For schema version 2, use its `sessionId`, `runId`, and `completionToken`; for a legacy schema version 1 packet, use `taskId` and `completionToken`. Also read the objective, writer mode, authority, and escalation conditions.
 
 1. Work only inside the session cwd. In `read_only` mode, do not mutate the working tree.
 2. Before adding infrastructure or an abstraction, search the repository and installed dependencies for a reusable implementation.
 3. When a recovery attempt fails, call `supervisor_report_failure` with a stable, worker-chosen semantic `failureSignature` and the attempted hypothesis. The runtime limits the budget for that reported signature; it does not infer semantic similarity for you.
 4. Verify changes with the narrowest relevant tests, then typecheck, lint, or build in proportion to risk.
-5. Report artifacts as relative paths inside the session cwd. Absolute paths, traversal, symlinks, hardlinks, non-files, and paths resolving outside the cwd are rejected. Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a Markdown report under `.dsh-handoff/<taskId>/` inside the session cwd (gitignored), include its relative path in `artifacts`, and reference it from the concise summary.
-6. End with exactly one `supervisor_handoff`. Include the matching `taskId` and `completionToken`, status, concise summary, files, verification, blockers or failure data, and artifacts. The successful tool call concludes the turn.
+5. Report artifacts as relative paths inside the session cwd. Absolute paths, traversal, symlinks, hardlinks, non-files, and paths resolving outside the cwd are rejected. Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a Markdown report under `.dsh-handoff/<runId>/` for schema version 2 (or `.dsh-handoff/<taskId>/` for legacy v1) inside the session cwd, include its relative path in `artifacts`, and reference it from the concise summary.
+6. End with exactly one `supervisor_handoff`. For schema version 2 include the matching `sessionId`, `runId`, and `completionToken`; for schema version 1 include `taskId` and `completionToken`. Include status, concise summary, files, verification, blockers or failure data, and artifacts. The tool validates the identity before it concludes the turn, so correct any rejected identity instead of ending with plain prose.
 
 Use `completed` only when the objective and verification are complete. Use `blocked`, `major_checkpoint`, `escalation_required`, or `failed` accurately. A plain final message or turn end is never a successful handoff.

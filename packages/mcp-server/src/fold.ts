@@ -2,7 +2,7 @@ import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import {
   TASK_PACKET_END, TASK_PACKET_START,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
-  type ProjectActivity, type TaskPacket, type TaskRuntimeState,
+  taskPacketSchema, type ProjectActivity, type TaskPacket, type TaskRuntimeState,
 } from './contracts.js'
 
 function textBlocks(content: unknown): string {
@@ -26,19 +26,21 @@ function taskPacketBoundary(events: readonly DshEvent[]): { packet: TaskPacket; 
     const event = events[index]
     if (event?.type !== 'user/message') continue
     const text = eventText(event)
-    const start = text.indexOf(TASK_PACKET_START)
-    const end = text.indexOf(TASK_PACKET_END, start + TASK_PACKET_START.length)
-    if (start < 0 || end < 0) continue
-    const raw = text.slice(start + TASK_PACKET_START.length, end).trim()
-    try {
-      const value = JSON.parse(raw) as TaskPacket
-      if (value.schemaVersion === 1
-        && typeof value.taskId === 'string'
-        && typeof value.completionToken === 'string'
-        && typeof value.objective === 'string'
-        && (value.writerMode === 'writer' || value.writerMode === 'read_only')) return { packet: value, seq: event.seq }
-    } catch {
-      return undefined
+    // The objective may itself mention either marker, including inside the
+    // serialized JSON. Anchor at the final closing marker and validate each
+    // preceding opening-marker candidate until the strict packet parses.
+    const end = text.lastIndexOf(TASK_PACKET_END)
+    if (end < 0) continue
+    let before = end
+    while (before >= 0) {
+      const start = text.lastIndexOf(TASK_PACKET_START, before)
+      if (start < 0) break
+      const raw = text.slice(start + TASK_PACKET_START.length, end).trim()
+      try {
+        const parsed = taskPacketSchema.safeParse(JSON.parse(raw))
+        if (parsed.success) return { packet: parsed.data, seq: event.seq }
+      } catch { /* Try an earlier opening marker in the same message. */ }
+      before = start - 1
     }
   }
   return undefined
@@ -55,6 +57,14 @@ export function parseTaskPacket(events: readonly DshEvent[]): TaskPacket | undef
  */
 export function taskBoundarySeq(events: readonly DshEvent[]): number | undefined {
   return taskPacketBoundary(events)?.seq
+}
+
+export function taskPacketSessionId(packet: TaskPacket): string {
+  return packet.schemaVersion === 2 ? packet.sessionId : packet.taskId
+}
+
+export function taskPacketRunId(packet: TaskPacket, boundarySeq: number): string {
+  return packet.schemaVersion === 2 ? packet.runId : `legacy-${String(boundarySeq)}`
 }
 
 // Project-activity summarization: the compact, bounded view of what a worker
@@ -366,10 +376,14 @@ export function progressObservation(
 
 function base(state: TaskRuntimeState, packet: TaskPacket | undefined): Omit<Observation, 'status'> {
   const asOfSeq = state.events.reduce((max, event) => Math.max(max, event.seq), -1)
+  const packetBoundarySeq = taskBoundarySeq(state.events) ?? -1
+  const sessionId = packet === undefined ? 'unknown' : taskPacketSessionId(packet)
   return {
     schemaVersion: 1,
     hostInstanceId: state.hostInstanceId,
-    taskId: packet?.taskId ?? 'unknown',
+    taskId: sessionId,
+    sessionId,
+    runId: packet === undefined ? 'unknown' : taskPacketRunId(packet, packetBoundarySeq),
     objective: packet?.objective ?? '',
     workerState: state.workerState,
     stage: 'unknown',
@@ -411,27 +425,37 @@ function handoffObservation(
     const data = call.data as { callId: string; arguments: string }
     let args: Record<string, unknown>
     try { args = JSON.parse(data.arguments) as Record<string, unknown> } catch { continue }
-    if (args.taskId !== packet.taskId || args.completionToken !== packet.completionToken) continue
     const result = toolResultFor(state.events, data.callId, turnEnd.seq)
     if (result === undefined) continue
-    const output = parsedResult(result) as { accepted?: unknown; artifacts?: unknown } | undefined
+    const output = parsedResult(result) as { accepted?: unknown; handoff?: unknown; artifacts?: unknown } | undefined
     if (output?.accepted !== true || !Array.isArray(output.artifacts)) continue
+    let handoff: Record<string, unknown>
+    if (packet.schemaVersion === 2) {
+      if (typeof output.handoff !== 'object' || output.handoff === null) continue
+      handoff = output.handoff as Record<string, unknown>
+      if (handoff.sessionId !== packet.sessionId
+        || handoff.runId !== packet.runId
+        || handoff.completionToken !== packet.completionToken) continue
+    } else {
+      if (args.taskId !== packet.taskId || args.completionToken !== packet.completionToken) continue
+      handoff = args
+    }
     const common = {
       ...base(state, packet),
       boundarySeq: turnEnd.seq,
-      stage: typeof args.stage === 'string' ? args.stage : 'unknown',
-      summary: typeof args.summary === 'string' ? args.summary.slice(0, 2_048) : '',
-      files: Array.isArray(args.files) ? args.files.filter((item): item is string => typeof item === 'string') : [],
-      verification: Array.isArray(args.verification) ? args.verification as Observation['verification'] : [],
+      stage: typeof handoff.stage === 'string' ? handoff.stage : 'unknown',
+      summary: typeof handoff.summary === 'string' ? handoff.summary.slice(0, 2_048) : '',
+      files: Array.isArray(handoff.files) ? handoff.files.filter((item): item is string => typeof item === 'string') : [],
+      verification: Array.isArray(handoff.verification) ? handoff.verification as Observation['verification'] : [],
       artifacts: output.artifacts as Observation['artifacts'],
       projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
-      ...typeof args.blocker === 'string' ? { blocker: args.blocker } : {},
-      ...typeof args.failureSignature === 'string' ? { failureSignature: args.failureSignature } : {},
-      ...Array.isArray(args.attemptedHypotheses)
-        ? { attemptedHypotheses: args.attemptedHypotheses.filter((item): item is string => typeof item === 'string') }
+      ...typeof handoff.blocker === 'string' ? { blocker: handoff.blocker } : {},
+      ...typeof handoff.failureSignature === 'string' ? { failureSignature: handoff.failureSignature } : {},
+      ...Array.isArray(handoff.attemptedHypotheses)
+        ? { attemptedHypotheses: handoff.attemptedHypotheses.filter((item): item is string => typeof item === 'string') }
         : {},
     }
-    switch (args.status) {
+    switch (handoff.status) {
       case 'completed': return { ...common, status: 'COMPLETED' }
       case 'blocked': return { ...common, status: 'BLOCKED' }
       case 'major_checkpoint': return { ...common, status: 'MAJOR_CHECKPOINT' }

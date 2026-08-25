@@ -6,7 +6,22 @@ import { deriveObservation, parseTaskPacket, progressObservation, timeoutObserva
 import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
-import { TASK_PACKET_END, TASK_PACKET_START, type Observation, type TaskPacket } from './contracts.js'
+import { TASK_PACKET_END, TASK_PACKET_START, taskPacketSchema, type Observation } from './contracts.js'
+
+interface SessionAddress {
+  sessionId?: string | undefined
+  /** Deprecated v1 alias for sessionId. */
+  taskId?: string | undefined
+}
+
+function sessionIdOf(input: SessionAddress): string {
+  if (input.sessionId !== undefined && input.taskId !== undefined && input.sessionId !== input.taskId) {
+    throw new Error(`sessionId ${input.sessionId} does not match deprecated taskId ${input.taskId}`)
+  }
+  const sessionId = input.sessionId ?? input.taskId
+  if (sessionId === undefined || sessionId.trim() === '') throw new Error('sessionId is required')
+  return sessionId
+}
 
 function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; error: { code: string; message: string } } }): T {
   if (!response.result.ok) throw new Error(`${response.result.error.code}: ${response.result.error.message}`)
@@ -161,6 +176,8 @@ export class GatewayManager {
       hostInstanceId: description.hostInstanceId,
       hostVersion: description.version,
       protocolVersion: description.protocolVersion,
+      sessionId,
+      // Compatibility alias for v1 callers. New control calls use sessionId + runId.
       taskId: sessionId,
       cwd: snapshot.cwd,
       reconnected: input.sessionId !== undefined,
@@ -223,8 +240,7 @@ export class GatewayManager {
     try { return await fn() } finally { release() }
   }
 
-  async task(input: {
-    taskId: string
+  async task(input: SessionAddress & {
     objective: string
     writerMode?: 'writer' | 'read_only' | undefined
     provider?: string | undefined
@@ -236,60 +252,74 @@ export class GatewayManager {
     acceptanceCriteria?: string[] | undefined
     verification?: string[] | undefined
     escalationConditions?: string[] | undefined
+    parentRunId?: string | undefined
+    baseline?: { head?: string | undefined; statusSummary: string } | undefined
+    authority?: { maxDirectChildren?: number | undefined; preAuthorizedActions?: string[] | undefined } | undefined
   }): Promise<Record<string, unknown>> {
-    const connection = await this.locate(input.taskId)
-    const snapshot = await connection.refreshSession(input.taskId)
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    const snapshot = await connection.refreshSession(sessionId)
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
     const sessionCwd = snapshot.cwd
     const writerMode = input.writerMode ?? 'writer'
 
-    const models = unwrap(await connection.api.sessions.models({ sessionId: input.taskId as SessionId }))
+    const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
     unwrap(await connection.api.sessions.selectModel({
-      sessionId: input.taskId as SessionId,
+      sessionId: sessionId as SessionId,
       provider: input.provider ?? this.config.defaultProvider ?? models.current.provider,
       model: input.model ?? this.config.defaultModel ?? models.current.model,
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
     }))
 
-    const packet: TaskPacket = {
-      schemaVersion: 1,
-      taskId: input.taskId,
+    const runId = randomUUID()
+    const packet = taskPacketSchema.parse({
+      schemaVersion: 2,
+      sessionId,
+      runId,
       completionToken: randomUUID(),
       objective: input.objective,
       writerMode,
+      // Temporary v1 worker compatibility; removed after every installed worker
+      // consumes sessionId + runId directly.
+      taskId: sessionId,
+      ...input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId },
+      ...input.baseline === undefined ? {} : { baseline: input.baseline },
       ...input.context === undefined ? {} : { context: input.context },
       ...input.allowedScope === undefined ? {} : { allowedScope: input.allowedScope },
       ...input.constraints === undefined ? {} : { constraints: input.constraints },
       ...input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria },
       ...input.verification === undefined ? {} : { verification: input.verification },
       ...input.escalationConditions === undefined ? {} : { escalationConditions: input.escalationConditions },
-    }
+      ...input.authority === undefined ? {} : { authority: input.authority },
+    })
     // Put the human objective first so DSH Web gives the session a meaningful
     // title instead of "<dsh-supervised-task>…". The durable packet remains in
     // the same message and parseTaskPacket deliberately accepts it anywhere.
     const prompt = `${input.objective}\n\n`
       + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
-      + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching taskId '
-      + 'and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
+      + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching sessionId, '
+      + 'runId, and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
       + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature.'
     const queueAndConfirm = async (): Promise<Record<string, unknown>> => {
       unwrap(await connection.api.sessions.prompt({
-        sessionId: input.taskId as SessionId,
+        sessionId: sessionId as SessionId,
         mode: 'queue',
         content: [{ type: 'text', text: prompt }],
       }))
       const packetDeadline = Date.now() + 10_000
-      let refreshed = await connection.refreshSession(input.taskId)
+      let refreshed = await connection.refreshSession(sessionId)
       while (parseTaskPacket(refreshed.events)?.completionToken !== packet.completionToken) {
         if (Date.now() >= packetDeadline) throw new Error('task prompt was accepted but its durable task packet was not observed')
         await connection.waitForChange(250)
-        refreshed = await connection.refreshSession(input.taskId)
+        refreshed = await connection.refreshSession(sessionId)
       }
       return {
         schemaVersion: 1,
         hostInstanceId: refreshed.hostInstanceId,
-        taskId: input.taskId,
+        sessionId,
+        taskId: sessionId,
+        runId,
         objective: input.objective,
         writerMode,
         accepted: true,
@@ -298,33 +328,49 @@ export class GatewayManager {
     }
     if (writerMode === 'writer') {
       return this.exclusiveWriterAdmission(async () => {
-        await this.assertWriterAvailable(connection, input.taskId, sessionCwd)
+        await this.assertWriterAvailable(connection, sessionId, sessionCwd)
         return queueAndConfirm()
       })
     }
     return queueAndConfirm()
   }
 
-  async wait(input: { taskId: string; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
+  async wait(input: SessionAddress & { runId?: string | undefined; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
     // The default is the five-minute aggregated progress cadence: ordinary event
     // churn never returns early, so the supervisor issues about one long dsh_wait
     // observation per window. Only a material boundary (terminal state, approval,
     // question, checkpoint, blocker, escalation) returns before the window expires.
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, 0), 300_000)
-    const connection = await this.locate(input.taskId)
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
     const deadline = Date.now() + timeoutMs
     let progressFromAsOfSeq = input.afterAsOfSeq
     while (true) {
-      const snapshot = await connection.refreshSession(input.taskId)
+      const snapshot = await connection.refreshSession(sessionId)
       const observation = deriveObservation(snapshot)
-      if (observation.taskId !== input.taskId) {
+      if (observation.sessionId !== sessionId) {
         return {
           ...observation,
-          taskId: input.taskId,
+          sessionId,
+          taskId: sessionId,
           status: 'FAILED',
           stage: 'protocol',
           summary: 'The latest durable task packet does not match this session id.',
-          failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.taskId}`, retryable: false },
+          failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.sessionId}`, retryable: false },
+        }
+      }
+      if (input.runId !== undefined && input.runId !== observation.runId) {
+        return {
+          ...observation,
+          status: 'FAILED',
+          stage: 'stale-run',
+          summary: `The requested run ${input.runId} is stale; the active run is ${observation.runId}.`,
+          failure: {
+            kind: 'PROTOCOL_ERROR',
+            message: `stale run ${input.runId}; active run is ${observation.runId}`,
+            retryable: false,
+            stale: true,
+          },
         }
       }
       if (input.afterAsOfSeq !== undefined && input.afterAsOfSeq > observation.asOfSeq) {
@@ -339,45 +385,63 @@ export class GatewayManager {
     }
   }
 
-  async steer(taskId: string, message: string): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
+  private assertCurrentRun(snapshot: Parameters<typeof deriveObservation>[0], runId: string | undefined): Observation {
+    const observation = deriveObservation(snapshot)
+    if (runId !== undefined && observation.runId !== runId) {
+      throw new Error(`stale run ${runId}; active run is ${observation.runId}`)
+    }
+    return observation
+  }
+
+  async steer(input: SessionAddress & { runId?: string | undefined; message: string }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
     unwrap(await connection.api.sessions.prompt({
-      sessionId: taskId as SessionId,
+      sessionId: sessionId as SessionId,
       mode: 'steer',
-      content: [{ type: 'text', text: message }],
+      content: [{ type: 'text', text: input.message }],
     }))
-    return { accepted: true, taskId }
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
   }
 
-  async cancel(taskId: string): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
-    unwrap(await connection.api.sessions.cancel({ sessionId: taskId as SessionId }))
-    return { accepted: true, taskId }
+  async cancel(input: SessionAddress & { runId?: string | undefined }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
+    unwrap(await connection.api.sessions.cancel({ sessionId: sessionId as SessionId }))
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
   }
 
-  async answerApproval(taskId: string, outcome: 'allowed-once' | 'rejected'): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
-    await connection.refreshSession(taskId)
-    await connection.answerApproval(taskId, outcome)
-    return { accepted: true, taskId, outcome }
+  async answerApproval(input: SessionAddress & { runId?: string | undefined; outcome: 'allowed-once' | 'rejected' }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
+    await connection.answerApproval(sessionId, input.outcome)
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId, outcome: input.outcome }
   }
 
-  async answerQuestion(
-    taskId: string,
-    answers: { id: string; selected: string[]; custom?: string | undefined }[],
-  ): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
-    await connection.refreshSession(taskId)
-    await connection.answerQuestion(taskId, answers)
-    return { accepted: true, taskId }
+  async answerQuestion(input: SessionAddress & {
+    runId?: string | undefined
+    answers: { id: string; selected: string[]; custom?: string | undefined }[]
+  }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
+    await connection.answerQuestion(sessionId, input.answers)
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
   }
 
-  async agents(parentSessionId: string): Promise<Record<string, unknown>> {
+  async agents(input: SessionAddress & { runId?: string | undefined }): Promise<Record<string, unknown>> {
+    const parentSessionId = sessionIdOf(input)
     const connection = await this.locate(parentSessionId)
+    this.assertCurrentRun(await connection.refreshSession(parentSessionId), input.runId)
     const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
     return {
       schemaVersion: 1,
       parentSessionId,
+      sessionId: parentSessionId,
+      runId: input.runId,
       ownership: {
         manager: 'DSH_ROOT',
         childCompletionDelivery: 'HOST_TO_PARENT_AUTOMATIC',
@@ -388,14 +452,16 @@ export class GatewayManager {
     }
   }
 
-  async interruptAgent(parentSessionId: string, childSessionId: string): Promise<Record<string, unknown>> {
+  async interruptAgent(input: SessionAddress & { runId?: string | undefined; childSessionId: string }): Promise<Record<string, unknown>> {
+    const parentSessionId = sessionIdOf(input)
     const connection = await this.locate(parentSessionId)
+    this.assertCurrentRun(await connection.refreshSession(parentSessionId), input.runId)
     unwrap(await connection.api.subagents.interrupt({
       parentSessionId: parentSessionId as SessionId,
-      childSessionId: childSessionId as SessionId,
+      childSessionId: input.childSessionId as SessionId,
       mode: 'continuable',
     }))
-    return { accepted: true, parentSessionId, childSessionId }
+    return { accepted: true, parentSessionId, sessionId: parentSessionId, runId: input.runId, childSessionId: input.childSessionId }
   }
 
   stopClients(): void {
