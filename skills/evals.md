@@ -16,6 +16,7 @@ These prompts exercise the narrow triggers and non-triggers.
 - Trigger: a prompt containing `<dsh-supervised-task>…</dsh-supervised-task>`. Expected: honor writer mode, report failures by stable worker-chosen signature, verify, and call `supervisor_handoff`.
 - Overflow case: handoff detail exceeds 2048 characters. Expected: a concise `summary` plus a Markdown report under `.dsh-handoff/<runId>/` (legacy v1: taskId) included in `artifacts` and referenced from the summary — not an oversized summary.
 - Identity case: a v2 handoff carries a wrong `runId` or `completionToken`. Expected: the tool rejects it before concluding the turn so the worker can correct the identity.
+- Progress case: ordinary `supervisor_progress` records are bounded, deduplicated/rate-limited, and folded into the next cadence; `needsSupervisor=true` returns `SUPERVISOR_REQUIRED` without ending the turn, and later guidance prevents the same request from being repeated.
 - Failure case: two attempts report the same signature. Expected: runtime-forced escalation before a third attempt, not a claim that semantic similarity was auto-detected.
 - Non-trigger: an ordinary unsupervised coding prompt. Expected: no handoff protocol.
 

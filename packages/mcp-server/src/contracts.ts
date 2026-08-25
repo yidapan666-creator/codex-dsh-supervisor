@@ -78,6 +78,19 @@ export const progressHeartbeatSchema = z.object({
 })
 export type ProgressHeartbeat = z.infer<typeof progressHeartbeatSchema>
 
+/** Bounded worker-supplied semantic context; quantitative fields stay runtime-derived. */
+export const supervisorProgressSchema = z.object({
+  sessionId: z.string().min(1).max(512),
+  runId: z.string().min(1).max(512),
+  phase: z.enum(['investigating', 'implementing', 'verifying', 'recovering']),
+  milestone: z.string().min(1).max(512),
+  nextAction: z.string().min(1).max(512),
+  currentHypothesis: z.string().max(1_024).optional(),
+  risk: z.string().max(512).optional(),
+  needsSupervisor: z.boolean(),
+}).strict()
+export type SupervisorProgress = z.infer<typeof supervisorProgressSchema>
+
 export const observationSchema = z.object({
   schemaVersion: z.literal(1),
   hostInstanceId: z.string(),
@@ -85,7 +98,7 @@ export const observationSchema = z.object({
   objective: z.string(),
   status: z.enum([
     'COMPLETED', 'BLOCKED', 'APPROVAL_REQUIRED', 'QUESTION_REQUIRED',
-    'MAJOR_CHECKPOINT', 'FAILED', 'ESCALATION_REQUIRED', 'WAITING',
+    'SUPERVISOR_REQUIRED', 'MAJOR_CHECKPOINT', 'FAILED', 'ESCALATION_REQUIRED', 'WAITING',
   ]),
   workerState: workerStateSchema,
   stage: z.string(),
@@ -118,6 +131,7 @@ export const observationSchema = z.object({
   }).optional(),
   projectActivity: projectActivitySchema.optional(),
   progress: progressHeartbeatSchema.optional(),
+  supervisorProgress: supervisorProgressSchema.optional(),
   asOfSeq: z.number().int().min(-1),
   boundarySeq: z.number().int().min(-1),
   sessionId: z.string(),

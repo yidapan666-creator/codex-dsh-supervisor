@@ -28,6 +28,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 
 /** Maximum length of `supervisor_handoff.summary`. Longer reports must become artifacts. */
 export const HANDOFF_SUMMARY_LIMIT = 2_048
+/** Ordinary semantic progress records are accepted at most once per minute. */
+export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
 
 /**
  * Validate the handoff summary length. Returns undefined when the summary is at
@@ -61,6 +63,21 @@ type HandoffIdentityArgs = {
   sessionId?: string | undefined
   runId?: string | undefined
   completionToken: string
+}
+
+type ProgressIdentityArgs = {
+  taskId?: string | undefined
+  sessionId?: string | undefined
+  runId?: string | undefined
+}
+
+export type SupervisorProgressArgs = ProgressIdentityArgs & {
+  phase: 'investigating' | 'implementing' | 'verifying' | 'recovering'
+  milestone: string
+  nextAction: string
+  currentHypothesis?: string | undefined
+  risk?: string | undefined
+  needsSupervisor: boolean
 }
 
 type TaskIdentity = {
@@ -118,16 +135,36 @@ export function handoffIdentityError(
 ): string | undefined {
   const identity = latestTaskIdentity(events)
   if (identity === undefined) return 'supervisor_handoff found no valid latest dsh-gate task packet'
-  if (identity.schemaVersion === 2) {
-    if (args.sessionId !== identity.sessionId) return 'supervisor_handoff sessionId does not match the latest task packet'
-    if (args.runId !== identity.runId) return 'supervisor_handoff runId does not match the latest task packet'
-  } else if (args.taskId !== identity.sessionId) {
-    return 'supervisor_handoff taskId does not match the latest task packet'
-  }
+  const addressError = taskAddressError(identity, args, 'supervisor_handoff')
+  if (addressError !== undefined) return addressError
   if (args.completionToken !== identity.completionToken) {
     return 'supervisor_handoff completionToken does not match the latest task packet'
   }
   return undefined
+}
+
+function taskAddressError(
+  identity: TaskIdentity,
+  args: ProgressIdentityArgs,
+  toolName: string,
+): string | undefined {
+  if (identity.schemaVersion === 2) {
+    if (args.sessionId !== identity.sessionId) return `${toolName} sessionId does not match the latest task packet`
+    if (args.runId !== identity.runId) return `${toolName} runId does not match the latest task packet`
+  } else if (args.taskId !== identity.sessionId) {
+    return `${toolName} taskId does not match the latest task packet`
+  }
+  return undefined
+}
+
+/** Validate a semantic progress record against the latest durable task packet. */
+export function progressIdentityError(
+  events: readonly { type: string; data: unknown }[],
+  args: ProgressIdentityArgs,
+): string | undefined {
+  const identity = latestTaskIdentity(events)
+  if (identity === undefined) return 'supervisor_progress found no valid latest dsh-gate task packet'
+  return taskAddressError(identity, args, 'supervisor_progress')
 }
 
 function latestTaskBoundary(events: readonly { type: string; data: unknown }[]): number {
@@ -138,6 +175,42 @@ function latestTaskBoundary(events: readonly { type: string; data: unknown }[]):
     if (contentText(data.content ?? data.message?.content).includes(TASK_PACKET_START)) return index
   }
   return 0
+}
+
+function sameProgress(left: SupervisorProgressArgs, right: SupervisorProgressArgs): boolean {
+  return left.phase === right.phase
+    && left.milestone === right.milestone
+    && left.nextAction === right.nextAction
+    && left.currentHypothesis === right.currentHypothesis
+    && left.risk === right.risk
+    && left.needsSupervisor === right.needsSupervisor
+}
+
+/**
+ * Decide whether the current progress call should become an accepted durable
+ * record. DSH records tool/call before execute, so the last matching call is
+ * the current one and earlier calls are the rate-limit/deduplication history.
+ */
+export function supervisorProgressDecision(
+  events: readonly { type: string; time?: number; data: unknown }[],
+  args: SupervisorProgressArgs,
+  now = Date.now(),
+): { accepted: true } | { accepted: false; reason: 'duplicate' | 'rate_limited' } {
+  const calls = events.slice(latestTaskBoundary(events)).flatMap((event) => {
+    if (event.type !== 'tool/call') return []
+    const data = event.data as { name?: unknown; arguments?: unknown }
+    if (data.name !== 'supervisor_progress' || typeof data.arguments !== 'string') return []
+    try {
+      return [{ args: JSON.parse(data.arguments) as SupervisorProgressArgs, time: event.time }]
+    } catch { return [] }
+  })
+  const previous = calls.at(-2)
+  if (previous === undefined) return { accepted: true }
+  if (sameProgress(previous.args, args)) return { accepted: false, reason: 'duplicate' }
+  if (!args.needsSupervisor && typeof previous.time === 'number' && now - previous.time < SUPERVISOR_PROGRESS_MIN_INTERVAL_MS) {
+    return { accepted: false, reason: 'rate_limited' }
+  }
+  return { accepted: true }
 }
 
 export function reportedFailureDecision(
@@ -171,10 +244,60 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a '
       + 'Markdown report under `.dsh-handoff/<runId>/` inside the session cwd, include its relative path in '
       + '`artifacts`, and reference it from the concise summary. '
+      + 'Use `supervisor_progress` only for bounded milestone changes; it never ends the turn. Set needsSupervisor only '
+      + 'when an actual supervisor decision is required. '
       + 'A normal turn ending without that valid handoff is not success. Report repeated failures through '
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
       + 'whether two failures are semantically the same remains your responsibility.',
   })
+
+  ctx.tools.register(defineTool({
+    name: 'supervisor_progress',
+    description: 'Publish bounded semantic progress for the next aggregated heartbeat without exposing reasoning, diffs, '
+      + 'tool arguments, or tool output. This tool never concludes the turn. Duplicate and overly frequent ordinary records are ignored.',
+    parameters: {
+      taskId: { type: 'string', description: 'Legacy schemaVersion 1 session/task id.' },
+      sessionId: { type: 'string', description: 'SchemaVersion 2 durable DSH session id.' },
+      runId: { type: 'string', description: 'SchemaVersion 2 supervised run id.' },
+      phase: { type: 'string', required: true, enum: ['investigating', 'implementing', 'verifying', 'recovering'] },
+      milestone: { type: 'string', required: true, maxLength: 512 },
+      nextAction: { type: 'string', required: true, maxLength: 512 },
+      currentHypothesis: { type: 'string', maxLength: 1024 },
+      risk: { type: 'string', maxLength: 512 },
+      needsSupervisor: { type: 'boolean', required: true },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          accepted: { type: 'boolean', required: true },
+          reason: { type: 'string', enum: ['duplicate', 'rate_limited'] },
+          progress: { type: 'json' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    execute(args, exec) {
+      if (exec.agent === undefined) throw new Error('supervisor_progress requires an agent-owned session')
+      const events = exec.agent.session.events
+      const identityError = progressIdentityError(events, args)
+      if (identityError !== undefined) throw new Error(identityError)
+      const decision = supervisorProgressDecision(events, args)
+      if (!decision.accepted) return Promise.resolve({ accepted: false as const, reason: decision.reason })
+      const progress = {
+        ...args.taskId === undefined ? {} : { taskId: args.taskId },
+        ...args.sessionId === undefined ? {} : { sessionId: args.sessionId },
+        ...args.runId === undefined ? {} : { runId: args.runId },
+        phase: args.phase,
+        milestone: args.milestone,
+        nextAction: args.nextAction,
+        ...args.currentHypothesis === undefined ? {} : { currentHypothesis: args.currentHypothesis },
+        ...args.risk === undefined ? {} : { risk: args.risk },
+        needsSupervisor: args.needsSupervisor,
+      }
+      return Promise.resolve({ accepted: true as const, progress })
+    },
+  }))
 
   ctx.tools.register(defineTool({
     name: 'supervisor_report_failure',

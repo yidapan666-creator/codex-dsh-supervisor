@@ -199,6 +199,111 @@ describe('authoritative completion fold', () => {
     })
   })
 
+  it('folds accepted bounded semantic progress into an ordinary running observation', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'implementing',
+      milestone: 'Parser changes are in place.', nextAction: 'Run focused tests.', needsSupervisor: false,
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, callId: 'p1', name: 'supervisor_progress', arguments: JSON.stringify(progress),
+      }),
+      event('tool/result', 3, {
+        turn: 1,
+        message: { source: { callId: 'p1' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+    ], { workerState: 'RUNNING' }))
+
+    expect(observed).toMatchObject({
+      status: 'WAITING', stage: 'running',
+      supervisorProgress: { phase: 'implementing', milestone: 'Parser changes are in place.', needsSupervisor: false },
+    })
+  })
+
+  it('returns early when bounded semantic progress requests a supervisor decision', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'investigating',
+      milestone: 'Two incompatible migration paths remain.', nextAction: 'Choose the compatibility policy.',
+      risk: 'The choice changes the public API.', needsSupervisor: true,
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, callId: 'p1', name: 'supervisor_progress', arguments: JSON.stringify(progress),
+      }),
+      event('tool/result', 3, {
+        turn: 1,
+        message: { source: { callId: 'p1' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+    ], { workerState: 'RUNNING' }))
+
+    expect(observed).toMatchObject({
+      status: 'SUPERVISOR_REQUIRED', boundarySeq: 3, stage: 'investigating',
+      supervisorProgress: { needsSupervisor: true, nextAction: 'Choose the compatibility policy.' },
+    })
+    expect(() => observationSchema.parse(observed)).not.toThrow()
+  })
+
+  it('does not repeat a supervisor-requested boundary after later supervisor guidance', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'investigating',
+      milestone: 'A policy choice is required.', nextAction: 'Choose one.', needsSupervisor: true,
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, callId: 'p1', name: 'supervisor_progress', arguments: JSON.stringify(progress),
+      }),
+      event('tool/result', 3, {
+        turn: 1,
+        message: { source: { callId: 'p1' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+      event('user/message', 4, { content: [{ type: 'text', text: 'Keep the compatibility layer for one release.' }] }),
+    ], { workerState: 'RUNNING' }))
+
+    expect(observed).toMatchObject({ status: 'WAITING', stage: 'running' })
+  })
+
   it('does not label an unchanged observation as progress', () => {
     const runtime = state([start], { workerState: 'RUNNING' })
     const observed = progressObservation(deriveObservation(runtime), runtime, 0)

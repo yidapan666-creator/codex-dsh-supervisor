@@ -2,7 +2,8 @@ import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import {
   TASK_PACKET_END, TASK_PACKET_START,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
-  taskPacketSchema, type ProjectActivity, type TaskPacket, type TaskRuntimeState,
+  taskPacketSchema, supervisorProgressSchema,
+  type ProjectActivity, type SupervisorProgress, type TaskPacket, type TaskRuntimeState,
 } from './contracts.js'
 
 function textBlocks(content: unknown): string {
@@ -410,6 +411,44 @@ function parsedResult(event: DshEvent): unknown {
   try { return JSON.parse(text) } catch { return undefined }
 }
 
+function latestSupervisorProgress(
+  events: readonly DshEvent[],
+  packet: TaskPacket,
+): { progress: SupervisorProgress; seq: number } | undefined {
+  const boundarySeq = taskBoundarySeq(events) ?? -1
+  const calls = events.filter((event) => {
+    if (event.type !== 'tool/call' || event.seq < boundarySeq) return false
+    return (event.data as { name?: unknown }).name === 'supervisor_progress'
+  }).reverse()
+  for (const call of calls) {
+    const data = call.data as { callId?: unknown }
+    if (typeof data.callId !== 'string') continue
+    const result = toolResultFor(events, data.callId, Number.POSITIVE_INFINITY)
+    if (result === undefined) continue
+    const output = parsedResult(result) as { accepted?: unknown; progress?: unknown } | undefined
+    if (output?.accepted !== true || typeof output.progress !== 'object' || output.progress === null) continue
+    const raw = output.progress as Record<string, unknown>
+    const sessionId = taskPacketSessionId(packet)
+    const runId = taskPacketRunId(packet, boundarySeq)
+    if (packet.schemaVersion === 2) {
+      if (raw.sessionId !== sessionId || raw.runId !== runId) continue
+    } else if (raw.taskId !== sessionId) continue
+    const parsed = supervisorProgressSchema.safeParse({
+      sessionId,
+      runId,
+      phase: raw.phase,
+      milestone: raw.milestone,
+      nextAction: raw.nextAction,
+      ...raw.currentHypothesis === undefined ? {} : { currentHypothesis: raw.currentHypothesis },
+      ...raw.risk === undefined ? {} : { risk: raw.risk },
+      needsSupervisor: raw.needsSupervisor,
+    })
+    if (!parsed.success) continue
+    return { progress: parsed.data, seq: result.seq }
+  }
+  return undefined
+}
+
 function handoffObservation(
   state: TaskRuntimeState,
   packet: TaskPacket,
@@ -505,7 +544,12 @@ function exhaustedFailureObservation(
 export function deriveObservation(state: TaskRuntimeState): Observation {
   const boundary = taskPacketBoundary(state.events)
   const packet = boundary?.packet
-  const common = base(state, packet)
+  const commonBase = base(state, packet)
+  const progressRecord = packet === undefined ? undefined : latestSupervisorProgress(state.events, packet)
+  const common = {
+    ...commonBase,
+    ...progressRecord === undefined ? {} : { supervisorProgress: progressRecord.progress },
+  }
   if (packet === undefined) return {
     ...common,
     status: 'FAILED',
@@ -523,6 +567,19 @@ export function deriveObservation(state: TaskRuntimeState): Observation {
   }
   if (state.pendingQuestion !== undefined) return {
     ...common, status: 'QUESTION_REQUIRED', stage: 'question', summary: 'Worker is waiting for an answer.', question: state.pendingQuestion,
+  }
+
+  const supervisorResponded = progressRecord === undefined
+    ? false
+    : state.events.some(event => event.type === 'user/message' && event.seq > progressRecord.seq)
+  if (progressRecord?.progress.needsSupervisor === true && !supervisorResponded) return {
+    ...common,
+    status: 'SUPERVISOR_REQUIRED',
+    boundarySeq: progressRecord.seq,
+    stage: progressRecord.progress.phase,
+    summary: progressRecord.progress.risk === undefined
+      ? progressRecord.progress.milestone
+      : `${progressRecord.progress.milestone} Risk: ${progressRecord.progress.risk}`.slice(0, 2_048),
   }
 
   const scopedState = boundary === undefined
