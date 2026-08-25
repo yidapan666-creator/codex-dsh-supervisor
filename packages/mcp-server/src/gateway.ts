@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
-import { deriveObservation, parseTaskPacket, progressObservation, timeoutObservation } from './fold.js'
+import { deriveObservation, parseTaskPacket, progressObservation, taskBoundarySeq, timeoutObservation } from './fold.js'
 import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
@@ -102,9 +102,20 @@ export interface GatewayConfig {
 
 /** The five-minute aggregated progress cadence used by {@link GatewayManager.wait}. */
 export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
+/** Periodic authoritative reconciliation while mux events drive cached observations. */
+export const WAIT_RECONCILE_INTERVAL_MS = 30_000
+
+/** A writer packet owns its in-process worktree lease until its corresponding turn ends. */
+export function writerLeaseHeld(events: readonly import('./contracts.js').DshEvent[]): boolean {
+  const boundary = taskBoundarySeq(events)
+  const packet = parseTaskPacket(events)
+  if (boundary === undefined || packet?.writerMode !== 'writer') return false
+  return !events.some(event => event.type === 'turn/end' && event.seq > boundary)
+}
 
 export class GatewayManager {
   private readonly connections = new Map<string, HostConnection>()
+  private readonly sessionHosts = new Map<string, string>()
   private readonly knownUrls: string[]
   private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
@@ -150,14 +161,21 @@ export class GatewayManager {
     sessionId?: string | undefined
     agentPreset?: string | undefined
   }): Promise<Record<string, unknown>> {
-    const connection = this.connection(input.hostBaseUrl)
+    const reconnectByDiscovery = input.sessionId !== undefined && input.hostBaseUrl === undefined
+    const connection = reconnectByDiscovery
+      ? await this.locate(input.sessionId as string)
+      : this.connection(input.hostBaseUrl)
     let description
-    try {
-      description = await connection.ensureConnected(2_000)
-    } catch (firstError) {
-      if (this.config.launch === undefined) throw firstError
-      await launchDetachedHost(this.config.launch)
-      description = await connection.ensureConnected(15_000)
+    if (reconnectByDiscovery) {
+      description = await connection.ensureConnected()
+    } else {
+      try {
+        description = await connection.ensureConnected(2_000)
+      } catch (firstError) {
+        if (this.config.launch === undefined) throw firstError
+        await launchDetachedHost(this.config.launch)
+        description = await connection.ensureConnected(15_000)
+      }
     }
     let sessionId = input.sessionId
     if (sessionId === undefined) {
@@ -166,9 +184,10 @@ export class GatewayManager {
         ...input.agentPreset === undefined ? {} : { agentPreset: input.agentPreset },
       }))
       sessionId = created.sessionId
-    } else if (!await connection.sessionExists(sessionId)) {
+    } else if (!reconnectByDiscovery && !await connection.sessionExists(sessionId)) {
       throw new Error(`session ${sessionId} does not exist on ${connection.baseUrl}`)
     }
+    this.sessionHosts.set(sessionId, connection.baseUrl)
     const snapshot = await connection.refreshSession(sessionId)
     return {
       schemaVersion: 1,
@@ -185,22 +204,38 @@ export class GatewayManager {
   }
 
   async locate(taskId: string): Promise<HostConnection> {
+    const boundUrl = this.sessionHosts.get(taskId)
+    if (boundUrl !== undefined) {
+      const bound = this.connection(boundUrl)
+      await bound.ensureConnected()
+      return bound
+    }
+    const failures: string[] = []
+    let reachable = 0
     for (const url of this.knownUrls) {
       const connection = this.connection(url)
       try {
         await connection.ensureConnected()
-        if (await connection.sessionExists(taskId)) return connection
-      } catch {
-        // Try the next explicitly configured Host. The final error is stable.
+        reachable++
+        if (await connection.sessionExists(taskId)) {
+          this.sessionHosts.set(taskId, connection.baseUrl)
+          return connection
+        }
+      } catch (error) {
+        failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
-    throw new Error(`task/session ${taskId} was not found on any configured DSH Host`)
+    if (reachable === 0) {
+      throw new Error(`could not connect to any configured DSH Host while locating session ${taskId}: ${failures.join('; ')}`)
+    }
+    const unavailable = failures.length === 0 ? '' : ` (${failures.length} Host(s) unavailable)`
+    throw new Error(`session ${taskId} was not found on any reachable configured DSH Host${unavailable}`)
   }
 
-  private async assertWriterAvailable(connection: HostConnection, taskId: string, cwd: string): Promise<void> {
+  private async assertWriterAvailable(connection: HostConnection, cwd: string): Promise<void> {
     const target = await this.resolveDomain(cwd)
     for (const row of await connection.listSessions()) {
-      if (row.sessionId === taskId || row.cwd === undefined) continue
+      if (row.cwd === undefined) continue
       let candidate: string
       try {
         candidate = await this.resolveDomain(row.cwd)
@@ -215,10 +250,7 @@ export class GatewayManager {
       }
       if (candidate !== target) continue
       const snapshot = await connection.refreshSession(row.sessionId)
-      const packet = parseTaskPacket(snapshot.events)
-      if (packet?.writerMode !== 'writer') continue
-      const status = deriveObservation(snapshot).status
-      if (status !== 'COMPLETED' && status !== 'FAILED') {
+      if (writerLeaseHeld(snapshot.events)) {
         throw new Error(`working tree already has writer session ${row.sessionId}; use read_only or an independent worktree`)
       }
     }
@@ -328,11 +360,45 @@ export class GatewayManager {
     }
     if (writerMode === 'writer') {
       return this.exclusiveWriterAdmission(async () => {
-        await this.assertWriterAvailable(connection, sessionId, sessionCwd)
+        await this.assertWriterAvailable(connection, sessionCwd)
         return queueAndConfirm()
       })
     }
     return queueAndConfirm()
+  }
+
+  private observationForRun(
+    snapshot: Parameters<typeof deriveObservation>[0],
+    sessionId: string,
+    runId: string | undefined,
+  ): Observation {
+    const observation = deriveObservation(snapshot)
+    if (observation.sessionId !== sessionId) {
+      return {
+        ...observation,
+        sessionId,
+        taskId: sessionId,
+        status: 'FAILED',
+        stage: 'protocol',
+        summary: 'The latest durable task packet does not match this session id.',
+        failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.sessionId}`, retryable: false },
+      }
+    }
+    if (runId !== undefined && runId !== observation.runId) {
+      return {
+        ...observation,
+        status: 'FAILED',
+        stage: 'stale-run',
+        summary: `The requested run ${runId} is stale; the active run is ${observation.runId}.`,
+        failure: {
+          kind: 'PROTOCOL_ERROR',
+          message: `stale run ${runId}; active run is ${observation.runId}`,
+          retryable: false,
+          stale: true,
+        },
+      }
+    }
+    return observation
   }
 
   async wait(input: SessionAddress & { runId?: string | undefined; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
@@ -345,43 +411,53 @@ export class GatewayManager {
     const connection = await this.locate(sessionId)
     const deadline = Date.now() + timeoutMs
     let progressFromAsOfSeq = input.afterAsOfSeq
+    let nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+    let snapshot = await connection.refreshSession(sessionId)
+    let authoritative = true
     while (true) {
-      const snapshot = await connection.refreshSession(sessionId)
-      const observation = deriveObservation(snapshot)
-      if (observation.sessionId !== sessionId) {
-        return {
-          ...observation,
-          sessionId,
-          taskId: sessionId,
-          status: 'FAILED',
-          stage: 'protocol',
-          summary: 'The latest durable task packet does not match this session id.',
-          failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.sessionId}`, retryable: false },
-        }
-      }
-      if (input.runId !== undefined && input.runId !== observation.runId) {
-        return {
-          ...observation,
-          status: 'FAILED',
-          stage: 'stale-run',
-          summary: `The requested run ${input.runId} is stale; the active run is ${observation.runId}.`,
-          failure: {
-            kind: 'PROTOCOL_ERROR',
-            message: `stale run ${input.runId}; active run is ${observation.runId}`,
-            retryable: false,
-            stale: true,
-          },
-        }
-      }
+      const observation = this.observationForRun(snapshot, sessionId, input.runId)
       if (input.afterAsOfSeq !== undefined && input.afterAsOfSeq > observation.asOfSeq) {
         throw new Error(`afterAsOfSeq ${String(input.afterAsOfSeq)} is ahead of observed asOfSeq ${String(observation.asOfSeq)}`)
       }
       progressFromAsOfSeq ??= observation.asOfSeq
       const observed = progressObservation(observation, snapshot, progressFromAsOfSeq)
-      if (observation.status !== 'WAITING') return observed
+      if (observation.status !== 'WAITING') {
+        // Mux frames make boundaries visible immediately, but reconcile once
+        // before returning so missing frames or replay state cannot decide a
+        // material/terminal result from cache alone.
+        if (!authoritative) {
+          snapshot = await connection.refreshSession(sessionId)
+          authoritative = true
+          nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+          continue
+        }
+        return observed
+      }
       const remaining = deadline - Date.now()
-      if (remaining <= 0) return timeoutObservation(observed, timeoutMs)
-      await connection.waitForChange(Math.min(remaining, 1_000))
+      if (remaining <= 0) {
+        // The cadence observation is also an externally visible boundary; make
+        // its final event/tool/token totals authoritative.
+        if (!authoritative) {
+          snapshot = await connection.refreshSession(sessionId)
+          authoritative = true
+          const finalObservation = this.observationForRun(snapshot, sessionId, input.runId)
+          const finalObserved = progressObservation(finalObservation, snapshot, progressFromAsOfSeq)
+          return finalObservation.status === 'WAITING'
+            ? timeoutObservation(finalObserved, timeoutMs)
+            : finalObserved
+        }
+        return timeoutObservation(observed, timeoutMs)
+      }
+      const untilReconcile = Math.max(0, nextReconcileAt - Date.now())
+      const changed = await connection.waitForChange(Math.min(remaining, untilReconcile))
+      if (changed) {
+        snapshot = connection.cachedSession(sessionId) ?? snapshot
+        authoritative = false
+      } else {
+        snapshot = await connection.refreshSession(sessionId)
+        authoritative = true
+        nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+      }
     }
   }
 
@@ -413,23 +489,24 @@ export class GatewayManager {
     return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
   }
 
-  async answerApproval(input: SessionAddress & { runId?: string | undefined; outcome: 'allowed-once' | 'rejected' }): Promise<Record<string, unknown>> {
+  async answerApproval(input: SessionAddress & { runId?: string | undefined; rpcId: string; outcome: 'allowed-once' | 'rejected' }): Promise<Record<string, unknown>> {
     const sessionId = sessionIdOf(input)
     const connection = await this.locate(sessionId)
     this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
-    await connection.answerApproval(sessionId, input.outcome)
-    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId, outcome: input.outcome }
+    await connection.answerApproval(sessionId, input.rpcId, input.outcome)
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId, rpcId: input.rpcId, outcome: input.outcome }
   }
 
   async answerQuestion(input: SessionAddress & {
     runId?: string | undefined
+    rpcId: string
     answers: { id: string; selected: string[]; custom?: string | undefined }[]
   }): Promise<Record<string, unknown>> {
     const sessionId = sessionIdOf(input)
     const connection = await this.locate(sessionId)
     this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
-    await connection.answerQuestion(sessionId, input.answers)
-    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
+    await connection.answerQuestion(sessionId, input.rpcId, input.answers)
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId, rpcId: input.rpcId }
   }
 
   async agents(input: SessionAddress & { runId?: string | undefined }): Promise<Record<string, unknown>> {
@@ -467,5 +544,6 @@ export class GatewayManager {
   stopClients(): void {
     for (const connection of this.connections.values()) connection.stopClient()
     this.connections.clear()
+    this.sessionHosts.clear()
   }
 }

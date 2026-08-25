@@ -95,6 +95,25 @@ describe('host error lifecycle', () => {
   })
 })
 
+describe('stable interaction identity', () => {
+  it('rejects an answer whose rpc id no longer matches the pending approval', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [packetEvent(1)] })
+    const connection = connected(api)
+    await connection.ensureConnected()
+    api.pushMux({
+      rpcId: 'approval-current',
+      payload: { type: 'approval/requested', sessionId: 's1', approvalId: 'a1', toolName: 'terminal' },
+    })
+    await settleFrames()
+
+    await expect(connection.answerApproval('s1', 'approval-stale', 'allowed-once'))
+      .rejects.toThrow(/stale approval rpcId/i)
+    await expect(connection.answerApproval('s1', 'approval-current', 'allowed-once'))
+      .resolves.toBeUndefined()
+  })
+})
+
 describe('bounded event cache', () => {
   it('keeps only events at or after the latest task packet boundary', async () => {
     const api = new FakeApi()

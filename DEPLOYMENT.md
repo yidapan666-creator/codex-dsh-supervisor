@@ -79,6 +79,19 @@ bootstrap exists precisely so nobody has to hand-apply a patch.
 pnpm bootstrap
 ```
 
+Bootstrap installs the DSH-side plugin into the isolated project home but does
+not guess a user-global Codex skill directory. Install the repository's Codex
+supervisor skill into the explicit personal skill directory used by your Codex
+installation, then restart Codex:
+
+```sh
+pnpm skill:install -- --target /absolute/path/to/personal/skills
+```
+
+The command refuses to overwrite an existing install unless `--force` is
+supplied; forced updates preserve the previous directory as a timestamped
+sibling backup.
+
 Runs, in order, the following phases (each idempotent; re-running is a no-op
 when everything is already current — pass `--force` to rebuild):
 

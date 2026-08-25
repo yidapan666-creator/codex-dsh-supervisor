@@ -4,7 +4,9 @@ import { join } from 'node:path'
 import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import { DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveWriterDomain } from '../src/gateway.js'
+import {
+  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveWriterDomain, writerLeaseHeld,
+} from '../src/gateway.js'
 import { parseTaskPacket } from '../src/fold.js'
 import { HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
@@ -15,8 +17,8 @@ afterEach(() => {
   for (const connection of live) connection.stopClient()
 })
 
-function connected(api: FakeApi): HostConnection {
-  const connection = new HostConnection('http://host', api.api)
+function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
+  const connection = new HostConnection(baseUrl, api.api)
   live.push(connection)
   return connection
 }
@@ -119,6 +121,15 @@ describe('writer domain resolution', () => {
 })
 
 describe('writer admission', () => {
+  it('rejects a second writer run in the same durable session while its current run owns the lease', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree', events: [packetEvent(1), event('turn/start', 2, { turn: 1 })] })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.task({ sessionId: 's1', objective: 'second writer run' }))
+      .rejects.toThrow(/already has writer session s1/)
+  })
+
   it('rejects a second writer session in the same worktree domain while the first is active', async () => {
     const api = new FakeApi()
     api.addRow('s1', { cwd: '/work/tree' })
@@ -149,6 +160,19 @@ describe('writer admission', () => {
     const manager = managerWith(api, sameDomain)
     await expect(manager.task({ taskId: 's1', objective: 'write' }))
       .resolves.toMatchObject({ taskId: 's1', writerMode: 'writer', accepted: true })
+  })
+
+  it('releases the writer run lease at turn end regardless of terminal handoff status', async () => {
+    const ended = [packetEvent(1), event('turn/start', 2, { turn: 1 }), event('turn/end', 3, {
+      turn: 1, reason: { kind: 'interrupted' },
+    })]
+    expect(writerLeaseHeld(ended)).toBe(false)
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree', events: ended })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.task({ sessionId: 's1', objective: 'new writer run' }))
+      .resolves.toMatchObject({ sessionId: 's1', accepted: true })
   })
 
   it('lets a read-only root coexist with an active writer in the same domain', async () => {
@@ -283,6 +307,55 @@ describe('Web-visible task identity', () => {
   })
 })
 
+describe('multi-Host reconnect', () => {
+  it('discovers an existing session on a non-default configured Host and binds later calls to it', async () => {
+    const first = new FakeApi()
+    const second = new FakeApi()
+    second.addRow('s-existing', { cwd: '/work/tree' })
+    const manager = new GatewayManager({ hostUrls: ['http://host-one', 'http://host-two'] }, {
+      resolveWriterDomain: sameDomain,
+      createConnection: baseUrl => connected(baseUrl === 'http://host-one' ? first : second, baseUrl),
+    })
+
+    const reconnected = await manager.startOrConnect({ sessionId: 's-existing' })
+    expect(reconnected).toMatchObject({
+      sessionId: 's-existing', hostBaseUrl: 'http://host-two', reconnected: true,
+    })
+    await manager.task({ sessionId: 's-existing', objective: 'read it', writerMode: 'read_only' })
+    expect(first.rows.has('s-existing')).toBe(false)
+    expect(second.rows.get('s-existing')?.events).toHaveLength(1)
+  })
+
+  it('restores a replayed pending interaction after the MCP manager restarts', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree', events: [s1Packet(1), event('turn/start', 2, { turn: 1 })] })
+    const firstManager = managerWith(api, sameDomain)
+    await firstManager.startOrConnect({ sessionId: 's1' })
+    api.pushMux({
+      rpcId: 'approval-replayed',
+      payload: { type: 'approval/requested', sessionId: 's1', approvalId: 'a1', toolName: 'terminal' },
+    } as unknown as RpcRequest<MuxFrame>)
+    await sleep(30)
+    expect(await firstManager.wait({ sessionId: 's1', timeoutMs: 0 })).toMatchObject({
+      status: 'APPROVAL_REQUIRED', approval: { rpcId: 'approval-replayed' },
+    })
+    firstManager.stopClients()
+
+    // The Host's stable-rpc-id replay contract is represented by replaying the
+    // same envelope to the newly connected MCP client.
+    api.pushMux({
+      rpcId: 'approval-replayed',
+      payload: { type: 'approval/requested', sessionId: 's1', approvalId: 'a1', toolName: 'terminal' },
+    } as unknown as RpcRequest<MuxFrame>)
+    const secondManager = managerWith(api, sameDomain)
+    await secondManager.startOrConnect({ sessionId: 's1' })
+    await sleep(30)
+    expect(await secondManager.wait({ sessionId: 's1', timeoutMs: 0 })).toMatchObject({
+      status: 'APPROVAL_REQUIRED', approval: { rpcId: 'approval-replayed' },
+    })
+  })
+})
+
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 const s1Packet = (seq: number): DshEvent => event('user/message', seq, {
   content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify({
@@ -342,10 +415,41 @@ describe('wait cadence', () => {
     expect(observed.workerState).toBe('IDLE')
     expect(observed.wait).toEqual({ reason: 'TIMEOUT', timeoutMs: 150 })
     expect(observed.progress?.projectActivity).toEqual({
+      coverage: 'complete',
       edits: { total: 1, files: ['src/a.ts'] },
-      verification: { total: 0, commands: [] },
+      verification: { total: 0, commands: [], evidence: [] },
     })
     expect(observed.progress?.steps).toEqual({ completed: 1, delta: 1 })
+    expect(api.historyCalls).toBe(2)
+  })
+
+  it('folds mux event churn from cache without refreshing HTTP history for every event', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [s1Packet(1)] })
+    const manager = managerWith(api, sameDomain)
+    const pending = manager.wait({ taskId: 's1', timeoutMs: 180 })
+    await sleep(30)
+    for (const pushed of [
+      event('turn/start', 2, { turn: 1 }),
+      toolCall(3, 'r1', 'read', { file_path: 'src/a.ts' }),
+      toolResult(4, 'r1'),
+      event('step/end', 5, { turn: 1, step: 1 }),
+    ]) {
+      api.pushMux({
+        rpcId: `mux-${pushed.seq}`,
+        payload: { type: 'session/event', sessionId: 's1', event: pushed },
+      } as unknown as RpcRequest<MuxFrame>)
+      await sleep(15)
+    }
+
+    const observed = await pending
+    expect(observed).toMatchObject({
+      status: 'WAITING',
+      progress: { steps: { completed: 1, delta: 1 }, tools: { totalCalls: 1, deltaCalls: 1 } },
+    })
+    // One initial history fetch and one cadence-boundary reconciliation, not
+    // one fetch per mux event.
+    expect(api.historyCalls).toBe(2)
   })
 
   it('returns immediately for a terminal completed state', async () => {

@@ -18,6 +18,8 @@ export interface FakeRow {
 
 export class FakeApi {
   readonly rows = new Map<string, FakeRow>()
+  historyCalls = 0
+  listCalls = 0
   private readonly muxFrames: RpcRequest<MuxFrame>[] = []
   private readonly hostFrames: RpcRequest<HostFrame>[] = []
   private nextSeq = 1
@@ -78,8 +80,12 @@ export class FakeApi {
 
   readonly api = {
     sessions: {
-      list: async () => this.ok({ items: this.listItems() }),
+      list: async () => {
+        this.listCalls++
+        return this.ok({ items: this.listItems() })
+      },
       history: async (payload: { sessionId: string }) => {
+        this.historyCalls++
         const row = this.rows.get(payload.sessionId)
         const events = row?.events ?? []
         return this.ok({ events: events.map(event => ({ event })), hasMore: false })

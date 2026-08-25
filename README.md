@@ -19,6 +19,14 @@ pnpm host:start     # start the independent DSH Web Host on http://127.0.0.1:808
 pnpm run doctor --live  # additionally verify the running Host identity/protocol
 ```
 
+Install the included Codex supervisor skill into the personal skill directory shown by your Codex installation, then restart Codex:
+
+```sh
+pnpm skill:install -- --target /absolute/path/to/personal/skills
+```
+
+The installer deliberately requires an explicit absolute target instead of guessing a global directory. Re-running with `--force` preserves the previous installation as a timestamped sibling backup before replacing it.
+
 Then copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path — the only machine-specific value. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
 
 For the full operator guide — prerequisites, the compatibility contract and update policy, Host independence, browser visibility, clean failure recovery, and the official-upstream-PR limitation — read **`DEPLOYMENT.md`**.
@@ -36,7 +44,9 @@ To update the pin: change `DSH_PINNED_COMMIT` in `scripts/dsh-gate-lib.mjs`, rem
 
 ## Supervision cadence
 
-`dsh_wait` runs a five-minute aggregated progress cadence: by default it returns about one observation every 300000 ms, and it returns early only for a material supervisor boundary — for example a terminal state, approval/question, worker-requested decision, checkpoint, blocker, or escalation. Ordinary event churn never triggers rapid repeated wait calls. Each cadence observation aggregates progress since the previous `asOfSeq` — step delta, tool counts, token deltas — plus a compact, bounded `projectActivity` summary of the distinct project files touched by successful edits/writes and the targeted verification commands attempted (for example `pnpm verify`). A worker can add one bounded semantic milestone through `supervisor_progress`; duplicate or overly frequent ordinary records are ignored, the tool never ends the turn, and only `needsSupervisor=true` returns early. Terminal observations carry the task-scope totals. No raw reasoning, logs, diffs, tool arguments, or tool outputs are ever included.
+`dsh_wait` runs a five-minute aggregated progress cadence: by default it returns about one observation every 300000 ms, and it returns early only for a material supervisor boundary — for example a terminal state, approval/question, worker-requested decision, checkpoint, blocker, or escalation. Ordinary mux event churn is folded from memory and never triggers one HTTP history refresh per event; reconciliation is periodic and mandatory before a visible boundary. Each cadence observation aggregates progress since the previous `asOfSeq` — step delta, tool counts, token deltas — plus a compact, bounded `projectActivity` summary of distinct project files touched by successful recognized edits/writes and targeted verification commands. Activity says whether instrumentation coverage is `complete` or `partial`, and verification evidence reports event-correlated outcomes separately from worker handoff claims. A worker can add one bounded semantic milestone through `supervisor_progress`; duplicate or overly frequent ordinary records are ignored, the tool never ends the turn, and only `needsSupervisor=true` returns early. Terminal observations carry the task-scope totals. No raw reasoning, logs, diffs, tool arguments, or tool outputs are ever included.
+
+When several Host URLs are configured, reconnect by `sessionId` discovers the existing session and binds the run to that Host. Connection failures are returned as structured `HOST_FAILED` envelopes instead of being flattened into “session not found.” Approval and question answers must echo the current stable `rpcId`, so a replayed or replaced interaction cannot be answered accidentally.
 
 DSH session identity and supervised execution identity are separate. `dsh_start_or_connect` returns the durable `sessionId`; every `dsh_task` returns a new UUID `runId`. Wait, answer, steer, cancel, child-observation, and interrupt calls carry both values, so a delayed control for an older run is rejected before it can affect a newer turn in the same session.
 

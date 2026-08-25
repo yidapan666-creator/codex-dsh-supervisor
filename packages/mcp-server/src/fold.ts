@@ -97,6 +97,10 @@ const MAX_PATH_LABEL = 200
 const MAX_ACTIVITY_FILES = 10
 const MAX_ACTIVITY_COMMANDS = 5
 const MAX_COMMAND_LABEL = 60
+const CLASSIFIED_NON_MUTATING_TOOLS = new Set([
+  'read', 'view', 'grep', 'glob', 'find', 'ls',
+  'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure',
+])
 
 /** Strip control characters and bound the length of any surfaced label. */
 function cleanLabel(value: string, max: number): string | undefined {
@@ -148,9 +152,11 @@ function verificationCommandLabel(name: string, argsText: string): string | unde
   return cleanLabel(action === undefined ? first : `${first} ${action}`, MAX_COMMAND_LABEL)
 }
 
-/** callIds whose first correlated tool/result succeeded, indexed once per scope. */
-function successfulCallIds(events: readonly DshEvent[], fromSeq: number, toSeq: number): Set<string> {
-  const okById = new Map<string, boolean>()
+type RuntimeToolOutcome = 'passed' | 'failed' | 'pending'
+
+/** First correlated runtime outcome for each call id, indexed once per scope. */
+function callOutcomes(events: readonly DshEvent[], fromSeq: number, toSeq: number): Map<string, RuntimeToolOutcome> {
+  const outcomeById = new Map<string, RuntimeToolOutcome>()
   for (const event of events) {
     if (event.seq < fromSeq || event.seq > toSeq) continue
     if (event.type !== 'tool/result') continue
@@ -159,13 +165,13 @@ function successfulCallIds(events: readonly DshEvent[], fromSeq: number, toSeq: 
       error?: unknown
     }
     const callId = data.message?.source?.callId
-    if (typeof callId !== 'string' || okById.has(callId)) continue
+    if (typeof callId !== 'string' || outcomeById.has(callId)) continue
     const resultBlock = data.message?.content?.find(block => block.type === 'tool-result')
-    okById.set(callId, data.error === undefined && resultBlock?.isError === false)
+    outcomeById.set(callId, data.error !== undefined || resultBlock?.isError === true
+      ? 'failed'
+      : resultBlock?.isError === false ? 'passed' : 'pending')
   }
-  const successful = new Set<string>()
-  for (const [callId, ok] of okById) if (ok) successful.add(callId)
-  return successful
+  return outcomeById
 }
 
 /**
@@ -180,9 +186,11 @@ export function projectActivityIn(
   toSeq: number,
   workspaceCwd?: string,
 ): ProjectActivity {
-  const successful = successfulCallIds(events, fromSeq, toSeq)
+  const outcomes = callOutcomes(events, fromSeq, toSeq)
   const editFiles = new Set<string>()
   const verificationCommands = new Set<string>()
+  const verificationEvidence = new Map<string, 'passed' | 'failed' | 'pending'>()
+  let coverage: 'complete' | 'partial' = 'complete'
   let steps = 0
   let toolCalls = 0
   const toolCallsByName: Record<string, number> = {}
@@ -197,17 +205,30 @@ export function projectActivityIn(
     const data = event.data as { name?: unknown; arguments?: unknown; callId?: unknown }
     const name = typeof data.name === 'string' ? data.name : 'unknown'
     toolCallsByName[name] = (toolCallsByName[name] ?? 0) + 1
-    if (typeof data.arguments !== 'string') continue
-    if (typeof data.callId === 'string' && successful.has(data.callId)) {
+    if (!(name in MUTATING_TOOLS) && !CLASSIFIED_NON_MUTATING_TOOLS.has(name)) coverage = 'partial'
+    if (typeof data.arguments !== 'string') {
+      coverage = 'partial'
+      continue
+    }
+    const outcome = typeof data.callId === 'string' ? outcomes.get(data.callId) : undefined
+    if (outcome === 'passed') {
       const path = mutatingFilePath(name, data.arguments, workspaceCwd)
       if (path !== undefined) editFiles.add(path)
     }
     const command = verificationCommandLabel(name, data.arguments)
-    if (command !== undefined) verificationCommands.add(command)
+    if (command !== undefined) {
+      verificationCommands.add(command)
+      verificationEvidence.set(command, outcome ?? 'pending')
+    }
   }
   return {
+    coverage,
     edits: { total: editFiles.size, files: [...editFiles].slice(0, MAX_ACTIVITY_FILES) },
-    verification: { total: verificationCommands.size, commands: [...verificationCommands].slice(0, MAX_ACTIVITY_COMMANDS) },
+    verification: {
+      total: verificationCommands.size,
+      commands: [...verificationCommands].slice(0, MAX_ACTIVITY_COMMANDS),
+      evidence: [...verificationEvidence].slice(0, MAX_ACTIVITY_COMMANDS).map(([command, outcome]) => ({ command, outcome })),
+    },
     steps,
     toolCalls,
     toolCallsByName,
@@ -217,7 +238,7 @@ export function projectActivityIn(
 
 /** The delta-scoped edit/write + verification summary used by the heartbeat. */
 function editWriteActivity(activity: ProjectActivity): EditWriteActivity {
-  return { edits: activity.edits, verification: activity.verification }
+  return { coverage: activity.coverage, edits: activity.edits, verification: activity.verification }
 }
 
 interface TokenBuckets {

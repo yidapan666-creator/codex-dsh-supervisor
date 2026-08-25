@@ -188,8 +188,9 @@ describe('authoritative completion fold', () => {
         cacheWriteTokens: 1,
       },
       projectActivity: {
+        coverage: 'complete',
         edits: { total: 0, files: [] },
-        verification: { total: 0, commands: [] },
+        verification: { total: 0, commands: [], evidence: [] },
       },
       lastActivity: { seq: 7, time: 7, kind: 'step', step: 1 },
     })
@@ -346,10 +347,18 @@ describe('project activity summarization', () => {
     ]
     const activity = projectActivityIn(events, 1, 17)
     expect(activity.edits).toEqual({ total: 2, files: ['packages/a/src/x.ts', 'packages/a/src/y.ts'] })
-    expect(activity.verification).toEqual({ total: 2, commands: ['pnpm verify', 'vitest run'] })
+    expect(activity.verification).toEqual({
+      total: 2,
+      commands: ['pnpm verify', 'vitest run'],
+      evidence: [
+        { command: 'pnpm verify', outcome: 'passed' },
+        { command: 'vitest run', outcome: 'passed' },
+      ],
+    })
     expect(activity.steps).toBe(1)
     expect(activity.toolCalls).toBe(8)
     expect(activity.toolCallsByName).toEqual({ edit: 3, write: 1, bash: 3, read: 1 })
+    expect(activity.coverage).toBe('partial')
     expect(activity.tokenUsage).toEqual({ uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })
   })
 
@@ -373,6 +382,26 @@ describe('project activity summarization', () => {
       toolResult(2, 'e1', false),
     ]
     expect(projectActivityIn(events, 1, 2).edits).toEqual({ total: 0, files: [] })
+  })
+
+  it('labels incomplete tool classification as partial and correlates failed verification evidence', () => {
+    const events = [
+      toolCall(1, 'custom-1', 'project_codegen', { target: 'src/generated.ts' }),
+      toolResult(2, 'custom-1'),
+      toolCall(3, 'verify-1', 'bash', { command: 'pytest' }),
+      toolResult(4, 'verify-1', false),
+      toolCall(5, 'verify-2', 'bash', { command: 'eslint src' }),
+      event('tool/result', 6, {
+        message: { source: { callId: 'verify-2' }, content: [{ type: 'tool-result', content: [] }] },
+      }),
+    ]
+    const activity = projectActivityIn(events, 1, 6)
+    expect(activity.coverage).toBe('partial')
+    expect(activity.edits).toEqual({ total: 0, files: [] })
+    expect(activity.verification.evidence).toEqual([
+      { command: 'pytest', outcome: 'failed' },
+      { command: 'eslint', outcome: 'pending' },
+    ])
   })
 
   it('keeps surfaced edit paths relative to the authoritative cwd and rejects escapes', () => {
@@ -424,8 +453,9 @@ describe('project activity summarization', () => {
     const runtime = state(events, { workerState: 'RUNNING' })
     const heartbeat = progressHeartbeat(runtime, 2)
     expect(heartbeat.projectActivity).toEqual({
+      coverage: 'complete',
       edits: { total: 1, files: ['b.ts'] },
-      verification: { total: 0, commands: [] },
+      verification: { total: 0, commands: [], evidence: [] },
     })
   })
 
@@ -450,8 +480,11 @@ describe('project activity summarization', () => {
     const observed = deriveObservation(state(events))
     expect(observed.status).toBe('COMPLETED')
     expect(observed.projectActivity).toMatchObject({
+      coverage: 'partial',
       edits: { total: 1, files: ['src/gateway.ts'] },
-      verification: { total: 1, commands: ['pnpm verify'] },
+      verification: {
+        total: 1, commands: ['pnpm verify'], evidence: [{ command: 'pnpm verify', outcome: 'passed' }],
+      },
       steps: 0,
       toolCalls: 3,
       toolCallsByName: { edit: 1, bash: 1, supervisor_handoff: 1 },

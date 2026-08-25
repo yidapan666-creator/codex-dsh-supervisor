@@ -2,6 +2,11 @@
 
 Date: 2026-08-20 (design review; implementation carried out later)
 
+> Historical identity note: examples below that equate `taskId` with `sessionId`
+> describe the v1 design. The implemented v2 contract in `docs/protocol.md` and
+> `docs/supervision-protocol-v2.md` uses a durable `sessionId` plus a unique
+> per-execution `runId`; those current documents are authoritative.
+
 Decision status: adopted with deviations — this document is the historical design review. The implementation
 in this repository follows the architecture below (a small MCP translation surface, one independent DSH Web
 Host, durable supervisor handoffs, and a bounded failure budget) with the deviations recorded in the README

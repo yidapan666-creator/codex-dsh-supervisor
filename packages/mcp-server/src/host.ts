@@ -22,6 +22,11 @@ export interface HostLaunchConfig {
 
 export type SessionSnapshot = TaskRuntimeState
 
+interface CachedSessionMetadata {
+  cwd?: string
+  telemetry?: TaskRuntimeState['telemetry']
+}
+
 function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; error: { code: string; message: string } } }): T {
   if (!response.result.ok) throw new Error(`${response.result.error.code}: ${response.result.error.message}`)
   return response.result.value
@@ -69,6 +74,7 @@ export class HostConnection {
   private readonly hostErrors = new Map<string, string>()
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly questions = new Map<string, PendingQuestion>()
+  private readonly metadata = new Map<string, CachedSessionMetadata>()
 
   constructor(readonly baseUrl: string, readonly api: IApiClient = new WebApiClient(baseUrl)) {
     this.controller = new ConnectionController(this.api, {
@@ -149,6 +155,7 @@ export class HostConnection {
     this.hostErrors.delete(sessionId)
     this.approvals.delete(sessionId)
     this.questions.delete(sessionId)
+    this.metadata.delete(sessionId)
   }
 
   async ensureConnected(timeoutMs = 10_000): Promise<HostDescription> {
@@ -237,7 +244,11 @@ export class HostConnection {
       ...telemetryValues?.sessionStats === undefined ? {} : { sessionStats: telemetryValues.sessionStats },
       ...telemetryValues?.subagent === undefined ? {} : { subagent: telemetryValues.subagent },
     }
-    return {
+    this.metadata.set(sessionId, {
+      ...row.cwd === undefined ? {} : { cwd: row.cwd },
+      ...telemetry === undefined ? {} : { telemetry },
+    })
+    return this.cachedSession(sessionId) ?? {
       hostInstanceId: description.hostInstanceId,
       events: [...(this.events.get(sessionId)?.values() ?? [])].sort((a, b) => a.seq - b.seq),
       workerState: this.running.get(sessionId) === true ? 'RUNNING' : this.running.get(sessionId) === false ? 'IDLE' : 'UNKNOWN',
@@ -249,16 +260,37 @@ export class HostConnection {
     }
   }
 
-  waitForChange(timeoutMs: number): Promise<void> {
+  /** Build a no-I/O snapshot from mux/host frames plus the last authoritative metadata. */
+  cachedSession(sessionId: string): SessionSnapshot | undefined {
+    const description = this.description
+    const metadata = this.metadata.get(sessionId)
+    if (description === undefined || metadata === undefined) return undefined
+    const pendingApproval = this.approvals.get(sessionId)
+    const pendingQuestion = this.questions.get(sessionId)
+    const hostError = this.hostErrors.get(sessionId)
+    return {
+      hostInstanceId: description.hostInstanceId,
+      events: [...(this.events.get(sessionId)?.values() ?? [])].sort((a, b) => a.seq - b.seq),
+      workerState: this.running.get(sessionId) === true ? 'RUNNING' : this.running.get(sessionId) === false ? 'IDLE' : 'UNKNOWN',
+      ...pendingApproval === undefined ? {} : { pendingApproval },
+      ...pendingQuestion === undefined ? {} : { pendingQuestion },
+      ...hostError === undefined ? {} : { hostError },
+      ...metadata.telemetry === undefined ? {} : { telemetry: metadata.telemetry },
+      ...metadata.cwd === undefined ? {} : { cwd: metadata.cwd },
+    }
+  }
+
+  waitForChange(timeoutMs: number): Promise<boolean> {
     return new Promise(resolve => {
-      const timer = setTimeout(() => { dispose(); resolve() }, timeoutMs)
-      const dispose = this.subscribe(() => { clearTimeout(timer); dispose(); resolve() })
+      const timer = setTimeout(() => { dispose(); resolve(false) }, timeoutMs)
+      const dispose = this.subscribe(() => { clearTimeout(timer); dispose(); resolve(true) })
     })
   }
 
-  async answerApproval(sessionId: string, outcome: 'allowed-once' | 'rejected'): Promise<void> {
+  async answerApproval(sessionId: string, rpcId: string, outcome: 'allowed-once' | 'rejected'): Promise<void> {
     const pending = this.approvals.get(sessionId)
     if (pending === undefined) throw new Error(`no pending approval for ${sessionId}`)
+    if (pending.rpcId !== rpcId) throw new Error(`stale approval rpcId ${rpcId}; active rpcId is ${pending.rpcId}`)
     const receipt = await this.api.respond({
       type: 'client-response', rpcId: pending.rpcId as never,
       result: { ok: true, value: { sessionId, approvalId: pending.approvalId, outcome } },
@@ -266,9 +298,10 @@ export class HostConnection {
     if (!receipt.accepted) throw new Error(`approval response rejected: ${receipt.reason}`)
   }
 
-  async answerQuestion(sessionId: string, answers: { id: string; selected: string[]; custom?: string | undefined }[]): Promise<void> {
+  async answerQuestion(sessionId: string, rpcId: string, answers: { id: string; selected: string[]; custom?: string | undefined }[]): Promise<void> {
     const pending = this.questions.get(sessionId)
     if (pending === undefined) throw new Error(`no pending question for ${sessionId}`)
+    if (pending.rpcId !== rpcId) throw new Error(`stale question rpcId ${rpcId}; active rpcId is ${pending.rpcId}`)
     const receipt = await this.api.respond({
       type: 'client-response', rpcId: pending.rpcId as never,
       result: { ok: true, value: { sessionId, answer: { answers } } },

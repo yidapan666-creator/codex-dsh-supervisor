@@ -9,12 +9,30 @@ function result(value: JsonRecord): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value }
 }
 
+/** Keep tool failures machine-readable so Host outages are not flattened into session lookup errors. */
+export function toolFailureEnvelope(error: unknown): JsonRecord {
+  const message = error instanceof Error ? error.message : String(error)
+  const lookupFailure = /session .*\b(?:not found|does not exist|no longer present)\b/i.test(message)
+  const hostFailure = !lookupFailure && /DSH Host|configured Host|connecting to|connect to any/i.test(message)
+  return {
+    schemaVersion: 1,
+    status: 'FAILED',
+    failure: {
+      kind: hostFailure ? 'HOST_FAILED' : 'PROTOCOL_ERROR',
+      message,
+      retryable: hostFailure,
+    },
+  }
+}
+
 function guarded<T extends JsonRecord>(handler: (input: T) => Promise<JsonRecord | z.infer<typeof observationSchema>>) {
   return async (input: T): Promise<CallToolResult> => {
     try { return result(await handler(input)) } catch (error) {
+      const envelope = toolFailureEnvelope(error)
       return {
         isError: true,
-        content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }],
+        content: [{ type: 'text', text: JSON.stringify(envelope) }],
+        structuredContent: envelope,
       }
     }
   }
@@ -29,7 +47,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'dsh_wait runs the five-minute aggregated cadence: one observation about every 300000 ms, returning early only '
       + 'for a material supervisor boundary (for example terminal, approval/question, worker-requested decision, checkpoint, blocker, or escalation). A WAITING/TIMEOUT return carries aggregated '
       + 'progress — step/tool/token deltas plus compact project edit/verification activity — since the prior observation; do not '
-      + 're-poll on ordinary event churn. Surface compact progress to the user and recap steps, tools, token deltas, project activity, '
+      + 're-poll on ordinary event churn. Surface activity coverage and runtime verification evidence separately from worker claims, and recap steps, tools, token deltas, project activity, '
       + 'and verification results at terminal state. '
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
@@ -77,17 +95,17 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.steer(input)))
 
   server.registerTool('dsh_answer_question', {
-    description: 'Answer the current DSH user-question batch as one response.',
+    description: 'Answer the current DSH user-question batch as one response. rpcId must match the current pending interaction; stale replies are rejected.',
     inputSchema: z.object({
-      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
+      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(), rpcId: z.string(),
       answers: z.array(z.object({ id: z.string(), selected: z.array(z.string()), custom: z.string().optional() })),
     }),
   }, guarded(input => manager.answerQuestion(input)))
 
   server.registerTool('dsh_answer_approval', {
-    description: 'Resolve the current DSH approval request.',
+    description: 'Resolve the current DSH approval request. rpcId must match the current pending interaction; stale replies are rejected.',
     inputSchema: z.object({
-      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
+      sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(), rpcId: z.string(),
       outcome: z.enum(['allowed-once', 'rejected']),
     }),
   }, guarded(input => manager.answerApproval(input)))

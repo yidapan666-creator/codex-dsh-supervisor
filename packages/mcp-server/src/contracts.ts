@@ -29,6 +29,8 @@ const tokenDeltaSchema = z.object({
 
 /** Bounded summary of edit/write and targeted verification activity since the prior observation. */
 export const editWriteActivitySchema = z.object({
+  /** Complete only when every observed tool is classifiable for project mutation coverage. */
+  coverage: z.enum(['complete', 'partial']),
   edits: z.object({
     /** Distinct project files touched by successful mutating tool calls. */
     total: z.number().int().nonnegative(),
@@ -40,6 +42,11 @@ export const editWriteActivitySchema = z.object({
     total: z.number().int().nonnegative(),
     /** Bounded sample of compact command labels. */
     commands: z.array(z.string()),
+    /** Runtime-correlated tool outcomes, distinct from worker handoff claims. */
+    evidence: z.array(z.object({
+      command: z.string(),
+      outcome: z.enum(['passed', 'failed', 'pending']),
+    })),
   }),
 })
 export type EditWriteActivity = z.infer<typeof editWriteActivitySchema>
