@@ -63,6 +63,7 @@ interface TaskPacketV2 {
   authority?: {
     maxDirectChildren?: number
     preAuthorizedActions?: string[]
+    preAuthorizedDecisionCategories?: DecisionCategory[]
   }
 }
 ```
@@ -118,12 +119,24 @@ interface SupervisorProgress {
   currentHypothesis?: string
   risk?: string
   needsSupervisor: boolean
+  decision?: {
+    category: DecisionCategory
+    impact: 'low' | 'medium' | 'high'
+    blocking: boolean
+    requiresHuman?: boolean
+    request: string
+    options?: string[]
+    recommendation?: string
+  }
 }
 ```
 
 The tool does not conclude the turn. The runtime deduplicates and rate-limits
 progress records. Ordinary records are folded into the next five-minute
-heartbeat. Only `needsSupervisor: true` creates an early material boundary.
+heartbeat. `needsSupervisor` is a legacy hint; the structured request is folded
+through the versioned decision policy. The policy outcome—not the boolean—decides
+whether the request creates an early boundary. Pre-authorization comes only from
+the task packet and never from the worker.
 Raw reasoning, transcripts, diffs, tool arguments, and tool output never enter
 the heartbeat.
 

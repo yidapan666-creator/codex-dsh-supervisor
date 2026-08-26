@@ -114,5 +114,15 @@ describe('bounded supervisor progress', () => {
     expect(supervisorProgressDecision([
       packet(v2), call(progress, 1_000), call(decision, 2_000),
     ], decision, 2_000)).toEqual({ accepted: true })
+    const structuredDecision = {
+      ...changed,
+      decision: {
+        category: 'information' as const, impact: 'low' as const, blocking: false,
+        request: 'Review this naming choice at the normal cadence.',
+      },
+    }
+    expect(supervisorProgressDecision([
+      packet(v2), call(progress, 1_000), call(structuredDecision, 2_000),
+    ], structuredDecision, 2_000)).toEqual({ accepted: true })
   })
 })

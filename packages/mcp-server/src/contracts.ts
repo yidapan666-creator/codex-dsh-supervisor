@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { DECISION_CATEGORIES, DECISION_IMPACTS } from '@dsh-gate/decision-policy'
 
 export const failureKindSchema = z.enum([
   'WORKER_FAILED', 'HOST_FAILED', 'MISSING_HANDOFF', 'PROTOCOL_ERROR',
@@ -85,6 +86,29 @@ export const progressHeartbeatSchema = z.object({
 })
 export type ProgressHeartbeat = z.infer<typeof progressHeartbeatSchema>
 
+export const workerDecisionRequestSchema = z.object({
+  category: z.enum(DECISION_CATEGORIES),
+  impact: z.enum(DECISION_IMPACTS),
+  blocking: z.boolean(),
+  requiresHuman: z.boolean().optional(),
+  request: z.string().min(1).max(512),
+  options: z.array(z.string().min(1).max(256)).max(5).optional(),
+  recommendation: z.string().min(1).max(512).optional(),
+}).strict()
+
+export const decisionOutcomeSchema = z.object({
+  timing: z.enum(['cadence', 'immediate']),
+  audience: z.enum(['none', 'supervisor', 'human']),
+  action: z.enum([
+    'CONTINUE_WAIT', 'SURFACE_PROGRESS', 'RESOLVE_INTERACTION', 'REVIEW_WORKER_REQUEST',
+    'ASK_HUMAN', 'ACCEPT_TERMINAL', 'REVIEW_FAILURE', 'QUEUE_CONTINUATION',
+  ]),
+  reasonCode: z.string(),
+  policyVersion: z.string(),
+  matchedRuleId: z.string(),
+  protocolInvariant: z.boolean(),
+}).strict()
+
 /** Bounded worker-supplied semantic context; quantitative fields stay runtime-derived. */
 export const supervisorProgressSchema = z.object({
   sessionId: z.string().min(1).max(512),
@@ -95,6 +119,7 @@ export const supervisorProgressSchema = z.object({
   currentHypothesis: z.string().max(1_024).optional(),
   risk: z.string().max(512).optional(),
   needsSupervisor: z.boolean(),
+  decision: workerDecisionRequestSchema.optional(),
 }).strict()
 export type SupervisorProgress = z.infer<typeof supervisorProgressSchema>
 
@@ -139,6 +164,7 @@ export const observationSchema = z.object({
   projectActivity: projectActivitySchema.optional(),
   progress: progressHeartbeatSchema.optional(),
   supervisorProgress: supervisorProgressSchema.optional(),
+  decision: decisionOutcomeSchema.optional(),
   asOfSeq: z.number().int().min(-1),
   boundarySeq: z.number().int().min(-1),
   sessionId: z.string(),
@@ -184,6 +210,7 @@ export const taskPacketV2Schema = z.object({
   authority: z.object({
     maxDirectChildren: z.number().int().min(0).max(64).optional(),
     preAuthorizedActions: packetListSchema.optional(),
+    preAuthorizedDecisionCategories: z.array(z.enum(DECISION_CATEGORIES)).max(10).optional(),
   }).strict().optional(),
   /** Migration-only alias for workers that still read the v1 taskId field. */
   taskId: z.string().min(1).max(512).optional(),

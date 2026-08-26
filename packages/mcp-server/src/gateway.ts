@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
+import {
+  DEFAULT_DECISION_POLICY, evaluateDecision, parseDecisionPolicy,
+  type DecisionCategory, type DecisionPolicy,
+} from '@dsh-gate/decision-policy'
 import { deriveObservation, parseTaskPacket, progressObservation, taskBoundarySeq, timeoutObservation } from './fold.js'
 import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
@@ -98,6 +102,7 @@ export interface GatewayConfig {
   defaultProvider?: string
   defaultModel?: string
   defaultReasoningEffort?: string
+  decisionPolicy?: DecisionPolicy
 }
 
 /** The five-minute aggregated progress cadence used by {@link GatewayManager.wait}. */
@@ -119,6 +124,7 @@ export class GatewayManager {
   private readonly knownUrls: string[]
   private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
+  private readonly decisionPolicy: DecisionPolicy
   /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
   private admissionTail: Promise<void> = Promise.resolve()
 
@@ -126,6 +132,7 @@ export class GatewayManager {
     this.knownUrls = [...new Set(config.hostUrls.map(normalizedUrl))]
     this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
     this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
+    this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
   }
 
   static fromEnvironment(env: NodeJS.ProcessEnv = process.env): GatewayManager {
@@ -141,6 +148,9 @@ export class GatewayManager {
       defaultProvider: env.DSH_WORKER_PROVIDER ?? 'deepseek-official',
       defaultModel: env.DSH_WORKER_MODEL ?? 'deepseek-v4-flash',
       defaultReasoningEffort: env.DSH_WORKER_REASONING_EFFORT ?? 'high',
+      ...env.DSH_DECISION_POLICY_JSON === undefined
+        ? {}
+        : { decisionPolicy: parseDecisionPolicy(JSON.parse(env.DSH_DECISION_POLICY_JSON) as unknown) },
     })
   }
 
@@ -286,7 +296,11 @@ export class GatewayManager {
     escalationConditions?: string[] | undefined
     parentRunId?: string | undefined
     baseline?: { head?: string | undefined; statusSummary: string } | undefined
-    authority?: { maxDirectChildren?: number | undefined; preAuthorizedActions?: string[] | undefined } | undefined
+    authority?: {
+      maxDirectChildren?: number | undefined
+      preAuthorizedActions?: string[] | undefined
+      preAuthorizedDecisionCategories?: DecisionCategory[] | undefined
+    } | undefined
   }): Promise<Record<string, unknown>> {
     const sessionId = sessionIdOf(input)
     const connection = await this.locate(sessionId)
@@ -372,7 +386,7 @@ export class GatewayManager {
     sessionId: string,
     runId: string | undefined,
   ): Observation {
-    const observation = deriveObservation(snapshot)
+    const observation = deriveObservation(snapshot, this.decisionPolicy)
     if (observation.sessionId !== sessionId) {
       return {
         ...observation,
@@ -382,6 +396,7 @@ export class GatewayManager {
         stage: 'protocol',
         summary: 'The latest durable task packet does not match this session id.',
         failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.sessionId}`, retryable: false },
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.decisionPolicy),
       }
     }
     if (runId !== undefined && runId !== observation.runId) {
@@ -396,6 +411,7 @@ export class GatewayManager {
           retryable: false,
           stale: true,
         },
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.decisionPolicy),
       }
     }
     return observation
@@ -421,7 +437,7 @@ export class GatewayManager {
       }
       progressFromAsOfSeq ??= observation.asOfSeq
       const observed = progressObservation(observation, snapshot, progressFromAsOfSeq)
-      if (observation.status !== 'WAITING') {
+      if (observation.decision?.timing === 'immediate') {
         // Mux frames make boundaries visible immediately, but reconcile once
         // before returning so missing frames or replay state cannot decide a
         // material/terminal result from cache alone.
@@ -442,7 +458,7 @@ export class GatewayManager {
           authoritative = true
           const finalObservation = this.observationForRun(snapshot, sessionId, input.runId)
           const finalObserved = progressObservation(finalObservation, snapshot, progressFromAsOfSeq)
-          return finalObservation.status === 'WAITING'
+          return finalObservation.decision?.timing !== 'immediate'
             ? timeoutObservation(finalObserved, timeoutMs)
             : finalObserved
         }
@@ -462,7 +478,7 @@ export class GatewayManager {
   }
 
   private assertCurrentRun(snapshot: Parameters<typeof deriveObservation>[0], runId: string | undefined): Observation {
-    const observation = deriveObservation(snapshot)
+    const observation = deriveObservation(snapshot, this.decisionPolicy)
     if (runId !== undefined && observation.runId !== runId) {
       throw new Error(`stale run ${runId}; active run is ${observation.runId}`)
     }

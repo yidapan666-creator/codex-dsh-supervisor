@@ -1,5 +1,9 @@
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import {
+  DEFAULT_DECISION_POLICY, evaluateDecision,
+  type DecisionOutcome, type DecisionPolicy, type DecisionSignal,
+} from '@dsh-gate/decision-policy'
+import {
   TASK_PACKET_END, TASK_PACKET_START,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
   taskPacketSchema, supervisorProgressSchema,
@@ -463,6 +467,7 @@ function latestSupervisorProgress(
       ...raw.currentHypothesis === undefined ? {} : { currentHypothesis: raw.currentHypothesis },
       ...raw.risk === undefined ? {} : { risk: raw.risk },
       needsSupervisor: raw.needsSupervisor,
+      ...raw.decision === undefined ? {} : { decision: raw.decision },
     })
     if (!parsed.success) continue
     return { progress: parsed.data, seq: result.seq }
@@ -562,14 +567,31 @@ function exhaustedFailureObservation(
   return undefined
 }
 
-export function deriveObservation(state: TaskRuntimeState): Observation {
+function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionPolicy): Observation {
   const boundary = taskPacketBoundary(state.events)
   const packet = boundary?.packet
   const commonBase = base(state, packet)
   const progressRecord = packet === undefined ? undefined : latestSupervisorProgress(state.events, packet)
+  const decisionRequest = progressRecord?.progress.decision
+  const supervisorResponded = progressRecord === undefined
+    ? false
+    : state.events.some(event => event.type === 'user/message' && event.seq > progressRecord.seq)
+  const workerDecision = progressRecord === undefined || supervisorResponded
+    || (decisionRequest === undefined && !progressRecord.progress.needsSupervisor)
+    ? undefined
+    : evaluateDecision({
+      signal: 'WORKER_DECISION',
+      category: decisionRequest?.category ?? 'unspecified',
+      impact: decisionRequest?.impact ?? 'medium',
+      blocking: decisionRequest?.blocking ?? progressRecord.progress.needsSupervisor,
+      ...decisionRequest?.requiresHuman === undefined ? {} : { requiresHuman: decisionRequest.requiresHuman },
+      explicitlyPreAuthorized: packet?.schemaVersion === 2
+        && packet.authority?.preAuthorizedDecisionCategories?.includes(decisionRequest?.category ?? 'unspecified') === true,
+    }, decisionPolicy)
   const common = {
     ...commonBase,
     ...progressRecord === undefined ? {} : { supervisorProgress: progressRecord.progress },
+    ...workerDecision === undefined ? {} : { decision: workerDecision },
   }
   if (packet === undefined) return {
     ...common,
@@ -590,17 +612,15 @@ export function deriveObservation(state: TaskRuntimeState): Observation {
     ...common, status: 'QUESTION_REQUIRED', stage: 'question', summary: 'Worker is waiting for an answer.', question: state.pendingQuestion,
   }
 
-  const supervisorResponded = progressRecord === undefined
-    ? false
-    : state.events.some(event => event.type === 'user/message' && event.seq > progressRecord.seq)
-  if (progressRecord?.progress.needsSupervisor === true && !supervisorResponded) return {
+  if (workerDecision?.timing === 'immediate' && progressRecord !== undefined && !supervisorResponded) return {
     ...common,
     status: 'SUPERVISOR_REQUIRED',
     boundarySeq: progressRecord.seq,
     stage: progressRecord.progress.phase,
-    summary: progressRecord.progress.risk === undefined
-      ? progressRecord.progress.milestone
-      : `${progressRecord.progress.milestone} Risk: ${progressRecord.progress.risk}`.slice(0, 2_048),
+    summary: decisionRequest?.request
+      ?? (progressRecord?.progress.risk === undefined
+        ? progressRecord?.progress.milestone ?? 'Worker requested a supervisor decision.'
+        : `${progressRecord.progress.milestone} Risk: ${progressRecord.progress.risk}`.slice(0, 2_048)),
   }
 
   const scopedState = boundary === undefined
@@ -632,6 +652,30 @@ export function deriveObservation(state: TaskRuntimeState): Observation {
     }
   }
   return { ...common, status: 'WAITING', stage: state.workerState === 'RUNNING' ? 'running' : 'idle', summary: 'No completed supervisor boundary observed.' }
+}
+
+function protocolSignal(observation: Observation): DecisionSignal {
+  switch (observation.status) {
+    case 'WAITING': return observation.supervisorProgress === undefined ? 'WAIT' : 'PROGRESS'
+    case 'APPROVAL_REQUIRED': return 'APPROVAL'
+    case 'QUESTION_REQUIRED': return 'QUESTION'
+    case 'SUPERVISOR_REQUIRED': return 'WORKER_DECISION'
+    case 'MAJOR_CHECKPOINT': return 'CHECKPOINT'
+    case 'COMPLETED': return 'TERMINAL_SUCCESS'
+    default: return 'TERMINAL_FAILURE'
+  }
+}
+
+/** Fold runtime state and attach the explainable policy outcome that controls delivery timing. */
+export function deriveObservation(
+  state: TaskRuntimeState,
+  decisionPolicy: DecisionPolicy = DEFAULT_DECISION_POLICY,
+): Observation {
+  const observation = deriveObservationRaw(state, decisionPolicy)
+  if (observation.decision !== undefined) return observation
+  const signal = protocolSignal(observation)
+  const decision: DecisionOutcome = evaluateDecision({ signal }, decisionPolicy)
+  return { ...observation, decision }
 }
 
 export function timeoutObservation(current: Observation, timeoutMs: number): Observation {

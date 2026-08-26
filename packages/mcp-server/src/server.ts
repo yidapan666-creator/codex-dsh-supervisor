@@ -2,6 +2,7 @@ import { McpServer, type CallToolResult } from '@modelcontextprotocol/server'
 import { z } from 'zod'
 import { observationSchema } from './contracts.js'
 import { GatewayManager } from './gateway.js'
+import { DECISION_CATEGORIES } from '@dsh-gate/decision-policy'
 
 type JsonRecord = Record<string, unknown>
 
@@ -45,7 +46,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'returns it: the runtime requires a valid matching supervisor_handoff result followed by that turn ending. '
       + 'Carry asOfSeq into afterAsOfSeq only as an observation cursor; DSH since is not a resume cursor. '
       + 'dsh_wait runs the five-minute aggregated cadence: one observation about every 300000 ms, returning early only '
-      + 'for a material supervisor boundary (for example terminal, approval/question, worker-requested decision, checkpoint, blocker, or escalation). A WAITING/TIMEOUT return carries aggregated '
+      + 'when the explainable decision outcome says immediate. Protocol boundaries are locked; structured worker requests are policy-evaluated. Follow decision.action and decision.audience instead of treating needsSupervisor as authority. A WAITING/TIMEOUT return carries aggregated '
       + 'progress — step/tool/token deltas plus compact project edit/verification activity — since the prior observation; do not '
       + 're-poll on ordinary event churn. Surface activity coverage and runtime verification evidence separately from worker claims, and recap steps, tools, token deltas, project activity, '
       + 'and verification results at terminal state. '
@@ -76,12 +77,13 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       authority: z.object({
         maxDirectChildren: z.number().int().min(0).max(64).optional(),
         preAuthorizedActions: z.array(z.string()).optional(),
+        preAuthorizedDecisionCategories: z.array(z.enum(DECISION_CATEGORIES)).optional(),
       }).optional(),
     }),
   }, guarded(input => manager.task(input)))
 
   server.registerTool('dsh_wait', {
-    description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early only for a material supervisor boundary, such as terminal state, approval/question, SUPERVISOR_REQUIRED, checkpoint, blocker, or escalation. A WAITING/TIMEOUT return is the cadence observation: aggregate progress since afterAsOfSeq, including step/tool/token deltas, compact project edit/verification activity, and the latest accepted bounded semantic milestone. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',
+    description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early when the attached explainable decision says timing=immediate; protocol boundaries are locked and structured worker requests are policy-evaluated. Follow decision.action/audience/reasonCode. A WAITING/TIMEOUT return is the cadence observation: aggregate progress since afterAsOfSeq, including step/tool/token deltas, compact project edit/verification activity, and the latest accepted bounded semantic milestone. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',
     inputSchema: z.object({
       sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
       afterAsOfSeq: z.number().int().min(-1).optional(), timeoutMs: z.number().int().min(0).max(300_000).optional(),

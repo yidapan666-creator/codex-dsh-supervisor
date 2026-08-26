@@ -78,6 +78,16 @@ export type SupervisorProgressArgs = ProgressIdentityArgs & {
   currentHypothesis?: string | undefined
   risk?: string | undefined
   needsSupervisor: boolean
+  decision?: {
+    category: 'architecture' | 'scope' | 'acceptance' | 'security' | 'destructive_action'
+      | 'credentials' | 'external_side_effect' | 'recovery' | 'information' | 'unspecified'
+    impact: 'low' | 'medium' | 'high'
+    blocking: boolean
+    requiresHuman?: boolean | undefined
+    request: string
+    options?: string[] | undefined
+    recommendation?: string | undefined
+  } | undefined
 }
 
 type TaskIdentity = {
@@ -184,6 +194,7 @@ function sameProgress(left: SupervisorProgressArgs, right: SupervisorProgressArg
     && left.currentHypothesis === right.currentHypothesis
     && left.risk === right.risk
     && left.needsSupervisor === right.needsSupervisor
+    && JSON.stringify(left.decision) === JSON.stringify(right.decision)
 }
 
 /**
@@ -207,7 +218,8 @@ export function supervisorProgressDecision(
   const previous = calls.at(-2)
   if (previous === undefined) return { accepted: true }
   if (sameProgress(previous.args, args)) return { accepted: false, reason: 'duplicate' }
-  if (!args.needsSupervisor && typeof previous.time === 'number' && now - previous.time < SUPERVISOR_PROGRESS_MIN_INTERVAL_MS) {
+  if (!args.needsSupervisor && args.decision === undefined
+    && typeof previous.time === 'number' && now - previous.time < SUPERVISOR_PROGRESS_MIN_INTERVAL_MS) {
     return { accepted: false, reason: 'rate_limited' }
   }
   return { accepted: true }
@@ -244,8 +256,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a '
       + 'Markdown report under `.dsh-handoff/<runId>/` inside the session cwd, include its relative path in '
       + '`artifacts`, and reference it from the concise summary. '
-      + 'Use `supervisor_progress` only for bounded milestone changes; it never ends the turn. Set needsSupervisor only '
-      + 'when an actual supervisor decision is required. '
+      + 'Use `supervisor_progress` only for bounded milestone changes; it never ends the turn. When a decision is needed, '
+      + 'include the structured decision category, impact, blocking state, request, options, and recommendation. '
+      + '`needsSupervisor` is a migration hint; the runtime policy decides whether the request interrupts immediately or '
+      + 'is folded into the normal progress cadence. Never claim pre-authorization yourself. '
       + 'A normal turn ending without that valid handoff is not success. Report repeated failures through '
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
       + 'whether two failures are semantically the same remains your responsibility.',
@@ -265,6 +279,21 @@ export function apply(ctx: Context, config: Config = {}): void {
       currentHypothesis: { type: 'string', maxLength: 1024 },
       risk: { type: 'string', maxLength: 512 },
       needsSupervisor: { type: 'boolean', required: true },
+      decision: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          category: {
+            type: 'string', required: true,
+            enum: ['architecture', 'scope', 'acceptance', 'security', 'destructive_action', 'credentials', 'external_side_effect', 'recovery', 'information', 'unspecified'],
+          },
+          impact: { type: 'string', required: true, enum: ['low', 'medium', 'high'] },
+          blocking: { type: 'boolean', required: true },
+          requiresHuman: { type: 'boolean' },
+          request: { type: 'string', required: true, maxLength: 512 },
+          options: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 256 } },
+          recommendation: { type: 'string', maxLength: 512 },
+        },
+      },
     },
     output: {
       schema: {
@@ -294,6 +323,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         ...args.currentHypothesis === undefined ? {} : { currentHypothesis: args.currentHypothesis },
         ...args.risk === undefined ? {} : { risk: args.risk },
         needsSupervisor: args.needsSupervisor,
+        ...args.decision === undefined ? {} : { decision: args.decision },
       }
       return Promise.resolve({ accepted: true as const, progress })
     },

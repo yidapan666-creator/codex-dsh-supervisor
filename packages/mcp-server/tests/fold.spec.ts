@@ -248,6 +248,10 @@ describe('authoritative completion fold', () => {
       sessionId: 's1', runId: packetV2.runId, phase: 'investigating',
       milestone: 'Two incompatible migration paths remain.', nextAction: 'Choose the compatibility policy.',
       risk: 'The choice changes the public API.', needsSupervisor: true,
+      decision: {
+        category: 'acceptance', impact: 'medium', blocking: true,
+        request: 'Choose the compatibility policy.', options: ['strict', 'compatible'], recommendation: 'compatible',
+      },
     }
     const observed = deriveObservation(state([
       event('user/message', 0, {
@@ -268,8 +272,53 @@ describe('authoritative completion fold', () => {
     expect(observed).toMatchObject({
       status: 'SUPERVISOR_REQUIRED', boundarySeq: 3, stage: 'investigating',
       supervisorProgress: { needsSupervisor: true, nextAction: 'Choose the compatibility policy.' },
+      decision: {
+        timing: 'immediate', audience: 'human', action: 'ASK_HUMAN',
+        matchedRuleId: 'worker.sensitive', reasonCode: 'SENSITIVE_OR_SCOPE_DECISION',
+      },
     })
     expect(() => observationSchema.parse(observed)).not.toThrow()
+  })
+
+  it('keeps a low-impact non-blocking worker request in the ordinary cadence', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'implementing',
+      milestone: 'Naming can be improved.', nextAction: 'Continue with the recommended local name.',
+      needsSupervisor: true,
+      decision: {
+        category: 'information', impact: 'low', blocking: false,
+        request: 'Review the local helper name at the next cadence.', recommendation: 'Use decisionFacts.',
+      },
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, { turn: 1, callId: 'p1', name: 'supervisor_progress', arguments: JSON.stringify(progress) }),
+      event('tool/result', 3, {
+        turn: 1,
+        message: { source: { callId: 'p1' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+    ], { workerState: 'RUNNING' }))
+
+    expect(observed).toMatchObject({
+      status: 'WAITING',
+      decision: {
+        timing: 'cadence', audience: 'supervisor', action: 'SURFACE_PROGRESS',
+        matchedRuleId: 'worker.fallback', reasonCode: 'NON_BLOCKING_WORKER_DECISION',
+      },
+    })
   })
 
   it('does not repeat a supervisor-requested boundary after later supervisor guidance', () => {
@@ -302,7 +351,10 @@ describe('authoritative completion fold', () => {
       event('user/message', 4, { content: [{ type: 'text', text: 'Keep the compatibility layer for one release.' }] }),
     ], { workerState: 'RUNNING' }))
 
-    expect(observed).toMatchObject({ status: 'WAITING', stage: 'running' })
+    expect(observed).toMatchObject({
+      status: 'WAITING', stage: 'running',
+      decision: { timing: 'cadence', matchedRuleId: 'protocol.progress' },
+    })
   })
 
   it('does not label an unchanged observation as progress', () => {
