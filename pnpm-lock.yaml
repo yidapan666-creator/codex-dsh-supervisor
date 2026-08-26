@@ -40,6 +40,9 @@ importers:
       '@dsh-gate/decision-policy':
         specifier: workspace:*
         version: link:../decision-policy
+      '@dsh-gate/run-journal':
+        specifier: workspace:*
+        version: link:../run-journal
       '@deepseek-ai/dsh-client-connection':
         specifier: '>=0.1.0-rc.8 <1'
         version: 0.1.0-rc.8(fe206655156830a934a8c1ad4c553629)
@@ -50,7 +53,13 @@ importers:
         specifier: ^4.0.0
         version: 4.4.3
 
-  packages/rag-context: {}
+  packages/rag-context:
+    dependencies:
+      '@dsh-gate/run-journal':
+        specifier: workspace:*
+        version: link:../run-journal
+
+  packages/run-journal: {}
 
 packages:
 

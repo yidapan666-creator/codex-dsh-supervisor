@@ -1,3 +1,5 @@
+import type { RunRecord } from '@dsh-gate/run-journal'
+
 export interface RagSource {
   uri: string
   path?: string
@@ -217,4 +219,41 @@ export function reciprocalRankFusion(
   return [...fused.values()]
     .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
     .slice(0, limit)
+}
+
+/** Convert one runtime record into small, provenance-carrying retrieval chunks without a model call. */
+export function runRecordToRagChunks(record: RunRecord): RagChunk[] {
+  const common = {
+    language: 'dsh-run-record',
+    ...record.baseline?.head === undefined ? {} : { commit: record.baseline.head },
+  }
+  const chunks: RagChunk[] = [{
+    id: `${record.recordId}:overview`,
+    contentHash: `${record.recordId}:${record.provenance.boundarySeq}:overview`,
+    text: [
+      `Objective: ${record.objective}`,
+      `Outcome: ${record.outcome}`,
+      `Stage: ${record.stage}`,
+      `Summary: ${record.summary}`,
+      ...record.failure === undefined ? [] : [`Failure: ${record.failure.kind} ${record.failure.message}`],
+    ].join('\n'),
+    source: { ...common, uri: `dsh-run://${record.runId}/overview`, symbol: 'run.overview' },
+  }]
+  if (record.files.length > 0) chunks.push({
+    id: `${record.recordId}:changes`, contentHash: `${record.recordId}:${record.provenance.boundarySeq}:changes`,
+    text: `Files changed or reported:\n${record.files.slice(0, 100).join('\n')}`,
+    source: { ...common, uri: `dsh-run://${record.runId}/changes`, symbol: 'run.changes' },
+  })
+  if (record.decisions.length > 0) chunks.push({
+    id: `${record.recordId}:decisions`, contentHash: `${record.recordId}:${record.provenance.boundarySeq}:decisions`,
+    text: record.decisions.map(decision =>
+      `${decision.category}/${decision.impact}: ${decision.request} -> ${decision.action} (${decision.reasonCode})`).join('\n'),
+    source: { ...common, uri: `dsh-run://${record.runId}/decisions`, symbol: 'run.decisions' },
+  })
+  if (record.verification.length > 0) chunks.push({
+    id: `${record.recordId}:verification`, contentHash: `${record.recordId}:${record.provenance.boundarySeq}:verification`,
+    text: record.verification.slice(0, 50).map(item => `${item.command}: ${item.outcome} — ${item.summary}`).join('\n'),
+    source: { ...common, uri: `dsh-run://${record.runId}/verification`, symbol: 'run.verification' },
+  })
+  return chunks
 }

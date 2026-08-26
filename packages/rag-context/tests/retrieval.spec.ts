@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   InMemoryLexicalRetriever, lexicalTerms, reciprocalRankFusion, type RagChunk, type RankedCandidate,
+  runRecordToRagChunks,
 } from '../src/index.js'
+import { runRecordId, type RunRecord } from '@dsh-gate/run-journal'
 
 const chunks: RagChunk[] = [
   {
@@ -56,5 +58,19 @@ describe('standalone RAG context primitives', () => {
     ])
     expect(fused[0]).toMatchObject({ id: 'artifacts', channel: 'fused' })
     expect(fused[0]?.reasons).toEqual(expect.arrayContaining(['rrf:lexical', 'rrf:semantic', 'rrf:symbol']))
+  })
+
+  it('turns a runtime run record into searchable, cited chunks without generation', async () => {
+    const record: RunRecord = {
+      schemaVersion: 1, recordId: runRecordId('s1', 'r1'), recordedAt: '2026-08-26T00:00:00.000Z',
+      sessionId: 's1', runId: 'r1', hostInstanceId: 'h1', objective: 'repair artifact containment',
+      outcome: 'COMPLETED', stage: 'done', summary: 'Rejected paths outside cwd.', workerState: 'IDLE',
+      files: ['src/artifacts.ts'], verification: [], decisions: [], artifacts: [],
+      truncation: { files: false, verification: false },
+      provenance: { boundarySeq: 9, asOfSeq: 9, generatedBy: 'dsh-gate-runtime', completionProtocolVerified: true, modelCallsUsed: 0 },
+    }
+    const chunks = runRecordToRagChunks(record)
+    const result = await new InMemoryLexicalRetriever('runs.v1', chunks).retrieve({ text: 'artifact containment cwd' })
+    expect(result.hits[0]?.chunk.source.uri).toBe('dsh-run://r1/overview')
   })
 })

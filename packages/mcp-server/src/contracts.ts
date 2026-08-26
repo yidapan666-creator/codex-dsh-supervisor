@@ -165,6 +165,12 @@ export const observationSchema = z.object({
   progress: progressHeartbeatSchema.optional(),
   supervisorProgress: supervisorProgressSchema.optional(),
   decision: decisionOutcomeSchema.optional(),
+  journal: z.object({
+    recorded: z.boolean(),
+    recordId: z.string(),
+    created: z.boolean().optional(),
+    warning: z.string().max(512).optional(),
+  }).strict().optional(),
   asOfSeq: z.number().int().min(-1),
   boundarySeq: z.number().int().min(-1),
   sessionId: z.string(),

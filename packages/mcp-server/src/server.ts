@@ -50,6 +50,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'progress — step/tool/token deltas plus compact project edit/verification activity — since the prior observation; do not '
       + 're-poll on ordinary event churn. Surface activity coverage and runtime verification evidence separately from worker claims, and recap steps, tools, token deltas, project activity, '
       + 'and verification results at terminal state. '
+      + 'Terminal observations also report whether the token-free run journal was recorded; journal warnings never change the task outcome. '
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
       + 'or take over completed child work. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '

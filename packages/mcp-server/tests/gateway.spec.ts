@@ -11,6 +11,7 @@ import { parseTaskPacket } from '../src/fold.js'
 import { HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
+import type { RunJournal, RunRecord } from '@dsh-gate/run-journal'
 
 const live: HostConnection[] = []
 afterEach(() => {
@@ -24,7 +25,7 @@ function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
 }
 
 function managerWith(api: FakeApi, resolve: (cwd: string) => Promise<string>): GatewayManager {
-  return new GatewayManager({ hostUrls: ['http://host'] }, {
+  return new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
     resolveWriterDomain: resolve,
     createConnection: baseUrl => connected(api),
   })
@@ -312,7 +313,7 @@ describe('multi-Host reconnect', () => {
     const first = new FakeApi()
     const second = new FakeApi()
     second.addRow('s-existing', { cwd: '/work/tree' })
-    const manager = new GatewayManager({ hostUrls: ['http://host-one', 'http://host-two'] }, {
+    const manager = new GatewayManager({ hostUrls: ['http://host-one', 'http://host-two'], runJournal: false }, {
       resolveWriterDomain: sameDomain,
       createConnection: baseUrl => connected(baseUrl === 'http://host-one' ? first : second, baseUrl),
     })
@@ -461,6 +462,51 @@ describe('wait cadence', () => {
     expect(Date.now() - started).toBeLessThan(500)
     expect(observed.status).toBe('COMPLETED')
     expect(observed.projectActivity).toMatchObject({ toolCalls: 1, steps: 0 })
+  })
+
+  it('records a terminal run once from runtime facts without another model call', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1CompletedEvents() })
+    const records: RunRecord[] = []
+    const journal: RunJournal = {
+      async record(value) {
+        const created = records.length === 0
+        if (created) records.push(value)
+        return { recordId: value.recordId, created }
+      },
+      async get(runId) { return records.find(record => record.runId === runId) },
+      async list() { return records },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+    const first = await manager.wait({ taskId: 's1', timeoutMs: 0 })
+    const second = await manager.wait({ taskId: 's1', timeoutMs: 0 })
+
+    expect(first.journal).toMatchObject({ recorded: true, created: true })
+    expect(second.journal).toMatchObject({ recorded: true, created: false })
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({
+      outcome: 'COMPLETED', summary: 'verified',
+      provenance: { completionProtocolVerified: true, modelCallsUsed: 0 },
+    })
+  })
+
+  it('preserves the terminal outcome when journal persistence fails', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1CompletedEvents() })
+    const journal: RunJournal = {
+      async record() { throw new Error('disk unavailable') },
+      async get() { return undefined },
+      async list() { return [] },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+    expect(await manager.wait({ taskId: 's1', timeoutMs: 0 })).toMatchObject({
+      status: 'COMPLETED',
+      journal: { recorded: false, warning: 'run journal write failed (Error)' },
+    })
   })
 
   it('returns immediately for a pending approval', async () => {

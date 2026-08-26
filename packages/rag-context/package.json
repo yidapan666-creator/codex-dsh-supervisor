@@ -5,6 +5,9 @@
   "description": "Standalone, unconnected retrieval primitives for future DSH context experiments",
   "license": "MIT",
   "type": "module",
+  "dependencies": {
+    "@dsh-gate/run-journal": "workspace:*"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

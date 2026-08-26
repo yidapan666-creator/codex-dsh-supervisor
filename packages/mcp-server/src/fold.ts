@@ -3,6 +3,7 @@ import {
   DEFAULT_DECISION_POLICY, evaluateDecision,
   type DecisionOutcome, type DecisionPolicy, type DecisionSignal,
 } from '@dsh-gate/decision-policy'
+import type { RunDecisionRecord } from '@dsh-gate/run-journal'
 import {
   TASK_PACKET_END, TASK_PACKET_START,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
@@ -436,15 +437,16 @@ function parsedResult(event: DshEvent): unknown {
   try { return JSON.parse(text) } catch { return undefined }
 }
 
-function latestSupervisorProgress(
+function acceptedSupervisorProgressRecords(
   events: readonly DshEvent[],
   packet: TaskPacket,
-): { progress: SupervisorProgress; seq: number } | undefined {
+): Array<{ progress: SupervisorProgress; seq: number }> {
   const boundarySeq = taskBoundarySeq(events) ?? -1
   const calls = events.filter((event) => {
     if (event.type !== 'tool/call' || event.seq < boundarySeq) return false
     return (event.data as { name?: unknown }).name === 'supervisor_progress'
-  }).reverse()
+  })
+  const records: Array<{ progress: SupervisorProgress; seq: number }> = []
   for (const call of calls) {
     const data = call.data as { callId?: unknown }
     if (typeof data.callId !== 'string') continue
@@ -469,10 +471,42 @@ function latestSupervisorProgress(
       needsSupervisor: raw.needsSupervisor,
       ...raw.decision === undefined ? {} : { decision: raw.decision },
     })
-    if (!parsed.success) continue
-    return { progress: parsed.data, seq: result.seq }
+    if (parsed.success) records.push({ progress: parsed.data, seq: result.seq })
   }
-  return undefined
+  return records
+}
+
+function latestSupervisorProgress(events: readonly DshEvent[], packet: TaskPacket): { progress: SupervisorProgress; seq: number } | undefined {
+  return acceptedSupervisorProgressRecords(events, packet).at(-1)
+}
+
+/** Bounded, structured decision history for the durable run journal; no messages or reasoning are copied. */
+export function supervisorDecisionHistory(
+  state: TaskRuntimeState,
+  decisionPolicy: DecisionPolicy = DEFAULT_DECISION_POLICY,
+): RunDecisionRecord[] {
+  const boundary = taskPacketBoundary(state.events)
+  if (boundary === undefined) return []
+  const packet = boundary.packet
+  return acceptedSupervisorProgressRecords(state.events, packet).flatMap(({ progress, seq }) => {
+    const request = progress.decision
+    if (request === undefined && !progress.needsSupervisor) return []
+    const category = request?.category ?? 'unspecified'
+    const outcome = evaluateDecision({
+      signal: 'WORKER_DECISION', category,
+      impact: request?.impact ?? 'medium',
+      blocking: request?.blocking ?? progress.needsSupervisor,
+      ...request?.requiresHuman === undefined ? {} : { requiresHuman: request.requiresHuman },
+      explicitlyPreAuthorized: packet.schemaVersion === 2
+        && packet.authority?.preAuthorizedDecisionCategories?.includes(category) === true,
+    }, decisionPolicy)
+    return [{
+      category, impact: request?.impact ?? 'medium', blocking: request?.blocking ?? progress.needsSupervisor,
+      request: request?.request ?? progress.nextAction,
+      timing: outcome.timing, audience: outcome.audience, action: outcome.action, reasonCode: outcome.reasonCode,
+      handled: state.events.some(event => event.type === 'user/message' && event.seq > seq),
+    }]
+  }).slice(-20)
 }
 
 function handoffObservation(

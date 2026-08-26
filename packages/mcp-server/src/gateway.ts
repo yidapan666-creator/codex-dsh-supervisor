@@ -1,12 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import {
   DEFAULT_DECISION_POLICY, evaluateDecision, parseDecisionPolicy,
   type DecisionCategory, type DecisionPolicy,
 } from '@dsh-gate/decision-policy'
-import { deriveObservation, parseTaskPacket, progressObservation, taskBoundarySeq, timeoutObservation } from './fold.js'
+import {
+  deriveObservation, parseTaskPacket, progressObservation, supervisorDecisionHistory, taskBoundarySeq, timeoutObservation,
+} from './fold.js'
+import {
+  FileRunJournal, isRunRecordOutcome, runRecordId, type RunJournal, type RunRecord,
+} from '@dsh-gate/run-journal'
 import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
@@ -103,7 +109,10 @@ export interface GatewayConfig {
   defaultModel?: string
   defaultReasoningEffort?: string
   decisionPolicy?: DecisionPolicy
+  runJournal?: RunJournal | false
 }
+
+export const DEFAULT_RUN_JOURNAL_DIR = fileURLToPath(new URL('../../../.dsh-state/memory/runs/', import.meta.url))
 
 /** The five-minute aggregated progress cadence used by {@link GatewayManager.wait}. */
 export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
@@ -125,6 +134,7 @@ export class GatewayManager {
   private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
   private readonly decisionPolicy: DecisionPolicy
+  private readonly runJournal: RunJournal | undefined
   /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
   private admissionTail: Promise<void> = Promise.resolve()
 
@@ -133,6 +143,9 @@ export class GatewayManager {
     this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
     this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
     this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
+    this.runJournal = config.runJournal === false
+      ? undefined
+      : config.runJournal ?? new FileRunJournal(DEFAULT_RUN_JOURNAL_DIR)
   }
 
   static fromEnvironment(env: NodeJS.ProcessEnv = process.env): GatewayManager {
@@ -151,6 +164,9 @@ export class GatewayManager {
       ...env.DSH_DECISION_POLICY_JSON === undefined
         ? {}
         : { decisionPolicy: parseDecisionPolicy(JSON.parse(env.DSH_DECISION_POLICY_JSON) as unknown) },
+      runJournal: env.DSH_RUN_JOURNAL_ENABLED === 'false'
+        ? false
+        : new FileRunJournal(env.DSH_RUN_JOURNAL_DIR ?? DEFAULT_RUN_JOURNAL_DIR),
     })
   }
 
@@ -417,6 +433,64 @@ export class GatewayManager {
     return observation
   }
 
+  private async withRunJournal(
+    observation: Observation,
+    snapshot: Parameters<typeof deriveObservation>[0],
+  ): Promise<Observation> {
+    const journal = this.runJournal
+    const packet = parseTaskPacket(snapshot.events)
+    const journalableFailure = observation.status === 'FAILED'
+      && (observation.failure?.kind === 'WORKER_FAILED' || observation.failure?.kind === 'MISSING_HANDOFF')
+    if (journal === undefined || packet === undefined
+      || (!isRunRecordOutcome(observation.status) || (observation.status === 'FAILED' && !journalableFailure))) return observation
+    const recordId = runRecordId(observation.sessionId, observation.runId)
+    const value: RunRecord = {
+      schemaVersion: 1,
+      recordId,
+      recordedAt: new Date().toISOString(),
+      sessionId: observation.sessionId,
+      runId: observation.runId,
+      hostInstanceId: observation.hostInstanceId,
+      objective: observation.objective,
+      outcome: observation.status,
+      stage: observation.stage,
+      summary: observation.summary,
+      workerState: observation.workerState,
+      ...packet.schemaVersion === 2 && packet.baseline !== undefined ? {
+        baseline: {
+          statusSummary: packet.baseline.statusSummary,
+          ...packet.baseline.head === undefined ? {} : { head: packet.baseline.head },
+        },
+      } : {},
+      files: observation.files.slice(0, 200),
+      verification: observation.verification.slice(0, 100),
+      decisions: supervisorDecisionHistory(snapshot, this.decisionPolicy),
+      ...observation.failure === undefined ? {} : { failure: observation.failure },
+      ...observation.projectActivity === undefined ? {} : { projectActivity: observation.projectActivity },
+      artifacts: observation.artifacts,
+      truncation: {
+        files: observation.files.length > 200,
+        verification: observation.verification.length > 100,
+      },
+      provenance: {
+        boundarySeq: observation.boundarySeq,
+        asOfSeq: observation.asOfSeq,
+        generatedBy: 'dsh-gate-runtime',
+        completionProtocolVerified: observation.status === 'COMPLETED',
+        modelCallsUsed: 0,
+      },
+    }
+    try {
+      const result = await journal.record(value)
+      return { ...observation, journal: { recorded: true, recordId, created: result.created } }
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : error instanceof Error ? error.name : 'UNKNOWN'
+      return { ...observation, journal: { recorded: false, recordId, warning: `run journal write failed (${code})` } }
+    }
+  }
+
   async wait(input: SessionAddress & { runId?: string | undefined; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
     // The default is the five-minute aggregated progress cadence: ordinary event
     // churn never returns early, so the supervisor issues about one long dsh_wait
@@ -447,7 +521,7 @@ export class GatewayManager {
           nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
           continue
         }
-        return observed
+        return this.withRunJournal(observed, snapshot)
       }
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
@@ -458,11 +532,12 @@ export class GatewayManager {
           authoritative = true
           const finalObservation = this.observationForRun(snapshot, sessionId, input.runId)
           const finalObserved = progressObservation(finalObservation, snapshot, progressFromAsOfSeq)
-          return finalObservation.decision?.timing !== 'immediate'
+          const result = finalObservation.decision?.timing !== 'immediate'
             ? timeoutObservation(finalObserved, timeoutMs)
             : finalObserved
+          return this.withRunJournal(result, snapshot)
         }
-        return timeoutObservation(observed, timeoutMs)
+        return this.withRunJournal(timeoutObservation(observed, timeoutMs), snapshot)
       }
       const untilReconcile = Math.max(0, nextReconcileAt - Date.now())
       const changed = await connection.waitForChange(Math.min(remaining, untilReconcile))

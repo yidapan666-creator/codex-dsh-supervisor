@@ -35,4 +35,11 @@ When the Host mounts the native projection units, each observation carries compa
 
 Mux frames update the in-memory fold immediately. HTTP list/history reconciliation is periodic during ordinary work, then mandatory before cadence, material, and terminal returns. Reconnect without an explicit Host URL scans configured Hosts, binds the discovered session to that Host, and preserves connection failures as structured `HOST_FAILED` tool envelopes. Approval/question controls must echo the pending stable `rpcId`; stale interaction replies are rejected before responding to the Host.
 
+Durable terminal observations create one structured run-journal record assembled
+only from already-folded runtime facts, with `modelCallsUsed: 0`. The stable
+run identity makes repeated terminal waits idempotent. Pending interactions,
+ordinary waits, stale requests, and temporary Host/protocol failures are
+excluded. Persistence fails open: a bounded `journal.warning` never changes the
+task status.
+
 DSH root exclusively manages its child tree. The Host automatically relays child reports and settled notices to that root; observing a child through `dsh_agents` never transfers ownership to Codex and never authorizes `dsh_steer`. `dsh_agents` enriches each direct child with existing session projection telemetry for read-only visibility. `dsh_interrupt_agent` is an explicit-human or safety-emergency control, not a routine orchestration action.

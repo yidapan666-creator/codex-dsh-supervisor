@@ -8,6 +8,7 @@ The workspace contains:
 - `@dsh-gate/supervisor-tools`: DSH-side handoff, artifact admission, and reported-failure budget tools;
 - `@dsh-gate/decision-policy`: dependency-free, explainable intervention policy with locked protocol invariants;
 - `@dsh-gate/rag-context`: standalone retrieval contracts, lexical baseline, and rank fusion; intentionally not connected to MCP or DSH;
+- `@dsh-gate/run-journal`: atomic, token-free terminal run records used as the durable source for future retrieval;
 - two narrow operator skills, example Codex/DSH configuration, and a deterministic bootstrap/doctor/Host workflow.
 
 ## Deploy, verify, and start
@@ -58,11 +59,15 @@ The queued prompt starts with the human-readable objective and embeds the durabl
 
 `supervisor_handoff.summary` is capped at 2048 characters. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<runId>/` (legacy v1: taskId) inside the session cwd, pass the relative path in `artifacts`, and reference it from the concise summary. The directory is gitignored. The handoff tool rejects over-limit summaries with exactly this instruction and never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
 
+## Token-free run journal
+
+At a durable run terminal state, the gateway writes one atomic JSON record under `.dsh-state/memory/runs/`. It reuses the existing task packet, accepted handoff, runtime project activity, verification, failure kind, and bounded decision history; it never calls a model (`modelCallsUsed: 0`) and never records heartbeat narration, reasoning, tool arguments, outputs, or user-message contents. Repeated terminal waits reuse the same run-id record. A journal write failure is reported as a warning on the observation and never changes the DSH outcome. Temporary Host/protocol failures and stale-run requests are not recorded as terminal work history. `@dsh-gate/rag-context` can convert these records into small cited retrieval chunks, but retrieval is not yet injected into `dsh_task` or `dsh_wait`.
+
 ## Release status
 
-The source is licensed under MIT and prepared for public hosting at `yidapan666-creator/dsh-gate`: the DSH dependency is a public fork commit pinned by SHA, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the bootstrap-managed link. Publication as **npm packages is a separate, still-blocked decision**: both packages keep `"private": true`, and a clean package install cannot build or run until the upstream DSH network-client seam is published (the fork pin works for source deployments, not for registry consumers).
+The source is licensed under MIT and prepared for public hosting at `yidapan666-creator/dsh-gate`: the DSH dependency is a public fork commit pinned by SHA, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the bootstrap-managed link. Publication as **npm packages is a separate, still-blocked decision**: the workspace packages keep `"private": true`, and a clean package install cannot build or run until the upstream DSH network-client seam is published (the fork pin works for source deployments, not for registry consumers).
 
-The remaining upstream limitation is npm publication: both packages stay private until the generic `@deepseek-ai/dsh-client-connection/network-client` exports are published upstream. The public fork pin at `7212c955438c70c9a2d168f67e85a8014b8d4488` makes source deployments reproducible today; it is not an upstream merge and no merge is claimed.
+The remaining upstream limitation is npm publication: the workspace packages stay private until the generic `@deepseek-ai/dsh-client-connection/network-client` exports are published upstream. The public fork pin at `7212c955438c70c9a2d168f67e85a8014b8d4488` makes source deployments reproducible today; it is not an upstream merge and no merge is claimed.
 
 Source installation, build, tests, packaging checks, and the protocol contract are covered by the documented verification workflow.
 
