@@ -53,6 +53,8 @@ When several Host URLs are configured, reconnect by `sessionId` discovers the ex
 
 DSH session identity and supervised execution identity are separate. `dsh_start_or_connect` returns the durable `sessionId`; every `dsh_task` returns a new UUID `runId`. Wait, answer, steer, cancel, child-observation, and interrupt calls carry both values, so a delayed control for an older run is rejected before it can affect a newer turn in the same session.
 
+Decision rules live as immutable, versioned JSON files under `config/decision-policies/`. New runs pin the active policy version plus its canonical SHA-256 digest in the durable task packet; an optional shadow policy is pinned the same way but never controls timing or action. After an MCP restart the gateway resolves the pinned version from the catalog and fails closed if the file is missing or changed. To inspect a decision without running DSH, build once and run `pnpm policy:explain -- --policy config/decision-policies/2026-08-26.v1.json --facts '{"signal":"WORKER_DECISION","category":"information","impact":"low","blocking":false}'`; add `--shadow <file>` for an observer-only comparison. `dry-run` is an equivalent CLI command. The legacy `DSH_DECISION_POLICY_JSON` input remains migration-only; file configuration is preferred.
+
 The queued prompt starts with the human-readable objective and embeds the durable task packet afterward. This keeps protocol validation unchanged while making new supervised sessions recognizable by task name in the DSH Web sidebar.
 
 ## Long handoff details

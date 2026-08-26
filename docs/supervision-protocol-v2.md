@@ -65,12 +65,22 @@ interface TaskPacketV2 {
     preAuthorizedActions?: string[]
     preAuthorizedDecisionCategories?: DecisionCategory[]
   }
+  decisionPolicy?: {
+    activeVersion: string
+    activeDigest: string
+    shadowVersion?: string
+    shadowDigest?: string
+  }
 }
 ```
 
 All strings and arrays receive explicit wire-size limits. Packet parsing uses one
 shared strict schema on the MCP and worker sides. A malformed newest packet is a
 typed protocol error; marker-like user prose cannot silently become a packet.
+Newly queued runs always include the decision-policy identity. The version and
+canonical digest pin active behavior across MCP restarts. An optional shadow
+identity is pinned for reproducible comparison but has no enforcement authority.
+Older v2 packets without this field remain migration-compatible.
 
 ## Stale-safe control
 

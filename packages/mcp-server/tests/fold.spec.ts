@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { deriveObservation, progressHeartbeat, progressObservation, projectActivityIn, timeoutObservation } from '../src/fold.js'
 import { observationSchema, progressHeartbeatSchema, TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type TaskRuntimeState } from '../src/contracts.js'
+import { DEFAULT_DECISION_POLICY } from '@dsh-gate/decision-policy'
 
 const packet = { schemaVersion: 1, taskId: 's1', completionToken: 'token', objective: 'ship it', writerMode: 'writer' }
 const event = (type: string, seq: number, data: unknown): DshEvent => ({ type, seq, time: seq, data })
@@ -253,6 +254,15 @@ describe('authoritative completion fold', () => {
         request: 'Choose the compatibility policy.', options: ['strict', 'compatible'], recommendation: 'compatible',
       },
     }
+    const shadow = {
+      ...DEFAULT_DECISION_POLICY,
+      version: 'shadow.test',
+      workerRules: [],
+      workerFallback: {
+        timing: 'cadence' as const, audience: 'supervisor' as const,
+        action: 'SURFACE_PROGRESS' as const, reasonCode: 'SHADOW_WOULD_WAIT',
+      },
+    }
     const observed = deriveObservation(state([
       event('user/message', 0, {
         content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
@@ -267,7 +277,7 @@ describe('authoritative completion fold', () => {
           type: 'text', text: JSON.stringify({ accepted: true, progress }),
         }] }] },
       }),
-    ], { workerState: 'RUNNING' }))
+    ], { workerState: 'RUNNING' }), DEFAULT_DECISION_POLICY, shadow)
 
     expect(observed).toMatchObject({
       status: 'SUPERVISOR_REQUIRED', boundarySeq: 3, stage: 'investigating',
@@ -275,6 +285,9 @@ describe('authoritative completion fold', () => {
       decision: {
         timing: 'immediate', audience: 'human', action: 'ASK_HUMAN',
         matchedRuleId: 'worker.sensitive', reasonCode: 'SENSITIVE_OR_SCOPE_DECISION',
+      },
+      decisionShadow: {
+        timing: 'cadence', action: 'SURFACE_PROGRESS', reasonCode: 'SHADOW_WOULD_WAIT', differs: true,
       },
     })
     expect(() => observationSchema.parse(observed)).not.toThrow()

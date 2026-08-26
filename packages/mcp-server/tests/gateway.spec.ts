@@ -12,6 +12,7 @@ import { HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
 import type { RunJournal, RunRecord } from '@dsh-gate/run-journal'
+import { decisionPolicyDigest, DEFAULT_DECISION_POLICY } from '@dsh-gate/decision-policy'
 
 const live: HostConnection[] = []
 afterEach(() => {
@@ -243,8 +244,48 @@ describe('Web-visible task identity', () => {
     expect(first).toMatchObject({ sessionId: 's1', runId: expect.any(String) })
     expect(second).toMatchObject({ sessionId: 's1', runId: expect.any(String) })
     expect(first.runId).not.toBe(second.runId)
-    expect(firstPacket).toMatchObject({ schemaVersion: 2, sessionId: 's1', runId: first.runId })
+    expect(firstPacket).toMatchObject({
+      schemaVersion: 2, sessionId: 's1', runId: first.runId,
+      decisionPolicy: {
+        activeVersion: DEFAULT_DECISION_POLICY.version,
+        activeDigest: decisionPolicyDigest(DEFAULT_DECISION_POLICY),
+      },
+    })
     expect(secondPacket).toMatchObject({ schemaVersion: 2, sessionId: 's1', runId: second.runId })
+  })
+
+  it('keeps the policy pinned by the run after a manager restart', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const firstManager = managerWith(api, sameDomain)
+    const run = await firstManager.task({ sessionId: 's1', objective: 'pinned', writerMode: 'read_only' })
+    firstManager.stopClients()
+    const newer = { ...DEFAULT_DECISION_POLICY, version: '2026-09-01.v2' }
+    const secondManager = new GatewayManager({
+      hostUrls: ['http://host'], runJournal: false, decisionPolicy: newer,
+      decisionPolicyCatalog: [DEFAULT_DECISION_POLICY, newer],
+    }, { resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl) })
+
+    expect(await secondManager.wait({ sessionId: 's1', runId: run.runId as string, timeoutMs: 0 }))
+      .toMatchObject({ decision: { policyVersion: DEFAULT_DECISION_POLICY.version } })
+  })
+
+  it('fails closed when a run pins changed policy contents', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const run = await manager.task({ sessionId: 's1', objective: 'pinned', writerMode: 'read_only' })
+    const packet = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+    expect(packet?.schemaVersion).toBe(2)
+    const forged = { ...packet, decisionPolicy: {
+      ...(packet?.schemaVersion === 2 ? packet.decisionPolicy : {}), activeDigest: '0'.repeat(64),
+    } }
+    api.setEvents('s1', [event('user/message', 1, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(forged)}\n${TASK_PACKET_END}` }],
+    })])
+
+    await expect(manager.wait({ sessionId: 's1', runId: run.runId as string, timeoutMs: 0 }))
+      .rejects.toThrow(/unavailable or changed/)
   })
 
   it('parses the generated packet when the human objective contains packet-marker prose', async () => {

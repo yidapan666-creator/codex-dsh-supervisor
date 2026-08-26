@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
+import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import {
-  DEFAULT_DECISION_POLICY, evaluateDecision, parseDecisionPolicy,
+  decisionPolicyDigest, DEFAULT_DECISION_POLICY, evaluateDecision, parseDecisionPolicy,
   type DecisionCategory, type DecisionPolicy,
 } from '@dsh-gate/decision-policy'
 import {
@@ -109,10 +110,23 @@ export interface GatewayConfig {
   defaultModel?: string
   defaultReasoningEffort?: string
   decisionPolicy?: DecisionPolicy
+  shadowDecisionPolicy?: DecisionPolicy
+  decisionPolicyCatalog?: DecisionPolicy[]
   runJournal?: RunJournal | false
 }
 
 export const DEFAULT_RUN_JOURNAL_DIR = fileURLToPath(new URL('../../../.dsh-state/memory/runs/', import.meta.url))
+export const DEFAULT_DECISION_POLICY_DIR = fileURLToPath(new URL('../../../config/decision-policies/', import.meta.url))
+export const DEFAULT_DECISION_POLICY_FILE = join(DEFAULT_DECISION_POLICY_DIR, '2026-08-26.v1.json')
+
+function readDecisionPolicy(path: string): DecisionPolicy {
+  return parseDecisionPolicy(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+}
+
+function readDecisionPolicyCatalog(directory: string): DecisionPolicy[] {
+  return readdirSync(directory).filter(name => name.endsWith('.json')).sort()
+    .map(name => readDecisionPolicy(join(directory, name)))
+}
 
 /** The five-minute aggregated progress cadence used by {@link GatewayManager.wait}. */
 export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
@@ -134,6 +148,8 @@ export class GatewayManager {
   private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
   private readonly decisionPolicy: DecisionPolicy
+  private readonly shadowDecisionPolicy: DecisionPolicy | undefined
+  private readonly decisionPolicies = new Map<string, DecisionPolicy>()
   private readonly runJournal: RunJournal | undefined
   /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
   private admissionTail: Promise<void> = Promise.resolve()
@@ -143,6 +159,15 @@ export class GatewayManager {
     this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
     this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
     this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
+    this.shadowDecisionPolicy = config.shadowDecisionPolicy
+    for (const policy of [...config.decisionPolicyCatalog ?? [], this.decisionPolicy,
+      ...this.shadowDecisionPolicy === undefined ? [] : [this.shadowDecisionPolicy]]) {
+      const existing = this.decisionPolicies.get(policy.version)
+      if (existing !== undefined && decisionPolicyDigest(existing) !== decisionPolicyDigest(policy)) {
+        throw new Error(`decision policy version ${policy.version} has conflicting contents`)
+      }
+      this.decisionPolicies.set(policy.version, policy)
+    }
     this.runJournal = config.runJournal === false
       ? undefined
       : config.runJournal ?? new FileRunJournal(DEFAULT_RUN_JOURNAL_DIR)
@@ -155,19 +180,51 @@ export class GatewayManager {
     if (!Array.isArray(urls) || !urls.every(url => typeof url === 'string')) {
       throw new Error('DSH_HOST_URLS must be a JSON string array')
     }
+    const policyDirectory = env.DSH_DECISION_POLICY_DIR ?? DEFAULT_DECISION_POLICY_DIR
+    const catalog = readDecisionPolicyCatalog(policyDirectory)
+    const filePolicy = readDecisionPolicy(env.DSH_DECISION_POLICY_FILE ?? DEFAULT_DECISION_POLICY_FILE)
+    const inlinePolicy = env.DSH_DECISION_POLICY_JSON === undefined
+      ? undefined
+      : parseDecisionPolicy(JSON.parse(env.DSH_DECISION_POLICY_JSON) as unknown)
+    const shadowPolicy = env.DSH_DECISION_SHADOW_POLICY_FILE === undefined
+      ? undefined
+      : readDecisionPolicy(env.DSH_DECISION_SHADOW_POLICY_FILE)
     return new GatewayManager({
       hostUrls: urls,
       ...env.DSH_HOST_LAUNCH === undefined ? {} : { launch: parseLaunchConfig(env.DSH_HOST_LAUNCH) as HostLaunchConfig },
       defaultProvider: env.DSH_WORKER_PROVIDER ?? 'deepseek-official',
       defaultModel: env.DSH_WORKER_MODEL ?? 'deepseek-v4-flash',
       defaultReasoningEffort: env.DSH_WORKER_REASONING_EFFORT ?? 'high',
-      ...env.DSH_DECISION_POLICY_JSON === undefined
-        ? {}
-        : { decisionPolicy: parseDecisionPolicy(JSON.parse(env.DSH_DECISION_POLICY_JSON) as unknown) },
+      decisionPolicy: inlinePolicy ?? filePolicy,
+      ...shadowPolicy === undefined ? {} : { shadowDecisionPolicy: shadowPolicy },
+      decisionPolicyCatalog: catalog,
       runJournal: env.DSH_RUN_JOURNAL_ENABLED === 'false'
         ? false
         : new FileRunJournal(env.DSH_RUN_JOURNAL_DIR ?? DEFAULT_RUN_JOURNAL_DIR),
     })
+  }
+
+  private policiesFor(snapshot: Parameters<typeof deriveObservation>[0]): {
+    active: DecisionPolicy
+    shadow?: DecisionPolicy
+  } {
+    const packet = parseTaskPacket(snapshot.events)
+    const pin = packet?.schemaVersion === 2 ? packet.decisionPolicy : undefined
+    if (pin === undefined) return {
+      active: this.decisionPolicy,
+      ...this.shadowDecisionPolicy === undefined ? {} : { shadow: this.shadowDecisionPolicy },
+    }
+    const active = this.decisionPolicies.get(pin.activeVersion)
+    if (active === undefined || decisionPolicyDigest(active) !== pin.activeDigest) {
+      throw new Error(`pinned decision policy ${pin.activeVersion} is unavailable or changed`)
+    }
+    if (pin.shadowVersion === undefined && pin.shadowDigest === undefined) return { active }
+    if (pin.shadowVersion === undefined || pin.shadowDigest === undefined) throw new Error('pinned shadow policy identity is incomplete')
+    const shadow = this.decisionPolicies.get(pin.shadowVersion)
+    if (shadow === undefined || decisionPolicyDigest(shadow) !== pin.shadowDigest) {
+      throw new Error(`pinned shadow decision policy ${pin.shadowVersion} is unavailable or changed`)
+    }
+    return { active, shadow }
   }
 
   connection(url = this.knownUrls[0]): HostConnection {
@@ -342,6 +399,14 @@ export class GatewayManager {
       completionToken: randomUUID(),
       objective: input.objective,
       writerMode,
+      decisionPolicy: {
+        activeVersion: this.decisionPolicy.version,
+        activeDigest: decisionPolicyDigest(this.decisionPolicy),
+        ...this.shadowDecisionPolicy === undefined ? {} : {
+          shadowVersion: this.shadowDecisionPolicy.version,
+          shadowDigest: decisionPolicyDigest(this.shadowDecisionPolicy),
+        },
+      },
       // Temporary v1 worker compatibility; removed after every installed worker
       // consumes sessionId + runId directly.
       taskId: sessionId,
@@ -402,7 +467,8 @@ export class GatewayManager {
     sessionId: string,
     runId: string | undefined,
   ): Observation {
-    const observation = deriveObservation(snapshot, this.decisionPolicy)
+    const policies = this.policiesFor(snapshot)
+    const observation = deriveObservation(snapshot, policies.active, policies.shadow)
     if (observation.sessionId !== sessionId) {
       return {
         ...observation,
@@ -412,7 +478,7 @@ export class GatewayManager {
         stage: 'protocol',
         summary: 'The latest durable task packet does not match this session id.',
         failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.sessionId}`, retryable: false },
-        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.decisionPolicy),
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
       }
     }
     if (runId !== undefined && runId !== observation.runId) {
@@ -427,7 +493,7 @@ export class GatewayManager {
           retryable: false,
           stale: true,
         },
-        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.decisionPolicy),
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
       }
     }
     return observation
@@ -444,6 +510,7 @@ export class GatewayManager {
     if (journal === undefined || packet === undefined
       || (!isRunRecordOutcome(observation.status) || (observation.status === 'FAILED' && !journalableFailure))) return observation
     const recordId = runRecordId(observation.sessionId, observation.runId)
+    const policies = this.policiesFor(snapshot)
     const value: RunRecord = {
       schemaVersion: 1,
       recordId,
@@ -464,7 +531,7 @@ export class GatewayManager {
       } : {},
       files: observation.files.slice(0, 200),
       verification: observation.verification.slice(0, 100),
-      decisions: supervisorDecisionHistory(snapshot, this.decisionPolicy),
+      decisions: supervisorDecisionHistory(snapshot, policies.active, policies.shadow),
       ...observation.failure === undefined ? {} : { failure: observation.failure },
       ...observation.projectActivity === undefined ? {} : { projectActivity: observation.projectActivity },
       artifacts: observation.artifacts,
@@ -553,7 +620,8 @@ export class GatewayManager {
   }
 
   private assertCurrentRun(snapshot: Parameters<typeof deriveObservation>[0], runId: string | undefined): Observation {
-    const observation = deriveObservation(snapshot, this.decisionPolicy)
+    const policies = this.policiesFor(snapshot)
+    const observation = deriveObservation(snapshot, policies.active, policies.shadow)
     if (runId !== undefined && observation.runId !== runId) {
       throw new Error(`stale run ${runId}; active run is ${observation.runId}`)
     }

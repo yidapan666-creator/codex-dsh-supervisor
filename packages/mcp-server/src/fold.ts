@@ -1,6 +1,6 @@
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import {
-  DEFAULT_DECISION_POLICY, evaluateDecision,
+  compareDecision, DEFAULT_DECISION_POLICY, evaluateDecision,
   type DecisionOutcome, type DecisionPolicy, type DecisionSignal,
 } from '@dsh-gate/decision-policy'
 import type { RunDecisionRecord } from '@dsh-gate/run-journal'
@@ -484,6 +484,7 @@ function latestSupervisorProgress(events: readonly DshEvent[], packet: TaskPacke
 export function supervisorDecisionHistory(
   state: TaskRuntimeState,
   decisionPolicy: DecisionPolicy = DEFAULT_DECISION_POLICY,
+  shadowPolicy?: DecisionPolicy,
 ): RunDecisionRecord[] {
   const boundary = taskPacketBoundary(state.events)
   if (boundary === undefined) return []
@@ -492,19 +493,29 @@ export function supervisorDecisionHistory(
     const request = progress.decision
     if (request === undefined && !progress.needsSupervisor) return []
     const category = request?.category ?? 'unspecified'
-    const outcome = evaluateDecision({
+    const comparison = compareDecision({
       signal: 'WORKER_DECISION', category,
       impact: request?.impact ?? 'medium',
       blocking: request?.blocking ?? progress.needsSupervisor,
       ...request?.requiresHuman === undefined ? {} : { requiresHuman: request.requiresHuman },
       explicitlyPreAuthorized: packet.schemaVersion === 2
         && packet.authority?.preAuthorizedDecisionCategories?.includes(category) === true,
-    }, decisionPolicy)
+    }, decisionPolicy, shadowPolicy)
+    const outcome = comparison.active
     return [{
       category, impact: request?.impact ?? 'medium', blocking: request?.blocking ?? progress.needsSupervisor,
       request: request?.request ?? progress.nextAction,
       timing: outcome.timing, audience: outcome.audience, action: outcome.action, reasonCode: outcome.reasonCode,
       handled: state.events.some(event => event.type === 'user/message' && event.seq > seq),
+      ...comparison.shadow === undefined ? {} : { shadow: {
+        policyVersion: comparison.shadow.policyVersion,
+        timing: comparison.shadow.timing,
+        audience: comparison.shadow.audience,
+        action: comparison.shadow.action,
+        reasonCode: comparison.shadow.reasonCode,
+        matchedRuleId: comparison.shadow.matchedRuleId,
+        differs: comparison.differs,
+      } },
     }]
   }).slice(-20)
 }
@@ -601,7 +612,7 @@ function exhaustedFailureObservation(
   return undefined
 }
 
-function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionPolicy): Observation {
+function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionPolicy, shadowPolicy?: DecisionPolicy): Observation {
   const boundary = taskPacketBoundary(state.events)
   const packet = boundary?.packet
   const commonBase = base(state, packet)
@@ -613,7 +624,7 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
   const workerDecision = progressRecord === undefined || supervisorResponded
     || (decisionRequest === undefined && !progressRecord.progress.needsSupervisor)
     ? undefined
-    : evaluateDecision({
+    : compareDecision({
       signal: 'WORKER_DECISION',
       category: decisionRequest?.category ?? 'unspecified',
       impact: decisionRequest?.impact ?? 'medium',
@@ -621,11 +632,15 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
       ...decisionRequest?.requiresHuman === undefined ? {} : { requiresHuman: decisionRequest.requiresHuman },
       explicitlyPreAuthorized: packet?.schemaVersion === 2
         && packet.authority?.preAuthorizedDecisionCategories?.includes(decisionRequest?.category ?? 'unspecified') === true,
-    }, decisionPolicy)
+    }, decisionPolicy, shadowPolicy)
+  const activeWorkerDecision = workerDecision?.active
   const common = {
     ...commonBase,
     ...progressRecord === undefined ? {} : { supervisorProgress: progressRecord.progress },
-    ...workerDecision === undefined ? {} : { decision: workerDecision },
+    ...activeWorkerDecision === undefined ? {} : { decision: activeWorkerDecision },
+    ...workerDecision?.shadow === undefined ? {} : {
+      decisionShadow: { ...workerDecision.shadow, differs: workerDecision.differs },
+    },
   }
   if (packet === undefined) return {
     ...common,
@@ -646,7 +661,7 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
     ...common, status: 'QUESTION_REQUIRED', stage: 'question', summary: 'Worker is waiting for an answer.', question: state.pendingQuestion,
   }
 
-  if (workerDecision?.timing === 'immediate' && progressRecord !== undefined && !supervisorResponded) return {
+  if (activeWorkerDecision?.timing === 'immediate' && progressRecord !== undefined && !supervisorResponded) return {
     ...common,
     status: 'SUPERVISOR_REQUIRED',
     boundarySeq: progressRecord.seq,
@@ -704,8 +719,9 @@ function protocolSignal(observation: Observation): DecisionSignal {
 export function deriveObservation(
   state: TaskRuntimeState,
   decisionPolicy: DecisionPolicy = DEFAULT_DECISION_POLICY,
+  shadowPolicy?: DecisionPolicy,
 ): Observation {
-  const observation = deriveObservationRaw(state, decisionPolicy)
+  const observation = deriveObservationRaw(state, decisionPolicy, shadowPolicy)
   if (observation.decision !== undefined) return observation
   const signal = protocolSignal(observation)
   const decision: DecisionOutcome = evaluateDecision({ signal }, decisionPolicy)

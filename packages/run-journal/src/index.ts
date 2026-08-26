@@ -17,6 +17,15 @@ export interface RunDecisionRecord {
   action: string
   reasonCode: string
   handled: boolean
+  shadow?: {
+    policyVersion: string
+    timing: string
+    audience: string
+    action: string
+    reasonCode: string
+    matchedRuleId: string
+    differs: boolean
+  }
 }
 
 export interface RunRecord {

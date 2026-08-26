@@ -24,6 +24,10 @@ DSH_HOST_URL = "http://127.0.0.1:8080"
 DSH_WORKER_PROVIDER = "deepseek-official"
 DSH_WORKER_MODEL = "deepseek-v4-flash"
 DSH_WORKER_REASONING_EFFORT = "high"
+DSH_DECISION_POLICY_DIR = "<workspace-root>/config/decision-policies"
+DSH_DECISION_POLICY_FILE = "<workspace-root>/config/decision-policies/2026-08-26.v1.json"
+# Optional observer-only candidate. It is pinned per run but never controls behavior.
+# DSH_DECISION_SHADOW_POLICY_FILE = "<workspace-root>/config/decision-policies/2026-08-26.shadow-v1.json"
 DSH_RUN_JOURNAL_DIR = "<workspace-root>/.dsh-state/memory/runs"
 # Set to "false" to disable token-free terminal run records.
 # DSH_RUN_JOURNAL_ENABLED = "false"

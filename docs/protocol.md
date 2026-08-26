@@ -18,6 +18,13 @@ A completed `turn/end` without those facts is `FAILED` with `MISSING_HANDOFF`. O
 
 `dsh_wait` runs a five-minute aggregated progress cadence: with the default timeout (300000 ms) it returns about one observation per window and returns early when the attached decision outcome says `timing=immediate`. Terminal state, approval/question, checkpoint, blocker, escalation, and Host/protocol failure are locked protocol boundaries; structured worker requests are evaluated by the versioned worker policy. Ordinary event churn does not produce rapid repeated wait calls. The `WAITING` return at the window boundary is `wait.reason=TIMEOUT` with the aggregate `progress` since the caller's observation cursor; `workerState` independently says whether the worker was `RUNNING`, `IDLE`, or `UNKNOWN` at the observation. The `PROGRESS` wait reason remains in the schema for compatibility but is not emitted by the current cadence.
 
+New runs pin the active decision-policy version and canonical SHA-256 digest in
+their durable packet. An optional shadow policy is pinned beside it. On MCP
+restart the catalog must still contain byte-semantically identical parsed policy
+content for those identities; a missing or changed pin fails closed. Shadow
+evaluation uses the same facts and engine, but only the active `decision` may
+control return timing or action. `decisionShadow` is comparison evidence.
+
 Codex must surface aggregated progress during long runs and repeat root step/tool/token figures and verification results in its terminal response. MCP output entering model context is not itself a user-visible report.
 
 ## Safety boundaries

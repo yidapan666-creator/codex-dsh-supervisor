@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 export const DECISION_CATEGORIES = [
   'architecture', 'scope', 'acceptance', 'security', 'destructive_action',
   'credentials', 'external_side_effect', 'recovery', 'information', 'unspecified',
@@ -7,15 +9,11 @@ export type DecisionCategory = typeof DECISION_CATEGORIES[number]
 export const DECISION_IMPACTS = ['low', 'medium', 'high'] as const
 export type DecisionImpact = typeof DECISION_IMPACTS[number]
 
-export type DecisionSignal =
-  | 'WAIT'
-  | 'PROGRESS'
-  | 'APPROVAL'
-  | 'QUESTION'
-  | 'WORKER_DECISION'
-  | 'CHECKPOINT'
-  | 'TERMINAL_SUCCESS'
-  | 'TERMINAL_FAILURE'
+export const DECISION_SIGNALS = [
+  'WAIT', 'PROGRESS', 'APPROVAL', 'QUESTION', 'WORKER_DECISION',
+  'CHECKPOINT', 'TERMINAL_SUCCESS', 'TERMINAL_FAILURE',
+] as const
+export type DecisionSignal = typeof DECISION_SIGNALS[number]
 
 export type DecisionTiming = 'cadence' | 'immediate'
 export type DecisionAudience = 'none' | 'supervisor' | 'human'
@@ -68,6 +66,50 @@ export interface DecisionOutcome extends DecisionEffect {
   policyVersion: string
   matchedRuleId: string
   protocolInvariant: boolean
+}
+
+export interface DecisionComparison {
+  active: DecisionOutcome
+  shadow?: DecisionOutcome
+  differs: boolean
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonical(record[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+export function decisionPolicyDigest(policy: DecisionPolicy): string {
+  return createHash('sha256').update(canonical(policy)).digest('hex')
+}
+
+export function parseDecisionFacts(value: unknown): DecisionFacts {
+  if (typeof value !== 'object' || value === null) throw new Error('decision facts must be an object')
+  const facts = value as Record<string, unknown>
+  if (typeof facts.signal !== 'string' || !(DECISION_SIGNALS as readonly string[]).includes(facts.signal)) {
+    throw new Error('decision facts signal is unsupported')
+  }
+  if (facts.category !== undefined && (typeof facts.category !== 'string' || !(DECISION_CATEGORIES as readonly string[]).includes(facts.category))) {
+    throw new Error('decision facts category is unsupported')
+  }
+  if (facts.impact !== undefined && (typeof facts.impact !== 'string' || !(DECISION_IMPACTS as readonly string[]).includes(facts.impact))) {
+    throw new Error('decision facts impact is unsupported')
+  }
+  for (const key of ['blocking', 'requiresHuman', 'explicitlyPreAuthorized']) {
+    if (facts[key] !== undefined && typeof facts[key] !== 'boolean') throw new Error(`decision facts ${key} must be boolean`)
+  }
+  return {
+    signal: facts.signal as DecisionSignal,
+    ...facts.category === undefined ? {} : { category: facts.category as DecisionCategory },
+    ...facts.impact === undefined ? {} : { impact: facts.impact as DecisionImpact },
+    ...facts.blocking === undefined ? {} : { blocking: facts.blocking as boolean },
+    ...facts.requiresHuman === undefined ? {} : { requiresHuman: facts.requiresHuman as boolean },
+    ...facts.explicitlyPreAuthorized === undefined ? {} : { explicitlyPreAuthorized: facts.explicitlyPreAuthorized as boolean },
+  }
 }
 
 const effect = (
@@ -152,6 +194,22 @@ export function evaluateDecision(
     policyVersion: policy.version,
     matchedRuleId: matched?.id ?? 'worker.fallback',
     protocolInvariant: false,
+  }
+}
+
+export function compareDecision(
+  facts: DecisionFacts,
+  activePolicy: DecisionPolicy = DEFAULT_DECISION_POLICY,
+  shadowPolicy?: DecisionPolicy,
+): DecisionComparison {
+  const active = evaluateDecision(facts, activePolicy)
+  if (shadowPolicy === undefined) return { active, differs: false }
+  const shadow = evaluateDecision(facts, shadowPolicy)
+  return {
+    active,
+    shadow,
+    differs: active.timing !== shadow.timing || active.audience !== shadow.audience
+      || active.action !== shadow.action,
   }
 }
 

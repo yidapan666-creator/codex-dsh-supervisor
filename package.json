@@ -16,6 +16,7 @@
     "link:dsh": "node scripts/link-local-dsh.mjs",
     "bootstrap": "node scripts/dsh-gate.mjs bootstrap",
     "doctor": "node scripts/dsh-gate.mjs doctor",
+    "policy:explain": "node packages/decision-policy/dist/cli.js explain",
     "skill:install": "node scripts/install-codex-skill.mjs",
     "host:start": "node scripts/dsh-gate.mjs host start",
     "host:status": "node scripts/dsh-gate.mjs host status",

@@ -7,6 +7,7 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": { "dsh-decision-policy": "dist/cli.js" },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -16,6 +17,7 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "explain": "node dist/cli.js explain"
   }
 }

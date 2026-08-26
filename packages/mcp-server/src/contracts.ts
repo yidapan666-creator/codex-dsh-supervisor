@@ -165,6 +165,7 @@ export const observationSchema = z.object({
   progress: progressHeartbeatSchema.optional(),
   supervisorProgress: supervisorProgressSchema.optional(),
   decision: decisionOutcomeSchema.optional(),
+  decisionShadow: decisionOutcomeSchema.extend({ differs: z.boolean() }).optional(),
   journal: z.object({
     recorded: z.boolean(),
     recordId: z.string(),
@@ -217,6 +218,12 @@ export const taskPacketV2Schema = z.object({
     maxDirectChildren: z.number().int().min(0).max(64).optional(),
     preAuthorizedActions: packetListSchema.optional(),
     preAuthorizedDecisionCategories: z.array(z.enum(DECISION_CATEGORIES)).max(10).optional(),
+  }).strict().optional(),
+  decisionPolicy: z.object({
+    activeVersion: z.string().min(1).max(128),
+    activeDigest: z.string().regex(/^[0-9a-f]{64}$/),
+    shadowVersion: z.string().min(1).max(128).optional(),
+    shadowDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   }).strict().optional(),
   /** Migration-only alias for workers that still read the v1 taskId field. */
   taskId: z.string().min(1).max(512).optional(),

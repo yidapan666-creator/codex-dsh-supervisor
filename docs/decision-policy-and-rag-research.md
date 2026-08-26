@@ -67,11 +67,13 @@ The default worker policy is intentionally conservative:
 structured `decision` object. Only Codex's durable task packet may declare
 `preAuthorizedDecisionCategories`; the worker cannot self-authorize.
 
-An operator may replace worker rules through `DSH_DECISION_POLICY_JSON`. The
-parser validates the document, while protocol effects remain non-overridable.
-This is deliberately an environment-level first version; a future revision can
-load a versioned file after configuration provenance and reload semantics are
-specified.
+Operators select immutable JSON policies from `config/decision-policies/`.
+Every new run durably pins the active version and canonical SHA-256 digest; an
+MCP restart must resolve the same catalog entry or fail closed. The explain/dry-
+run CLI reports matched rules for supplied facts. An optional pinned shadow
+policy is evaluated by the same engine and recorded for comparison while active
+timing/action remains authoritative. `DSH_DECISION_POLICY_JSON` is retained only
+for migration.
 
 ## Why RAG is separate
 
