@@ -212,6 +212,17 @@ provider-reporting variance can still carry the final total past the limit. Opti
 `dsh-usage-monitor` bridge for comparison only; monitor downtime cannot stop a
 task, and monitor totals are never enforcement authority.
 
+### Direct-child authority
+
+`authority.maxDirectChildren` is enforced in the DSH Host before child creation,
+including parallel start attempts. The bundled profile guards the default
+`subagent` tool. If a deployment renames that tool or mounts another direct-child
+creation tool, add every such name to the supervisor plugin's
+`directChildToolNames` list; startup rejects an empty list rather than silently
+disabling the authority boundary. The counter uses persisted direct-child
+session creation facts for the current run and does not move orchestration
+ownership from the DSH root to MCP/Codex.
+
 ## Wiring Codex
 
 1. `pnpm bootstrap` (once).

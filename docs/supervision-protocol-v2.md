@@ -107,6 +107,10 @@ Codex sends the complete objective, scope, constraints, acceptance checks,
 verification commands, escalation conditions, Git baseline, authority, and
 pre-authorized child budget in one durable packet. Safe in-scope edits and
 declared verification do not require another human confirmation.
+The Host enforces `authority.maxDirectChildren` before configured child-start
+tools run, using durable direct-child creation times plus atomic reservations
+for concurrent starts. Within the limit the worker does not ask again; beyond
+the limit the call is denied without transferring child control to Codex.
 
 ### DSH to Codex during ordinary work
 

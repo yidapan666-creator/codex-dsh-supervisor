@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { installTokenBudgetGuards, liveTokenBudgetState } from '../src/index.js'
+import {
+  installDirectChildAuthorityGuards,
+  installTokenBudgetGuards,
+  liveTokenBudgetState,
+} from '../src/index.js'
 
 const runId = '11111111-1111-4111-8111-111111111111'
 const oldRunId = '33333333-3333-4333-8333-333333333333'
@@ -17,6 +21,17 @@ const packetFor = (id: string, sessionId = 'root') => ({
 const packetEvent = (seq: number, time: number, id = runId, sessionId = 'root') => ({
   type: 'user/message', seq, time, data: {
     content: [{ type: 'text', text: `<dsh-supervised-task>\n${JSON.stringify(packetFor(id, sessionId))}\n</dsh-supervised-task>` }],
+  },
+})
+
+const childLimitedPacketEvent = (seq: number, time: number, maxDirectChildren: number) => ({
+  type: 'user/message', seq, time, data: {
+    content: [{
+      type: 'text',
+      text: `<dsh-supervised-task>\n${JSON.stringify({
+        ...packetFor(runId), authority: { maxDirectChildren },
+      })}\n</dsh-supervised-task>`,
+    }],
   },
 })
 
@@ -334,5 +349,90 @@ describe('Host token budget fold', () => {
 
     await expect(secondPromise).resolves.toMatchObject({ maxTokens: 90 })
     expect(cancelled.size).toBe(0)
+  })
+})
+
+describe('Host direct-child authority guard', () => {
+  it('atomically counts durable children and concurrent start reservations', async () => {
+    const root = {
+      header: { id: 'root', createdAt: 90 },
+      events: [childLimitedPacketEvent(0, 100, 2)],
+    }
+    const existingChild = { id: 'child-1', createdAt: 110, parentSession: 'root' }
+    const snapshots = [{ header: existingChild, revision: 'child-1-r1' }]
+    const agent = { session: root, cancel: () => {} }
+    type Decision = { kind: 'allow' } | { kind: 'deny'; reason: string } | { kind: 'ask'; reason?: string }
+    type Execution = { name: string; token: symbol; agent: typeof agent }
+    let preExecute: ((execution: Execution, next: () => Promise<Decision>) => Promise<Decision>) | undefined
+    let toolResult: ((execution: Execution, result: { isError: boolean }) => void) | undefined
+    const ctx = {
+      sessions: { list: () => [root] },
+      agents: { list: () => [agent] },
+      on(name: string, listener: unknown) {
+        if (name === 'tools/pre-execute') preExecute = listener as typeof preExecute
+        if (name === 'tools/result') toolResult = listener as typeof toolResult
+      },
+      sessionPersistence: {
+        listSnapshots: async () => snapshots,
+        inspect: async () => { throw new Error('not used') },
+      },
+    }
+    installDirectChildAuthorityGuards(ctx as never)
+
+    const first = { name: 'subagent', token: Symbol('first'), agent }
+    const second = { name: 'subagent', token: Symbol('second'), agent }
+    await expect(preExecute?.(first, async () => ({ kind: 'allow' }))).resolves.toEqual({ kind: 'allow' })
+    await expect(preExecute?.(second, async () => ({ kind: 'allow' }))).resolves.toMatchObject({
+      kind: 'deny',
+      reason: expect.stringContaining('dsh-gate:direct-child-limit'),
+    })
+
+    toolResult?.(first, { isError: false })
+    snapshots.push({
+      header: { id: 'child-2', createdAt: 120, parentSession: 'root' },
+      revision: 'child-2-r1',
+    })
+    const third = { name: 'subagent', token: Symbol('third'), agent }
+    await expect(preExecute?.(third, async () => ({ kind: 'allow' }))).resolves.toMatchObject({
+      kind: 'deny',
+      reason: expect.stringContaining('used=2;limit=2'),
+    })
+  })
+
+  it('does not consume a slot for a failed start or an unrelated tool', async () => {
+    const root = {
+      header: { id: 'root', createdAt: 90 },
+      events: [childLimitedPacketEvent(0, 100, 1)],
+    }
+    const agent = { session: root, cancel: () => {} }
+    type Decision = { kind: 'allow' } | { kind: 'deny'; reason: string } | { kind: 'ask'; reason?: string }
+    type Execution = { name: string; token: symbol; agent: typeof agent }
+    let preExecute: ((execution: Execution, next: () => Promise<Decision>) => Promise<Decision>) | undefined
+    let toolResult: ((execution: Execution, result: { isError: boolean }) => void) | undefined
+    const ctx = {
+      sessions: { list: () => [root] },
+      agents: { list: () => [agent] },
+      on(name: string, listener: unknown) {
+        if (name === 'tools/pre-execute') preExecute = listener as typeof preExecute
+        if (name === 'tools/result') toolResult = listener as typeof toolResult
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [],
+        inspect: async () => { throw new Error('not used') },
+      },
+    }
+    installDirectChildAuthorityGuards(ctx as never)
+
+    const failed = { name: 'subagent', token: Symbol('failed'), agent }
+    await expect(preExecute?.(failed, async () => ({ kind: 'allow' }))).resolves.toEqual({ kind: 'allow' })
+    toolResult?.(failed, { isError: true })
+    await expect(preExecute?.(
+      { name: 'subagent', token: Symbol('retry'), agent },
+      async () => ({ kind: 'allow' }),
+    )).resolves.toEqual({ kind: 'allow' })
+    await expect(preExecute?.(
+      { name: 'read', token: Symbol('read'), agent },
+      async () => ({ kind: 'allow' }),
+    )).resolves.toEqual({ kind: 'allow' })
   })
 })

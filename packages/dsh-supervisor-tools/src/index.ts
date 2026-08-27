@@ -32,11 +32,14 @@ export interface Config {
   maxReportedFailuresPerSignature?: number
   /** Largest output reservation granted to one model request under a run budget. */
   maxReservedOutputTokensPerRequest?: number
+  /** Model-facing tool names that establish a direct child and consume run authority. */
+  directChildToolNames?: string[]
 }
 
 export const Config: z<Config> = z.object({
   maxReportedFailuresPerSignature: z.natural().min(1).max(20).default(2),
   maxReservedOutputTokensPerRequest: z.natural().min(1).max(131_072).default(8_192),
+  directChildToolNames: z.array(z.string()).default(['subagent']),
 })
 
 const HANDOFF_STATUSES = [
@@ -116,12 +119,14 @@ type TaskIdentity = {
   runId?: string | undefined
   completionToken: string
   tokenBudget?: number | undefined
+  maxDirectChildren?: number | undefined
 }
 
 type TaskIdentityBoundary = { identity: TaskIdentity; boundarySeq: number; boundaryTime?: number }
 
 interface RuntimeSessionHeader {
   id: string
+  createdAt?: number
   parentSession?: string
   seedLength?: number
 }
@@ -141,6 +146,12 @@ interface RuntimeSession {
 interface RuntimeAgent {
   session: RuntimeSession
   cancel(cause: { kind: 'hook'; reason: string }): void
+}
+
+interface RuntimeToolExecution {
+  readonly name: string
+  readonly token: symbol
+  readonly agent?: RuntimeAgent
 }
 
 interface RuntimeLlmCallConfig {
@@ -173,6 +184,17 @@ interface SupervisorRuntimeContext {
     name: 'agent/pre-step',
     listener: (payload: { agent: RuntimeAgent }, next: () => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: unknown[] }>)
       => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: unknown[] }>,
+  ): void
+  on(
+    name: 'tools/pre-execute',
+    listener: (
+      execution: RuntimeToolExecution,
+      next: () => Promise<{ kind: 'allow' } | { kind: 'deny'; reason: string } | { kind: 'ask'; reason?: string }>,
+    ) => Promise<{ kind: 'allow' } | { kind: 'deny'; reason: string } | { kind: 'ask'; reason?: string }>,
+  ): void
+  on(
+    name: 'tools/result',
+    listener: (execution: RuntimeToolExecution, result: { readonly isError: boolean }) => void,
   ): void
   on(
     name: 'agent/request',
@@ -217,6 +239,7 @@ function latestTaskIdentityBoundary(
       try {
         const value = JSON.parse(text.slice(start + TASK_PACKET_START.length, end).trim()) as Record<string, unknown>
         const maxTokens = (value.budget as { maxTokens?: unknown } | undefined)?.maxTokens
+        const maxDirectChildren = (value.authority as { maxDirectChildren?: unknown } | undefined)?.maxDirectChildren
         if (value.schemaVersion === 2
           && typeof value.sessionId === 'string' && value.sessionId.length > 0
           && typeof value.runId === 'string' && UUID_PATTERN.test(value.runId)
@@ -231,6 +254,10 @@ function latestTaskIdentityBoundary(
               completionToken: value.completionToken,
               ...typeof maxTokens === 'number' && Number.isSafeInteger(maxTokens) && maxTokens > 0
                 ? { tokenBudget: maxTokens }
+                : {},
+              ...typeof maxDirectChildren === 'number'
+                && Number.isSafeInteger(maxDirectChildren) && maxDirectChildren >= 0
+                ? { maxDirectChildren }
                 : {},
             },
             boundarySeq: event.seq ?? index,
@@ -534,8 +561,8 @@ function reservedTokens(reservations: ReadonlyMap<string, BudgetReservation>, ex
   return total
 }
 
-/** Minimal keyed mutex used only for short request-admission accounting sections. */
-async function withRunBudgetLock<T>(
+/** Minimal keyed mutex used only for short Host-side admission accounting sections. */
+async function withKeyedLock<T>(
   locks: Map<string, Promise<void>>,
   key: string,
   task: () => Promise<T>,
@@ -698,6 +725,75 @@ export function reportedFailureDecision(
 }
 
 /** Install Host-owned live and post-restart token-budget enforcement. */
+export function installDirectChildAuthorityGuards(
+  runtime: SupervisorRuntimeContext,
+  options: { directChildToolNames?: readonly string[] } = {},
+): void {
+  const toolNames = new Set(options.directChildToolNames ?? ['subagent'])
+  const locks = new Map<string, Promise<void>>()
+  const pendingByRun = new Map<string, Set<symbol>>()
+  const runByExecution = new Map<symbol, string>()
+
+  const release = (token: symbol): void => {
+    const runKey = runByExecution.get(token)
+    if (runKey === undefined) return
+    runByExecution.delete(token)
+    const pending = pendingByRun.get(runKey)
+    pending?.delete(token)
+    if (pending?.size === 0) pendingByRun.delete(runKey)
+  }
+
+  runtime.on('tools/result', (execution) => { release(execution.token) })
+  runtime.on('tools/pre-execute', async (execution, next) => {
+    const delegated = await next()
+    if (delegated.kind !== 'allow' || !toolNames.has(execution.name) || execution.agent === undefined) {
+      return delegated
+    }
+    const { session } = execution.agent
+    const boundary = latestTaskIdentityBoundary(session.events)
+    const identity = boundary?.identity
+    if (boundary === undefined
+      || identity?.schemaVersion !== 2
+      || identity.runId === undefined
+      || identity.sessionId !== session.header.id
+      || identity.maxDirectChildren === undefined) return delegated
+    if (boundary.boundaryTime === undefined) {
+      return { kind: 'deny', reason: `dsh-gate:direct-child-accounting-failed;runId=${identity.runId};error=missing-task-boundary-time` }
+    }
+
+    const { boundaryTime } = boundary
+    const { maxDirectChildren } = identity
+    const runKey = runBudgetKey(identity.sessionId, identity.runId)
+    return withKeyedLock(locks, runKey, async () => {
+      try {
+        const snapshots = await runtime.sessionPersistence.listSnapshots()
+        const headers = new Map<string, RuntimeSessionHeader>()
+        for (const snapshot of snapshots) headers.set(snapshot.header.id, snapshot.header)
+        for (const candidate of runtime.sessions.list()) headers.set(candidate.header.id, candidate.header)
+        const created = [...headers.values()].filter(header => header.parentSession === identity.sessionId
+          && header.createdAt !== undefined && header.createdAt >= boundaryTime).length
+        const pending = pendingByRun.get(runKey) ?? new Set<symbol>()
+        if (created + pending.size >= maxDirectChildren) {
+          return {
+            kind: 'deny' as const,
+            reason: `dsh-gate:direct-child-limit;runId=${identity.runId};used=${created + pending.size};limit=${maxDirectChildren}`,
+          }
+        }
+        pending.add(execution.token)
+        pendingByRun.set(runKey, pending)
+        runByExecution.set(execution.token, runKey)
+        return delegated
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return {
+          kind: 'deny' as const,
+          reason: `dsh-gate:direct-child-accounting-failed;runId=${identity.runId};error=${message.slice(0, 256)}`,
+        }
+      }
+    })
+  })
+}
+
 export function installTokenBudgetGuards(
   runtime: SupervisorRuntimeContext,
   options: { maxReservedOutputTokensPerRequest?: number } = {},
@@ -833,7 +929,7 @@ export function installTokenBudgetGuards(
     const requestKey = requestBudgetKey(agent.session.header.id, turn, step)
     const system = renderPrompt(assembly)
     while (true) {
-      const admission = await withRunBudgetLock(locks, runKey, async () => {
+      const admission = await withKeyedLock(locks, runKey, async () => {
         try {
           const state = await durableTokenBudgetState(
             runtime, rootId, runId, tokenBudget, durableUsageCache,
@@ -889,11 +985,16 @@ export function installTokenBudgetGuards(
 
 export function apply(ctx: Context, config: Config = {}): void {
   const resolved = Config(config) as Required<Config>
+  const directChildToolNames = [...new Set(resolved.directChildToolNames.map(value => value.trim()))]
+  if (directChildToolNames.length === 0 || directChildToolNames.some(value => value.length === 0)) {
+    throw new Error('dsh-gate supervisor tools: directChildToolNames must contain at least one non-empty tool name')
+  }
   const runtime = ctx as unknown as SupervisorRuntimeContext
   ctx.effect(() => registerTaskAdmissionRoute(
     runtime.webServer,
     new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
   ), 'dsh-gate task admission route')
+  installDirectChildAuthorityGuards(runtime, { directChildToolNames })
   installTokenBudgetGuards(runtime, {
     maxReservedOutputTokensPerRequest: resolved.maxReservedOutputTokensPerRequest,
   })
@@ -911,6 +1012,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'include the structured decision category, impact, blocking state, request, options, and recommendation. '
       + '`needsSupervisor` is a migration hint; the runtime policy decides whether the request interrupts immediately or '
       + 'is folded into the normal progress cadence. Never claim pre-authorization yourself. '
+      + 'When the task packet grants `authority.maxDirectChildren`, you may create children within that cap without asking again; the Host rejects starts beyond the durable run limit. '
       + 'A normal turn ending without that valid handoff is not success. Report repeated failures through '
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
       + 'whether two failures are semantically the same remains your responsibility.',

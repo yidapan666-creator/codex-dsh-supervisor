@@ -10,3 +10,6 @@
       name: '@dsh-gate/supervisor-tools'
       config:
         maxReportedFailuresPerSignature: 2
+        maxReservedOutputTokensPerRequest: 8192
+        directChildToolNames:
+          - subagent

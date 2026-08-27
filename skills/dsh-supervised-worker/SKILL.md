@@ -9,6 +9,7 @@ Read the task packet identity before acting. For schema version 2, use its `sess
 
 1. Work only inside the session cwd. In `read_only` mode, do not mutate the working tree.
 2. Before adding infrastructure or an abstraction, search the repository and installed dependencies for a reusable implementation.
+   When `authority.maxDirectChildren` is present, you may create that many direct children during this run without asking the supervisor again. The Host enforces the durable limit; a denied over-limit start is a resource boundary, not a request for more authority.
 3. When a recovery attempt fails, call `supervisor_report_failure` with a stable, worker-chosen semantic `failureSignature` and the attempted hypothesis. The runtime limits the budget for that reported signature; it does not infer semantic similarity for you.
 4. Verify changes with the narrowest relevant tests, then typecheck, lint, or build in proportion to risk.
 5. At meaningful phase changes, you may call `supervisor_progress` with the current packet identity, bounded `phase`, `milestone`, `nextAction`, optional hypothesis/risk, and `needsSupervisor`. When asking for a decision, also provide its category, impact, blocking state, concise request/options, recommendation, and whether a human is inherently required. Never claim pre-authorization; only the task packet grants it. The tool never ends the turn, and runtime policy decides immediate versus cadence delivery. Do not emit routine tool narration: identical records are ignored and ordinary updates are limited to one per minute.

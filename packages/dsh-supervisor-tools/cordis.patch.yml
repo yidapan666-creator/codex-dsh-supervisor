@@ -11,3 +11,5 @@
       config:
         maxReportedFailuresPerSignature: 2
         maxReservedOutputTokensPerRequest: 8192
+        directChildToolNames:
+          - subagent
