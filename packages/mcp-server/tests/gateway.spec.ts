@@ -529,6 +529,47 @@ function s1CompletedEvents(): DshEvent[] {
   ]
 }
 
+const v2RunId = '11111111-1111-4111-8111-111111111111'
+const v2CompletionToken = '22222222-2222-4222-8222-222222222222'
+
+function s1V2CompletedEvents(): DshEvent[] {
+  const packet = {
+    schemaVersion: 2,
+    sessionId: 's1',
+    runId: v2RunId,
+    completionToken: v2CompletionToken,
+    objective: 'ship with children',
+    writerMode: 'writer',
+    budget: { maxTokens: 100 },
+  }
+  const handoff = {
+    sessionId: 's1',
+    runId: v2RunId,
+    completionToken: v2CompletionToken,
+    status: 'completed',
+    stage: 'done',
+    summary: 'root verified',
+    files: [],
+    verification: [],
+  }
+  return [
+    event('user/message', 1, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+    }),
+    event('turn/start', 2, { turn: 1 }),
+    toolCall(3, 'v2-handoff', 'supervisor_handoff', handoff),
+    event('tool/result', 4, {
+      turn: 1,
+      step: 1,
+      message: { source: { callId: 'v2-handoff' }, content: [{
+        type: 'tool-result',
+        content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff, artifacts: [] }) }],
+      }] },
+    }),
+    event('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+}
+
 describe('wait cadence', () => {
   it('defaults the wait window to the five-minute aggregated cadence', () => {
     expect(DEFAULT_WAIT_TIMEOUT_MS).toBe(300_000)
@@ -603,6 +644,89 @@ describe('wait cadence', () => {
     expect(Date.now() - started).toBeLessThan(500)
     expect(observed.status).toBe('COMPLETED')
     expect(observed.projectActivity).toMatchObject({ toolCalls: 1, steps: 0 })
+  })
+
+  it('keeps a valid root handoff waiting until its affiliated child settles', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'child-1', {
+      running: true,
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING',
+      stage: 'children-running',
+      wait: { reason: 'TIMEOUT' },
+    })
+
+    api.setRunning('child-1', false)
+    api.setEvents('child-1', [
+      { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+      { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+      { ...event('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }), time: 12 },
+    ])
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'COMPLETED',
+      summary: 'root verified',
+    })
+  })
+
+  it('lets a durable child budget stop override an earlier completed root handoff', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'child-1', {
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+        { ...event('turn/end', 2, {
+          turn: 1,
+          reason: {
+            kind: 'aborted',
+            reason: { kind: 'hook', reason: `dsh-gate:token-budget-exhausted;runId=${v2RunId};used=150;limit=100` },
+          },
+        }), time: 12 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'ESCALATION_REQUIRED',
+      stage: 'token-budget-exhausted',
+      budget: { observedTokens: 150, limitTokens: 100, exhausted: true, coverage: 'run_tree' },
+    })
+  })
+
+  it('does not journal COMPLETED before an affiliated child converges', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    const childPrompt = { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 }
+    api.addChild('s1', 'child-1', { running: true, events: [childPrompt] })
+    const records: RunRecord[] = []
+    const journal: RunJournal = {
+      async record(value) { records.push(value); return { recordId: value.recordId, created: true } },
+      async get() { return undefined },
+      async list() { return records },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+
+    expect((await manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).status).toBe('WAITING')
+    expect(records).toHaveLength(0)
+
+    api.setRunning('child-1', false)
+    api.setEvents('child-1', [
+      childPrompt,
+      { ...event('turn/end', 1, { turn: 1, reason: { kind: 'completed' } }), time: 12 },
+    ])
+    expect((await manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).status).toBe('COMPLETED')
+    expect(records).toHaveLength(1)
+    expect(records[0]?.outcome).toBe('COMPLETED')
   })
 
   it('records a terminal run once from runtime facts without another model call', async () => {

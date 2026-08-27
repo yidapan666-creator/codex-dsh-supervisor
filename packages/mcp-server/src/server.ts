@@ -43,7 +43,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   const server = new McpServer({ name: 'dsh-gate', version: '0.1.0' }, {
     capabilities: { tools: {} },
     instructions: 'Supervise DSH root sessions through these lifecycle tools. Accept COMPLETED only when dsh_wait '
-      + 'returns it: the runtime requires a valid matching supervisor_handoff result followed by that turn ending. '
+      + 'returns it: the runtime requires a valid matching supervisor_handoff result, that turn ending, and every affiliated child settling. '
       + 'Carry asOfSeq into afterAsOfSeq only as an observation cursor; DSH since is not a resume cursor. '
       + 'dsh_wait runs the five-minute aggregated cadence: one observation about every 300000 ms, returning early only '
       + 'when the explainable decision outcome says immediate. Protocol boundaries are locked; structured worker requests are policy-evaluated. Follow decision.action and decision.audience instead of treating needsSupervisor as authority. A WAITING/TIMEOUT return carries aggregated '
@@ -57,7 +57,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree; the external dsh-usage-monitor reading is optional observability and never budget authority. '
       + 'After MCP/Codex reconnect, use dsh_runs to rediscover identity and dsh_recover to reattach before waiting. Do not replay the objective. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
-      + 'or take over completed child work. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '
+      + 'or take over completed child work. A root handoff remains WAITING while affiliated children run; their durable budget stop overrides the older root handoff. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '
       + 'Never stop the independently owned DSH Host. '
       + 'Use one writer per real working tree; parallel writers require independent worktrees.',
   })

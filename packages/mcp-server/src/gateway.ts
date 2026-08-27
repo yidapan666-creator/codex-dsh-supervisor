@@ -17,7 +17,10 @@ import {
 import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
-import { TASK_PACKET_END, TASK_PACKET_START, taskPacketSchema, type Observation } from './contracts.js'
+import {
+  TASK_PACKET_END, TASK_PACKET_START, taskPacketSchema,
+  type DshEvent, type Observation, type TaskRuntimeState,
+} from './contracts.js'
 import { UsageMonitorClient } from './usage-monitor.js'
 
 interface SessionAddress {
@@ -102,6 +105,43 @@ export function attachChildObservations<T extends { id: string }>(
       },
     }
   })
+}
+
+interface RunTreeBudgetStop {
+  usedTokens?: number
+  limitTokens?: number
+}
+
+interface RunTreeConvergence {
+  activeSessionIds: string[]
+  budgetStop?: RunTreeBudgetStop
+}
+
+function reasonFields(text: string): Map<string, string> {
+  return new Map(text.split(';').slice(1).flatMap((part) => {
+    const separator = part.indexOf('=')
+    return separator < 0 ? [] : [[part.slice(0, separator), part.slice(separator + 1)] as const]
+  }))
+}
+
+function hookBudgetStop(events: readonly DshEvent[], afterSeq: number, runId: string): RunTreeBudgetStop | undefined {
+  const terminal = events.findLast((event) => {
+    if (event.type !== 'turn/end' || event.seq <= afterSeq) return false
+    const reason = (event.data as { reason?: { kind?: unknown; reason?: { kind?: unknown; reason?: unknown } } }).reason
+    return reason?.kind === 'aborted' && reason.reason?.kind === 'hook'
+      && typeof reason.reason.reason === 'string'
+      && reason.reason.reason.startsWith('dsh-gate:token-budget-exhausted;')
+      && reasonFields(reason.reason.reason).get('runId') === runId
+  })
+  if (terminal === undefined) return undefined
+  const text = ((terminal.data as { reason: { reason: { reason: string } } }).reason.reason.reason)
+  const fields = reasonFields(text)
+  const used = Number(fields.get('used'))
+  const limit = Number(fields.get('limit'))
+  return {
+    ...Number.isSafeInteger(used) && used >= 0 ? { usedTokens: used } : {},
+    ...Number.isSafeInteger(limit) && limit > 0 ? { limitTokens: limit } : {},
+  }
 }
 
 export interface GatewayConfig {
@@ -542,6 +582,152 @@ export class GatewayManager {
     })
   }
 
+  private async childHistorySince(
+    connection: HostConnection,
+    parentSessionId: string,
+    child: { id: string; mode: 'one-shot' | 'continuable' },
+    since: number,
+  ): Promise<DshEvent[]> {
+    const events = new Map<number, DshEvent>()
+    let beforeSeq: number | undefined
+    let hasMore = true
+    while (hasMore) {
+      const page = unwrap(await connection.api.subagents.history({
+        parentSessionId: parentSessionId as SessionId,
+        childSessionId: child.id as SessionId,
+        mode: child.mode,
+        maxMessages: 200,
+        ...beforeSeq === undefined ? {} : { beforeSeq },
+      }))
+      for (const entry of page.events) events.set(entry.event.seq, entry.event as DshEvent)
+      hasMore = page.hasMore
+      const first = page.events.at(0)?.event
+      if (!hasMore || first === undefined || first.time < since) break
+      beforeSeq = first.seq
+    }
+    return [...events.values()].sort((left, right) => left.seq - right.seq)
+  }
+
+  private async inspectRunTree(
+    connection: HostConnection,
+    snapshot: TaskRuntimeState,
+    rootSessionId: string,
+    runId: string,
+  ): Promise<RunTreeConvergence> {
+    const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
+      packet.schemaVersion === 2 && packet.sessionId === rootSessionId && packet.runId === runId)
+    if (packetEntry === undefined || packetEntry.packet.schemaVersion !== 2) return { activeSessionIds: [] }
+    const rootPacket = packetEntry.packet
+    const rootBoundary = snapshot.events.find(event => event.seq === packetEntry.seq)
+    if (rootBoundary === undefined) return { activeSessionIds: [] }
+    const activeSessionIds: string[] = []
+    let budgetStop: RunTreeBudgetStop | undefined
+    const visited = new Set<string>()
+
+    const visit = async (parentSessionId: string): Promise<void> => {
+      if (visited.has(parentSessionId)) return
+      visited.add(parentSessionId)
+      const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
+      for (const entry of catalog.entries) {
+        if (entry.kind !== 'child') continue
+        const events = await this.childHistorySince(connection, parentSessionId, entry, rootBoundary.time)
+        const nested = taskPacketEntries(events).findLast(({ packet, seq }) => {
+          const boundary = events.find(event => event.seq === seq)
+          return packet.schemaVersion === 2 && packet.sessionId === entry.id
+            && boundary !== undefined && boundary.time >= rootBoundary.time
+        })
+        if (nested !== undefined && nested.packet.schemaVersion === 2 && nested.packet.runId !== rootPacket.runId) {
+          continue
+        }
+        const activation = events.find((event) => {
+          if (event.type !== 'user/message' || event.time < rootBoundary.time) return false
+          const packet = parseTaskPacket([event])
+          return packet === undefined || (packet.schemaVersion === 2 && packet.sessionId === entry.id
+            && packet.runId === rootPacket.runId)
+        })
+        if (activation === undefined) continue
+        if (entry.activity === 'running') activeSessionIds.push(entry.id)
+        budgetStop ??= hookBudgetStop(events, activation.seq, rootPacket.runId)
+        if (entry.hasChildren) await visit(entry.id)
+      }
+    }
+
+    await visit(rootSessionId)
+    return {
+      activeSessionIds: activeSessionIds.slice(0, 64),
+      ...budgetStop === undefined ? {} : { budgetStop },
+    }
+  }
+
+  private async validateRunTreeCompletion(
+    connection: HostConnection,
+    snapshot: TaskRuntimeState,
+    observation: Observation,
+  ): Promise<{ snapshot: TaskRuntimeState; observation: Observation }> {
+    const packet = parseTaskPacket(snapshot.events)
+    if (observation.status !== 'COMPLETED' || packet?.schemaVersion !== 2) return { snapshot, observation }
+    let tree: RunTreeConvergence
+    try {
+      tree = await this.inspectRunTree(connection, snapshot, packet.sessionId, packet.runId)
+    } catch (error) {
+      const policies = this.policiesFor(snapshot)
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'FAILED',
+          stage: 'run-tree-reconciliation',
+          summary: 'The root handoff is valid, but child convergence could not be verified.',
+          failure: { kind: 'HOST_FAILED', message, retryable: true },
+          decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
+        },
+      }
+    }
+    const policies = this.policiesFor(snapshot)
+    if (tree.budgetStop !== undefined) {
+      const observedTokens = tree.budgetStop.usedTokens ?? observation.budget?.observedTokens ?? 0
+      const limitTokens = tree.budgetStop.limitTokens ?? observation.budget?.limitTokens ?? Math.max(1, observedTokens)
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'ESCALATION_REQUIRED',
+          stage: 'token-budget-exhausted',
+          summary: `A child exhausted the Host-enforced run-tree token budget (${String(observedTokens)}/${String(limitTokens)}).`,
+          budget: {
+            limitTokens,
+            observedTokens,
+            remainingTokens: 0,
+            exhausted: true,
+            coverage: 'run_tree',
+            enforcement: 'DSH_HOST_RUNTIME',
+            overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
+          },
+          decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
+        },
+      }
+    }
+    if (tree.activeSessionIds.length > 0) {
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'WAITING',
+          stage: 'children-running',
+          summary: `Root handoff accepted; waiting for ${String(tree.activeSessionIds.length)} affiliated child session(s) to settle.`,
+          decision: evaluateDecision({ signal: 'WAIT' }, policies.active),
+        },
+      }
+    }
+
+    // Child settlement may synchronously deliver a report back to root. Refresh
+    // once after proving the tree quiet so that a newly opened root turn wins
+    // over its older handoff instead of racing a false COMPLETED response.
+    const refreshed = await connection.refreshSession(packet.sessionId)
+    return { snapshot: refreshed, observation: this.observationForRun(refreshed, packet.sessionId, packet.runId) }
+  }
+
   private observationForRun(
     snapshot: Parameters<typeof deriveObservation>[0],
     sessionId: string,
@@ -702,8 +888,11 @@ export class GatewayManager {
   async recover(input: SessionAddress & { runId?: string | undefined }): Promise<Observation> {
     const sessionId = sessionIdOf(input)
     const connection = await this.locate(sessionId)
-    const snapshot = await connection.refreshSession(sessionId)
-    const observation = this.observationForRun(snapshot, sessionId, input.runId)
+    let snapshot = await connection.refreshSession(sessionId)
+    let observation = this.observationForRun(snapshot, sessionId, input.runId)
+    const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+    snapshot = validated.snapshot
+    observation = validated.observation
     const recovered: Observation = observation.recovery?.kind === 'CONTINUATION_REQUIRED'
       ? observation
       : {
@@ -730,7 +919,10 @@ export class GatewayManager {
     let snapshot = await connection.refreshSession(sessionId)
     let authoritative = true
     while (true) {
-      const observation = this.observationForRun(snapshot, sessionId, input.runId)
+      let observation = this.observationForRun(snapshot, sessionId, input.runId)
+      const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+      snapshot = validated.snapshot
+      observation = validated.observation
       if (input.afterAsOfSeq !== undefined && input.afterAsOfSeq > observation.asOfSeq) {
         throw new Error(`afterAsOfSeq ${String(input.afterAsOfSeq)} is ahead of observed asOfSeq ${String(observation.asOfSeq)}`)
       }
@@ -755,7 +947,10 @@ export class GatewayManager {
         if (!authoritative) {
           snapshot = await connection.refreshSession(sessionId)
           authoritative = true
-          const finalObservation = this.observationForRun(snapshot, sessionId, input.runId)
+          let finalObservation = this.observationForRun(snapshot, sessionId, input.runId)
+          const finalValidated = await this.validateRunTreeCompletion(connection, snapshot, finalObservation)
+          snapshot = finalValidated.snapshot
+          finalObservation = finalValidated.observation
           const finalObserved = progressObservation(finalObservation, snapshot, progressFromAsOfSeq)
           const result = finalObservation.decision?.timing !== 'immediate'
             ? timeoutObservation(finalObserved, timeoutMs)

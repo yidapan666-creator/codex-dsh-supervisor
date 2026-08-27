@@ -19,6 +19,9 @@ export interface FakeRow {
 
 export class FakeApi {
   readonly rows = new Map<string, FakeRow>()
+  readonly childCatalog = new Map<string, Array<{
+    kind: 'child'; id: string; mode: 'one-shot' | 'continuable'; activity: 'running' | 'inactive'; hasChildren: boolean; label?: string
+  }>>()
   historyCalls = 0
   listCalls = 0
   promptCalls = 0
@@ -38,9 +41,32 @@ export class FakeApi {
     })
   }
 
+  addChild(
+    parentSessionId: string,
+    childSessionId: string,
+    options: { mode?: 'one-shot' | 'continuable'; running?: boolean; events?: DshEvent[]; hasChildren?: boolean } = {},
+  ): void {
+    this.addRow(childSessionId, { running: options.running, events: options.events })
+    const mode = options.mode ?? 'one-shot'
+    const entries = this.childCatalog.get(parentSessionId) ?? []
+    entries.push({
+      kind: 'child',
+      id: childSessionId,
+      mode,
+      activity: options.running === true ? 'running' : 'inactive',
+      hasChildren: options.hasChildren ?? false,
+      ...mode === 'continuable' ? { label: childSessionId } : {},
+    })
+    this.childCatalog.set(parentSessionId, entries)
+  }
+
   setRunning(sessionId: string, running: boolean): void {
     const row = this.rows.get(sessionId)
     if (row !== undefined) row.running = running
+    for (const entries of this.childCatalog.values()) {
+      const child = entries.find(entry => entry.id === sessionId)
+      if (child !== undefined) child.activity = running ? 'running' : 'inactive'
+    }
   }
 
   setEvents(sessionId: string, events: DshEvent[]): void {
@@ -129,6 +155,17 @@ export class FakeApi {
         this.stream(this.muxFrames, signal, onOpen),
       host: (_payload: unknown, signal: AbortSignal, onOpen?: () => void): AsyncIterable<RpcRequest<HostFrame>> =>
         this.stream(this.hostFrames, signal, onOpen),
+    },
+    subagents: {
+      list: async (payload: { parentSessionId: string }) => this.ok({
+        entries: this.childCatalog.get(payload.parentSessionId) ?? [],
+        parentAvailable: this.rows.has(payload.parentSessionId),
+      }),
+      history: async (payload: { childSessionId: string }) => {
+        const events = this.rows.get(payload.childSessionId)?.events ?? []
+        return this.ok({ events: events.map(event => ({ event })), hasMore: false })
+      },
+      interrupt: async () => this.ok({ accepted: true as const }),
     },
     respond: async () => ({ accepted: true }),
   } as unknown as IApiClient

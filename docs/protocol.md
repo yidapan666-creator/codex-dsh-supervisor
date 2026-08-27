@@ -9,8 +9,9 @@ The worker receives a durable task packet containing the durable `sessionId`, a 
 1. a `supervisor_handoff` call whose session id, run id, and token match the latest task packet;
 2. a successful correlated `tool/result` whose output was accepted;
 3. the corresponding `turn/end` after that result.
+4. every descendant session affiliated with that run has settled.
 
-A completed `turn/end` without those facts is `FAILED` with `MISSING_HANDOFF`. Other failures use `WORKER_FAILED`, `HOST_FAILED`, or `PROTOCOL_ERROR`. Every wait and control call for a v2 run carries `sessionId + runId`; a stale run is rejected before it can observe or mutate the newer execution.
+A completed `turn/end` without the handoff facts is `FAILED` with `MISSING_HANDOFF`. A valid root handoff with an affiliated child still running remains `WAITING/children-running`; after convergence, a child's durable token-budget stop takes precedence over the older root handoff. Other failures use `WORKER_FAILED`, `HOST_FAILED`, or `PROTOCOL_ERROR`. Every wait and control call for a v2 run carries `sessionId + runId`; a stale run is rejected before it can observe or mutate the newer execution.
 
 Schema v2 may pin a caller `requestId`, its task-payload digest, and a
 `budget.maxTokens`. Admission is a Host-owned operation: the supervisor plugin

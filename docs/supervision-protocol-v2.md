@@ -14,8 +14,9 @@ progress, and preserves the existing completion and Host-lifetime invariants.
 - DSH root exclusively manages its child tree. Codex observes children and may
   interrupt one only on explicit human request or a safety/resource emergency.
 - `asOfSeq` is an observation cursor, never a DSH server resume cursor.
-- Success requires a valid accepted `supervisor_handoff` and its corresponding
-  `turn/end`. A plain turn end is never success.
+- Success requires a valid accepted `supervisor_handoff`, its corresponding
+  `turn/end`, and convergence of every affiliated child. A plain turn end is
+  never success; a root handoff remains waiting while its child work is active.
 - One active writer is allowed per real Git working tree. Parallel writers use
   existing independent worktrees; dsh-gate does not create a workspace lock
   manager.
@@ -241,7 +242,7 @@ service is added.
 
 - wrong session/run/token is rejected before turn conclusion;
 - fold consumes a schema-validated canonical handoff result;
-- valid handoff plus matching turn end completes;
+- valid handoff plus matching turn end completes only after affiliated children settle;
 - turn end alone remains `MISSING_HANDOFF`.
 
 ### Phase 3 — semantic progress and evidence
