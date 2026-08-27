@@ -21,7 +21,11 @@ inbox insertion before returning its stable run receipt. A same-id, same-digest
 retry returns the original run id; a different digest is rejected. New
 admission to a running session is rejected rather than parked in an unconfirmed
 next-turn queue. The budget is enforced by the DSH Host plugin rather than MCP,
-so client disconnect does not reset it.
+so client disconnect does not reset it. Before each model call, the Host uses
+DSH's public prompt/request hooks and token meter to reserve the estimated full
+input plus a bounded output allowance atomically across the run tree. A request
+temporarily blocked by another live reservation waits for settlement; it does
+not oversell or cancel that request.
 
 ## Observation cursor
 
@@ -57,8 +61,12 @@ root task-packet window, and each descendant's accepted-work boundary. This
 covers spawn, fork, nested descendants, and a continuable child that accepts
 new work in a later run while excluding its earlier work. Reaching
 the limit cancels the run tree with a durable hook reason and yields
-`ESCALATION_REQUIRED/token-budget-exhausted`; the current in-flight model
-responses across concurrent agents bound overshoot. Ordinary observations label their visible budget
+`ESCALATION_REQUIRED/token-budget-exhausted`. Request reservations prevent
+concurrent agents from claiming the same remaining allowance, and each request's
+`maxTokens` is capped before dispatch. Because provider usage is authoritative
+only after a response, the final total can still cross the cutoff by input-token
+estimation or provider-reporting variance; the field is not an exact billing cap.
+Ordinary observations label their visible budget
 coverage `root_session`, while the enforcement boundary reports `run_tree`.
 An optional read-only `dsh-usage-monitor` bridge exposes session totals with
 `authoritativeForBudget=false`; its cost fields are neither read nor used.

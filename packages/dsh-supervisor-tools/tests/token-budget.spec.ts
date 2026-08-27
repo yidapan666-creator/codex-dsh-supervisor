@@ -215,4 +215,124 @@ describe('Host token budget fold', () => {
 
     expect([...cancelled].sort()).toEqual(['child', 'root'])
   })
+
+  it('reserves estimated input before a request and caps that request output', async () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100)],
+    }
+    const cancellations: string[] = []
+    const agent = {
+      session: root,
+      cancel: ({ reason }: { reason: string }) => { cancellations.push(reason) },
+    }
+    const assembly = {
+      sections: [{ name: 'persona', text: 'bounded persona' }],
+      contexts: [],
+      tools: [{ name: 'read', description: 'Read a file', parameters: { type: 'object', properties: {} } }],
+      variables: {},
+    }
+    let measuredHeader: unknown
+    let assemble: ((
+      value: typeof assembly,
+      context: { agent: typeof agent },
+      next: () => Promise<typeof assembly>,
+    ) => Promise<typeof assembly>) | undefined
+    let request: ((
+      payload: { agent: typeof agent; turn: number; step: number; signal: AbortSignal },
+      next: () => Promise<{ provider: string; model: string }>,
+    ) => Promise<{ provider: string; model: string; maxTokens?: number }>) | undefined
+    const ctx = {
+      sessions: { list: () => [root] },
+      agents: { list: () => [agent] },
+      tokenMeter: {
+        measure: (_session: typeof root, header: unknown) => {
+          measuredHeader = header
+          return { totalTokens: 50 }
+        },
+      },
+      on(name: string, listener: unknown) {
+        if (name === 'system-prompt/assemble') assemble = listener as typeof assemble
+        if (name === 'agent/request') request = listener as typeof request
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [],
+        inspect: async () => { throw new Error('not used') },
+      },
+    }
+    installTokenBudgetGuards(ctx as never, { maxReservedOutputTokensPerRequest: 80 })
+    await assemble?.(assembly, { agent }, async () => assembly)
+    const config = await request?.(
+      { agent, turn: 1, step: 1, signal: new AbortController().signal },
+      async () => ({ provider: 'deepseek', model: 'flash' }),
+    )
+
+    expect(config).toMatchObject({ provider: 'deepseek', model: 'flash', maxTokens: 80 })
+    expect(measuredHeader).toMatchObject({
+      config: { provider: 'deepseek', model: 'flash' },
+      system: 'bounded persona',
+      tools: assembly.tools,
+    })
+    expect(cancellations).toEqual([])
+  })
+
+  it('waits for an in-flight tree reservation instead of overselling or cancelling it', async () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100)],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 110, parentSession: 'root' },
+      events: [userMessage(0, 111)],
+    }
+    const cancelled = new Set<string>()
+    const rootAgent = { session: root, cancel: () => { cancelled.add('root') } }
+    const childAgent = { session: child, cancel: () => { cancelled.add('child') } }
+    const assembly = { sections: [], contexts: [], tools: [], variables: {} }
+    let assemble: ((
+      value: typeof assembly,
+      context: { agent: typeof rootAgent },
+      next: () => Promise<typeof assembly>,
+    ) => Promise<typeof assembly>) | undefined
+    let request: ((
+      payload: { agent: typeof rootAgent; turn: number; step: number; signal: AbortSignal },
+      next: () => Promise<{ provider: string; model: string; maxTokens: number }>,
+    ) => Promise<{ provider: string; model: string; maxTokens: number }>) | undefined
+    let sessionEvent: ((session: typeof root, event: ReturnType<typeof usage>) => void) | undefined
+    const ctx = {
+      sessions: { list: () => [root, child] },
+      agents: { list: () => [rootAgent, childAgent] },
+      tokenMeter: { measure: () => ({ totalTokens: 20 }) },
+      on(name: string, listener: unknown) {
+        if (name === 'system-prompt/assemble') assemble = listener as typeof assemble
+        if (name === 'agent/request') request = listener as typeof request
+        if (name === 'session/event') sessionEvent = listener as typeof sessionEvent
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [],
+        inspect: async () => { throw new Error('not used') },
+      },
+    }
+    installTokenBudgetGuards(ctx as never, { maxReservedOutputTokensPerRequest: 100 })
+    await assemble?.(assembly, { agent: rootAgent }, async () => assembly)
+    await assemble?.(assembly, { agent: childAgent }, async () => assembly)
+    const signal = new AbortController().signal
+    const first = await request?.(
+      { agent: rootAgent, turn: 1, step: 1, signal },
+      async () => ({ provider: 'deepseek', model: 'flash', maxTokens: 100 }),
+    )
+    const secondPromise = request?.(
+      { agent: childAgent, turn: 1, step: 1, signal },
+      async () => ({ provider: 'deepseek', model: 'flash', maxTokens: 100 }),
+    )
+    expect(first?.maxTokens).toBe(100)
+    expect(await Promise.race([secondPromise?.then(() => 'settled'), Promise.resolve('waiting')])).toBe('waiting')
+
+    const rootUsage = usage(1, 120, 1, 1, 30, 10)
+    root.events.push(rootUsage)
+    sessionEvent?.(root, rootUsage)
+
+    await expect(secondPromise).resolves.toMatchObject({ maxTokens: 90 })
+    expect(cancelled.size).toBe(0)
+  })
 })

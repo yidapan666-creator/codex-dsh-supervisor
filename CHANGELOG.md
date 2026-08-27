@@ -1,6 +1,6 @@
 # Changelog
 
-- **Durable reconnect and task-token guard.** Dispatches can carry an idempotency `requestId`; `dsh_runs` rediscovers supervised roots and `dsh_recover` reattaches without prompt replay. Host crash interruption now requires an explicit `parentRunId` continuation. Optional per-task/default token budgets are pinned in task packets and enforced inside the independent Host across persisted run-tree sessions with streaming/final replacement semantics. The user's existing `dsh-usage-monitor` can be queried through its localhost session endpoint as non-authoritative, failure-contained observability; no monitor source was modified.
+- **Durable reconnect and task-token guard.** Dispatches can carry an idempotency `requestId`; `dsh_runs` rediscovers supervised roots and `dsh_recover` reattaches without prompt replay. Host crash interruption now requires an explicit `parentRunId` continuation. Optional per-task/default token budgets are pinned in task packets and enforced inside the independent Host across persisted run-tree sessions with request preflight, atomic input/output reservations, per-request output caps, and provider-usage settlement. This prevents concurrent allowance oversell while honestly remaining a cutoff rather than an exact provider-billing cap. The user's existing `dsh-usage-monitor` can be queried through its localhost session endpoint as non-authoritative, failure-contained observability; no monitor source was modified.
 
 Notable changes to dsh-gate, tracked from the pre-publication baseline.
 

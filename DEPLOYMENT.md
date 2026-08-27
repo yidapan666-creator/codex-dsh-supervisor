@@ -200,8 +200,14 @@ Spawn, fork, nested, and reused continuable-child activations are affiliated
 from durable `parentSession`, task-packet, and accepted-work boundaries. This
 does not inject another model message or spend tokens, and inherited fork seed
 usage is not counted twice. Cold descendants are reconciled after Host restart.
-Overshoot is bounded by model responses already in flight across concurrent
-agents. Optional
+Before dispatch, DSH's token meter estimates the complete request input and the
+Host atomically reserves that input plus a capped output allowance across the
+run tree. Concurrent agents therefore cannot claim the same remaining budget;
+requests wait for live reservations to settle near the boundary. The plugin's
+`maxReservedOutputTokensPerRequest` setting (8192 by default) bounds each call's
+output reservation. Provider usage settles the estimate afterward, so this is a
+reliable cutoff rather than an exact billing cap: tokenizer-estimation or
+provider-reporting variance can still carry the final total past the limit. Optional
 `DSH_USAGE_MONITOR_URL=http://127.0.0.1:41999` reads the existing
 `dsh-usage-monitor` bridge for comparison only; monitor downtime cannot stop a
 task, and monitor totals are never enforcement authority.

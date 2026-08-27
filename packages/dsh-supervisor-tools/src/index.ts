@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-system-prompt'
+import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { admitArtifacts } from './artifacts.js'
 import {
   registerTaskAdmissionRoute,
@@ -23,15 +23,20 @@ export {
 } from './admission.js'
 
 export const name = 'dsh-gate-supervisor-tools'
-export const inject = ['tools', 'systemPrompt', 'agents', 'sessions', 'sessionPersistence', 'apiProxy', 'webServer']
+export const inject = [
+  'tools', 'systemPrompt', 'tokenMeter', 'agents', 'sessions', 'sessionPersistence', 'apiProxy', 'webServer',
+]
 
 export interface Config {
   /** Exact worker-reported failure signatures accepted before forced escalation. */
   maxReportedFailuresPerSignature?: number
+  /** Largest output reservation granted to one model request under a run budget. */
+  maxReservedOutputTokensPerRequest?: number
 }
 
 export const Config: z<Config> = z.object({
   maxReportedFailuresPerSignature: z.natural().min(1).max(20).default(2),
+  maxReservedOutputTokensPerRequest: z.natural().min(1).max(131_072).default(8_192),
 })
 
 const HANDOFF_STATUSES = [
@@ -138,6 +143,21 @@ interface RuntimeAgent {
   cancel(cause: { kind: 'hook'; reason: string }): void
 }
 
+interface RuntimeLlmCallConfig {
+  provider: string
+  model: string
+  reasoningEffort?: unknown
+  temperature?: number
+  maxTokens?: number
+  stop?: string[]
+}
+
+interface RuntimeRequestHeader {
+  config: RuntimeLlmCallConfig
+  system?: string
+  tools?: PromptAssembly['tools']
+}
+
 interface SupervisorRuntimeContext {
   sessions: { list(): RuntimeSession[] }
   agents: { list(): RuntimeAgent[] }
@@ -145,11 +165,36 @@ interface SupervisorRuntimeContext {
     listSnapshots(): Promise<Array<{ header: RuntimeSessionHeader; revision: string }>>
     inspect(id: string): Promise<{ meta: RuntimeSessionHeader; events: readonly RuntimeEvent[] }>
   }
+  tokenMeter: {
+    measure(session: RuntimeSession, requestHeader?: RuntimeRequestHeader): { totalTokens: number }
+  }
   on(name: 'session/event', listener: (session: RuntimeSession, event: RuntimeEvent) => void): void
   on(
     name: 'agent/pre-step',
     listener: (payload: { agent: RuntimeAgent }, next: () => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: unknown[] }>)
       => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: unknown[] }>,
+  ): void
+  on(
+    name: 'agent/request',
+    listener: (
+      payload: { agent: RuntimeAgent; turn: number; step: number; signal: AbortSignal },
+      next: () => Promise<RuntimeLlmCallConfig>,
+    ) => Promise<RuntimeLlmCallConfig>,
+  ): void
+  on(
+    name: 'agent/request-error',
+    listener: (
+      payload: { agent: RuntimeAgent; turn: number; step: number },
+      next: () => Promise<unknown>,
+    ) => Promise<unknown>,
+  ): void
+  on(
+    name: 'system-prompt/assemble',
+    listener: (
+      assembly: PromptAssembly,
+      context: { agent?: RuntimeAgent },
+      next: () => Promise<PromptAssembly>,
+    ) => Promise<PromptAssembly>,
   ): void
   apiProxy: TaskAdmissionRuntime['apiProxy']
   webServer: Parameters<typeof registerTaskAdmissionRoute>[0]
@@ -468,6 +513,47 @@ async function durableTokenBudgetState(
 const BUDGET_REASON = 'dsh-gate:token-budget-exhausted'
 const BUDGET_ACCOUNTING_REASON = 'dsh-gate:token-budget-accounting-failed'
 
+type BudgetReservation = {
+  inputTokens: number
+  outputTokens: number
+}
+
+function runBudgetKey(rootId: string, runId: string): string {
+  return `${rootId}\u0000${runId}`
+}
+
+function requestBudgetKey(sessionId: string, turn: number, step: number): string {
+  return `${sessionId}\u0000${turn}\u0000${step}`
+}
+
+function reservedTokens(reservations: ReadonlyMap<string, BudgetReservation>, except?: string): number {
+  let total = 0
+  for (const [key, reservation] of reservations) {
+    if (key !== except) total += reservation.inputTokens + reservation.outputTokens
+  }
+  return total
+}
+
+/** Minimal keyed mutex used only for short request-admission accounting sections. */
+async function withRunBudgetLock<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const prior = locks.get(key) ?? Promise.resolve()
+  let release = (): void => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const tail = prior.then(() => held)
+  locks.set(key, tail)
+  await prior
+  try {
+    return await task()
+  } finally {
+    release()
+    if (locks.get(key) === tail) locks.delete(key)
+  }
+}
+
 function cancelRun(ctx: SupervisorRuntimeContext, rootId: string, runId: string, reason: string): void {
   const sessions = ctx.sessions.list()
   const headers = new Map(sessions.map(session => [session.header.id, session.header]))
@@ -612,14 +698,85 @@ export function reportedFailureDecision(
 }
 
 /** Install Host-owned live and post-restart token-budget enforcement. */
-export function installTokenBudgetGuards(runtime: SupervisorRuntimeContext): void {
+export function installTokenBudgetGuards(
+  runtime: SupervisorRuntimeContext,
+  options: { maxReservedOutputTokensPerRequest?: number } = {},
+): void {
+  const maxReservedOutputTokensPerRequest = options.maxReservedOutputTokensPerRequest ?? 8_192
   const durableUsageCache = new Map<string, { revision: string; session: RuntimeSession }>()
+  const promptAssemblies = new WeakMap<RuntimeAgent, PromptAssembly>()
+  const locks = new Map<string, Promise<void>>()
+  const reservations = new Map<string, Map<string, BudgetReservation>>()
+  const reservationGenerations = new Map<string, number>()
+  const reservationWaiters = new Map<string, Set<() => void>>()
+
+  const releaseReservation = (runKey: string, requestKey: string): void => {
+    const runReservations = reservations.get(runKey)
+    if (runReservations?.delete(requestKey) !== true) return
+    if (runReservations.size === 0) reservations.delete(runKey)
+    reservationGenerations.set(runKey, (reservationGenerations.get(runKey) ?? 0) + 1)
+    const waiters = reservationWaiters.get(runKey)
+    if (waiters === undefined) return
+    reservationWaiters.delete(runKey)
+    for (const wake of waiters) wake()
+  }
+
+  const releaseEventReservation = (session: RuntimeSession, event: RuntimeEvent): void => {
+    if (event.type !== 'assistant/message' && event.type !== 'step/end' && event.type !== 'turn/end') return
+    const packet = budgetIdentityForSession(session, runtime.sessions.list())
+    if (packet?.schemaVersion !== 2 || packet.runId === undefined) return
+    const data = event.data as { turn?: unknown; step?: unknown }
+    if (typeof data.turn !== 'number') return
+    const runKey = runBudgetKey(packet.sessionId, packet.runId)
+    if (typeof data.step === 'number') {
+      releaseReservation(runKey, requestBudgetKey(session.header.id, data.turn, data.step))
+      return
+    }
+    const prefix = `${session.header.id}\u0000${data.turn}\u0000`
+    for (const key of reservations.get(runKey)?.keys() ?? []) {
+      if (key.startsWith(prefix)) releaseReservation(runKey, key)
+    }
+  }
+
+  const waitForReservation = async (runKey: string, generation: number, signal: AbortSignal): Promise<void> => {
+    signal.throwIfAborted()
+    if ((reservationGenerations.get(runKey) ?? 0) !== generation) return
+    await new Promise<void>((resolve, reject) => {
+      const waiters = reservationWaiters.get(runKey) ?? new Set<() => void>()
+      reservationWaiters.set(runKey, waiters)
+      const settle = (): void => {
+        signal.removeEventListener('abort', abort)
+        waiters.delete(settle)
+        if (waiters.size === 0 && reservationWaiters.get(runKey) === waiters) {
+          reservationWaiters.delete(runKey)
+        }
+        resolve()
+      }
+      const abort = (): void => {
+        waiters.delete(settle)
+        if (waiters.size === 0 && reservationWaiters.get(runKey) === waiters) {
+          reservationWaiters.delete(runKey)
+        }
+        reject(signal.reason)
+      }
+      waiters.add(settle)
+      signal.addEventListener('abort', abort, { once: true })
+      if ((reservationGenerations.get(runKey) ?? 0) !== generation) settle()
+    })
+  }
+
+  runtime.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const resolved = await next()
+    if (context.agent !== undefined) promptAssemblies.set(context.agent, resolved)
+    return resolved
+  })
 
   // The guard lives in the independently owned Host process, so loss of the
   // MCP/Codex client cannot reset or disable it. A stream usage sample gives an
   // immediate live-tree brake; every pre-step also reconciles persisted cold
   // descendants so Host restart and completed children remain accounted for.
   runtime.on('session/event', (session, event) => {
+    releaseEventReservation(session, event)
     if (usageSample(event) === undefined) return
     const sessions = runtime.sessions.list()
     const packet = budgetIdentityForSession(session, sessions)
@@ -648,6 +805,86 @@ export function installTokenBudgetGuards(runtime: SupervisorRuntimeContext): voi
     }
     return { kind: 'reject' }
   })
+
+  runtime.on('agent/request-error', async ({ agent, turn, step }, next) => {
+    const packet = budgetIdentityForSession(agent.session, runtime.sessions.list())
+    if (packet?.schemaVersion === 2 && packet.runId !== undefined) {
+      releaseReservation(
+        runBudgetKey(packet.sessionId, packet.runId),
+        requestBudgetKey(agent.session.header.id, turn, step),
+      )
+    }
+    return next()
+  })
+
+  runtime.on('agent/request', async ({ agent, turn, step, signal }, next) => {
+    const proposed = await next()
+    const packet = budgetIdentityForSession(agent.session, runtime.sessions.list())
+    if (packet?.schemaVersion !== 2 || packet.runId === undefined || packet.tokenBudget === undefined) return proposed
+    const assembly = promptAssemblies.get(agent)
+    if (assembly === undefined) {
+      cancelRun(runtime, packet.sessionId, packet.runId,
+        `${BUDGET_ACCOUNTING_REASON};runId=${packet.runId};error=missing-prompt-assembly`)
+      return proposed
+    }
+
+    const { sessionId: rootId, runId, tokenBudget } = packet
+    const runKey = runBudgetKey(rootId, runId)
+    const requestKey = requestBudgetKey(agent.session.header.id, turn, step)
+    const system = renderPrompt(assembly)
+    while (true) {
+      const admission = await withRunBudgetLock(locks, runKey, async () => {
+        try {
+          const state = await durableTokenBudgetState(
+            runtime, rootId, runId, tokenBudget, durableUsageCache,
+          )
+          const requestHeader: RuntimeRequestHeader = {
+            config: proposed,
+            ...system === '' ? {} : { system },
+            ...assembly.tools.length === 0 ? {} : { tools: assembly.tools },
+          }
+          const inputTokens = Math.max(0, Math.ceil(runtime.tokenMeter.measure(agent.session, requestHeader).totalTokens))
+          const runReservations = reservations.get(runKey) ?? new Map<string, BudgetReservation>()
+          const otherReserved = reservedTokens(runReservations, requestKey)
+          const actualRemaining = state.remainingTokens
+          if (state.exhausted || actualRemaining <= inputTokens) {
+            runReservations.delete(requestKey)
+            return { kind: 'exhausted' as const, state }
+          }
+          const available = actualRemaining - otherReserved
+          if (available <= inputTokens) {
+            return {
+              kind: 'wait' as const,
+              generation: reservationGenerations.get(runKey) ?? 0,
+            }
+          }
+          const requestedOutput = proposed.maxTokens === undefined
+            ? maxReservedOutputTokensPerRequest
+            : Math.max(1, Math.floor(proposed.maxTokens))
+          const outputTokens = Math.min(requestedOutput, maxReservedOutputTokensPerRequest, available - inputTokens)
+          runReservations.set(requestKey, { inputTokens, outputTokens })
+          reservations.set(runKey, runReservations)
+          return { kind: 'admitted' as const, outputTokens }
+        } catch (error) {
+          return { kind: 'error' as const, error }
+        }
+      })
+
+      if (admission.kind === 'admitted') return { ...proposed, maxTokens: admission.outputTokens }
+      if (admission.kind === 'wait') {
+        await waitForReservation(runKey, admission.generation, signal)
+        continue
+      }
+      if (admission.kind === 'exhausted') {
+        cancelRun(runtime, rootId, runId, budgetReason(admission.state))
+        return proposed
+      }
+      const message = admission.error instanceof Error ? admission.error.message : String(admission.error)
+      cancelRun(runtime, rootId, runId,
+        `${BUDGET_ACCOUNTING_REASON};runId=${runId};error=${message.slice(0, 256)}`)
+      return proposed
+    }
+  })
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
@@ -657,7 +894,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.webServer,
     new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
   ), 'dsh-gate task admission route')
-  installTokenBudgetGuards(runtime)
+  installTokenBudgetGuards(runtime, {
+    maxReservedOutputTokensPerRequest: resolved.maxReservedOutputTokensPerRequest,
+  })
 
   ctx.systemPrompt.section({
     name: 'tool:supervisor-handoff',
