@@ -4,4 +4,5 @@
 export { createServer } from './server.js'
 export { GatewayManager, resolveWriterDomain } from './gateway.js'
 export { deriveObservation, parseTaskPacket, taskBoundarySeq, timeoutObservation } from './fold.js'
+export { UsageMonitorClient, type UsageMonitorObservation } from './usage-monitor.js'
 export * from './contracts.js'

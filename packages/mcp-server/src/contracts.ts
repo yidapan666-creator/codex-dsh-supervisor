@@ -161,6 +161,28 @@ export const observationSchema = z.object({
     sessionStats: z.unknown().optional(),
     subagent: z.unknown().optional(),
   }).optional(),
+  budget: z.object({
+    limitTokens: z.number().int().positive(),
+    observedTokens: z.number().int().nonnegative(),
+    remainingTokens: z.number().int().nonnegative(),
+    exhausted: z.boolean(),
+    coverage: z.enum(['root_session', 'run_tree']),
+    enforcement: z.literal('DSH_HOST_RUNTIME'),
+    overshootBound: z.literal('IN_FLIGHT_MODEL_RESPONSES'),
+  }).strict().optional(),
+  usageMonitor: z.object({
+    source: z.literal('dsh-usage-monitor'),
+    authoritativeForBudget: z.literal(false),
+    available: z.boolean(),
+    sessionRawTokens: z.number().int().nonnegative().optional(),
+    requestCount: z.number().int().nonnegative().optional(),
+    warning: z.string().max(256).optional(),
+  }).strict().optional(),
+  recovery: z.object({
+    kind: z.enum(['REATTACHED', 'CONTINUATION_REQUIRED']),
+    reason: z.string().max(256),
+    parentRunId: z.string().uuid().optional(),
+  }).strict().optional(),
   projectActivity: projectActivitySchema.optional(),
   progress: progressHeartbeatSchema.optional(),
   supervisorProgress: supervisorProgressSchema.optional(),
@@ -203,6 +225,12 @@ export const taskPacketV2Schema = z.object({
   completionToken: z.string().uuid(),
   objective: z.string().min(1).max(8_192),
   writerMode: z.enum(['writer', 'read_only']),
+  requestId: z.string().uuid().optional(),
+  requestDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  budget: z.object({
+    /** Provider-reported uncached input + cache read/write + output across the run tree. */
+    maxTokens: z.number().int().positive(),
+  }).strict().optional(),
   parentRunId: z.string().uuid().optional(),
   baseline: z.object({
     head: z.string().max(256).optional(),

@@ -29,8 +29,17 @@ DSH_DECISION_POLICY_FILE = "<workspace-root>/config/decision-policies/2026-08-26
 # Optional observer-only candidate. It is pinned per run but never controls behavior.
 # DSH_DECISION_SHADOW_POLICY_FILE = "<workspace-root>/config/decision-policies/2026-08-26.shadow-v1.json"
 DSH_RUN_JOURNAL_DIR = "<workspace-root>/.dsh-state/memory/runs"
-# Set to "false" to disable token-free terminal run records.
+# Set to "false" to disable model-free terminal run records.
 # DSH_RUN_JOURNAL_ENABLED = "false"
+
+# Optional deployment default for a whole supervised run tree. A dsh_task
+# tokenBudget overrides it. The Host counts provider-reported uncached input,
+# cache read/write, and output tokens; no money estimate is used.
+# DSH_DEFAULT_TASK_TOKEN_BUDGET = "300000"
+
+# Optional read-only cross-check against the user's dsh-usage-monitor bridge.
+# It is session-level observability only and never controls the hard budget.
+# DSH_USAGE_MONITOR_URL = "http://127.0.0.1:41999"
 
 # Optional: let the MCP server auto-launch the Host when it is not reachable.
 # The launch is detached and MCP never retains a kill capability; stop the

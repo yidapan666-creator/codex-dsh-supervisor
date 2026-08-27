@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
 import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -9,7 +9,7 @@ import {
   type DecisionCategory, type DecisionPolicy,
 } from '@dsh-gate/decision-policy'
 import {
-  deriveObservation, parseTaskPacket, progressObservation, supervisorDecisionHistory, taskBoundarySeq, timeoutObservation,
+  deriveObservation, parseTaskPacket, progressObservation, supervisorDecisionHistory, taskBoundarySeq, taskPacketEntries, timeoutObservation,
 } from './fold.js'
 import {
   FileRunJournal, isRunRecordOutcome, runRecordId, type RunJournal, type RunRecord,
@@ -18,6 +18,7 @@ import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, taskPacketSchema, type Observation } from './contracts.js'
+import { UsageMonitorClient } from './usage-monitor.js'
 
 interface SessionAddress {
   sessionId?: string | undefined
@@ -113,6 +114,8 @@ export interface GatewayConfig {
   shadowDecisionPolicy?: DecisionPolicy
   decisionPolicyCatalog?: DecisionPolicy[]
   runJournal?: RunJournal | false
+  defaultTaskTokenBudget?: number
+  usageMonitor?: UsageMonitorClient | false
 }
 
 export const DEFAULT_RUN_JOURNAL_DIR = fileURLToPath(new URL('../../../.dsh-state/memory/runs/', import.meta.url))
@@ -151,6 +154,8 @@ export class GatewayManager {
   private readonly shadowDecisionPolicy: DecisionPolicy | undefined
   private readonly decisionPolicies = new Map<string, DecisionPolicy>()
   private readonly runJournal: RunJournal | undefined
+  private readonly usageMonitor: UsageMonitorClient | undefined
+  private launchPromise: Promise<void> | undefined
   /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
   private admissionTail: Promise<void> = Promise.resolve()
 
@@ -171,6 +176,7 @@ export class GatewayManager {
     this.runJournal = config.runJournal === false
       ? undefined
       : config.runJournal ?? new FileRunJournal(DEFAULT_RUN_JOURNAL_DIR)
+    this.usageMonitor = config.usageMonitor === false ? undefined : config.usageMonitor
   }
 
   static fromEnvironment(env: NodeJS.ProcessEnv = process.env): GatewayManager {
@@ -189,6 +195,13 @@ export class GatewayManager {
     const shadowPolicy = env.DSH_DECISION_SHADOW_POLICY_FILE === undefined
       ? undefined
       : readDecisionPolicy(env.DSH_DECISION_SHADOW_POLICY_FILE)
+    const defaultTaskTokenBudget = env.DSH_DEFAULT_TASK_TOKEN_BUDGET === undefined
+      ? undefined
+      : Number(env.DSH_DEFAULT_TASK_TOKEN_BUDGET)
+    if (defaultTaskTokenBudget !== undefined
+      && (!Number.isSafeInteger(defaultTaskTokenBudget) || defaultTaskTokenBudget <= 0)) {
+      throw new Error('DSH_DEFAULT_TASK_TOKEN_BUDGET must be a positive integer')
+    }
     return new GatewayManager({
       hostUrls: urls,
       ...env.DSH_HOST_LAUNCH === undefined ? {} : { launch: parseLaunchConfig(env.DSH_HOST_LAUNCH) as HostLaunchConfig },
@@ -198,6 +211,10 @@ export class GatewayManager {
       decisionPolicy: inlinePolicy ?? filePolicy,
       ...shadowPolicy === undefined ? {} : { shadowDecisionPolicy: shadowPolicy },
       decisionPolicyCatalog: catalog,
+      ...defaultTaskTokenBudget === undefined ? {} : { defaultTaskTokenBudget },
+      ...env.DSH_USAGE_MONITOR_URL === undefined
+        ? {}
+        : { usageMonitor: new UsageMonitorClient(env.DSH_USAGE_MONITOR_URL) },
       runJournal: env.DSH_RUN_JOURNAL_ENABLED === 'false'
         ? false
         : new FileRunJournal(env.DSH_RUN_JOURNAL_DIR ?? DEFAULT_RUN_JOURNAL_DIR),
@@ -236,6 +253,14 @@ export class GatewayManager {
     this.connections.set(baseUrl, connection)
     if (!this.knownUrls.includes(baseUrl)) this.knownUrls.push(baseUrl)
     return connection
+  }
+
+  private async launchConfiguredHost(): Promise<void> {
+    if (this.config.launch === undefined) throw new Error('no DSH Host launch command is configured')
+    this.launchPromise ??= launchDetachedHost(this.config.launch).finally(() => { this.launchPromise = undefined })
+    await this.launchPromise
+    const first = this.knownUrls[0]
+    if (first !== undefined) await this.connection(first).ensureConnected(15_000)
   }
 
   async startOrConnect(input: {
@@ -283,15 +308,25 @@ export class GatewayManager {
       taskId: sessionId,
       cwd: snapshot.cwd,
       reconnected: input.sessionId !== undefined,
+      hostOwnership: 'INDEPENDENT',
+      disconnectBehavior: 'HOST_AND_SESSION_CONTINUE',
+      usageMonitorConfigured: this.usageMonitor !== undefined,
     }
   }
 
-  async locate(taskId: string): Promise<HostConnection> {
+  async locate(taskId: string, allowLaunch = true): Promise<HostConnection> {
     const boundUrl = this.sessionHosts.get(taskId)
     if (boundUrl !== undefined) {
       const bound = this.connection(boundUrl)
-      await bound.ensureConnected()
-      return bound
+      try {
+        await bound.ensureConnected()
+        if (await bound.sessionExists(taskId)) return bound
+        this.sessionHosts.delete(taskId)
+      } catch {
+        // A stale in-memory binding after MCP/Host restart is only a hint. Scan
+        // every configured Host before deciding the session is unavailable.
+        this.sessionHosts.delete(taskId)
+      }
     }
     const failures: string[] = []
     let reachable = 0
@@ -309,6 +344,10 @@ export class GatewayManager {
       }
     }
     if (reachable === 0) {
+      if (allowLaunch && this.config.launch !== undefined) {
+        await this.launchConfiguredHost()
+        return this.locate(taskId, false)
+      }
       throw new Error(`could not connect to any configured DSH Host while locating session ${taskId}: ${failures.join('; ')}`)
     }
     const unavailable = failures.length === 0 ? '' : ` (${failures.length} Host(s) unavailable)`
@@ -356,6 +395,7 @@ export class GatewayManager {
   }
 
   async task(input: SessionAddress & {
+    requestId?: string | undefined
     objective: string
     writerMode?: 'writer' | 'read_only' | undefined
     provider?: string | undefined
@@ -374,6 +414,7 @@ export class GatewayManager {
       preAuthorizedActions?: string[] | undefined
       preAuthorizedDecisionCategories?: DecisionCategory[] | undefined
     } | undefined
+    tokenBudget?: { maxTokens: number } | undefined
   }): Promise<Record<string, unknown>> {
     const sessionId = sessionIdOf(input)
     const connection = await this.locate(sessionId)
@@ -381,6 +422,54 @@ export class GatewayManager {
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
     const sessionCwd = snapshot.cwd
     const writerMode = input.writerMode ?? 'writer'
+    const requestId = input.requestId ?? randomUUID()
+    const budget = input.tokenBudget ?? (this.config.defaultTaskTokenBudget === undefined
+      ? undefined
+      : { maxTokens: this.config.defaultTaskTokenBudget })
+    const requestDigest = createHash('sha256').update(JSON.stringify({
+      sessionId,
+      objective: input.objective,
+      writerMode,
+      provider: input.provider,
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      context: input.context,
+      allowedScope: input.allowedScope,
+      constraints: input.constraints,
+      acceptanceCriteria: input.acceptanceCriteria,
+      verification: input.verification,
+      escalationConditions: input.escalationConditions,
+      parentRunId: input.parentRunId,
+      baseline: input.baseline,
+      authority: input.authority,
+      budget,
+    })).digest('hex')
+
+    const reconciledResponse = (candidate: typeof snapshot): Record<string, unknown> | undefined => {
+      const entry = taskPacketEntries(candidate.events).find(({ packet }) =>
+        packet.schemaVersion === 2 && packet.requestId === requestId)
+      if (entry === undefined || entry.packet.schemaVersion !== 2) return undefined
+      if (entry.packet.requestDigest !== requestDigest) {
+        throw new Error(`requestId ${requestId} was already used with a different task payload`)
+      }
+      return {
+        schemaVersion: 1,
+        hostInstanceId: candidate.hostInstanceId,
+        sessionId,
+        taskId: sessionId,
+        requestId,
+        runId: entry.packet.runId,
+        objective: entry.packet.objective,
+        writerMode: entry.packet.writerMode,
+        accepted: true,
+        reconciled: true,
+        asOfSeq: candidate.events.at(-1)?.seq ?? -1,
+        ...entry.packet.budget === undefined ? {} : { tokenBudget: entry.packet.budget },
+        disconnectBehavior: 'HOST_CONTINUES',
+      }
+    }
+    const existing = reconciledResponse(snapshot)
+    if (existing !== undefined) return existing
 
     const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
@@ -399,6 +488,9 @@ export class GatewayManager {
       completionToken: randomUUID(),
       objective: input.objective,
       writerMode,
+      requestId,
+      requestDigest,
+      ...budget === undefined ? {} : { budget },
       decisionPolicy: {
         activeVersion: this.decisionPolicy.version,
         activeDigest: decisionPolicyDigest(this.decisionPolicy),
@@ -427,7 +519,8 @@ export class GatewayManager {
       + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
       + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching sessionId, '
       + 'runId, and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
-      + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature.'
+      + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature. '
+      + 'The DSH Host enforces any task token budget even when the external supervisor is disconnected.'
     const queueAndConfirm = async (): Promise<Record<string, unknown>> => {
       unwrap(await connection.api.sessions.prompt({
         sessionId: sessionId as SessionId,
@@ -446,20 +539,23 @@ export class GatewayManager {
         hostInstanceId: refreshed.hostInstanceId,
         sessionId,
         taskId: sessionId,
+        requestId,
         runId,
         objective: input.objective,
         writerMode,
         accepted: true,
         asOfSeq: refreshed.events.at(-1)?.seq ?? -1,
+        ...budget === undefined ? {} : { tokenBudget: budget },
+        disconnectBehavior: 'HOST_CONTINUES',
       }
     }
-    if (writerMode === 'writer') {
-      return this.exclusiveWriterAdmission(async () => {
-        await this.assertWriterAvailable(connection, sessionCwd)
-        return queueAndConfirm()
-      })
-    }
-    return queueAndConfirm()
+    return this.exclusiveWriterAdmission(async () => {
+      const latest = await connection.refreshSession(sessionId)
+      const reconciled = reconciledResponse(latest)
+      if (reconciled !== undefined) return reconciled
+      if (writerMode === 'writer') await this.assertWriterAvailable(connection, sessionCwd)
+      return queueAndConfirm()
+    })
   }
 
   private observationForRun(
@@ -503,6 +599,9 @@ export class GatewayManager {
     observation: Observation,
     snapshot: Parameters<typeof deriveObservation>[0],
   ): Promise<Observation> {
+    if (this.usageMonitor !== undefined) {
+      observation = { ...observation, usageMonitor: await this.usageMonitor.observeSession(observation.sessionId) }
+    }
     const journal = this.runJournal
     const packet = parseTaskPacket(snapshot.events)
     const journalableFailure = observation.status === 'FAILED'
@@ -533,6 +632,14 @@ export class GatewayManager {
       verification: observation.verification.slice(0, 100),
       decisions: supervisorDecisionHistory(snapshot, policies.active, policies.shadow),
       ...observation.failure === undefined ? {} : { failure: observation.failure },
+      ...observation.budget === undefined ? {} : { budget: {
+        limitTokens: observation.budget.limitTokens,
+        observedTokens: observation.budget.observedTokens,
+        remainingTokens: observation.budget.remainingTokens,
+        exhausted: observation.budget.exhausted,
+        coverage: observation.budget.coverage,
+        enforcement: observation.budget.enforcement,
+      } },
       ...observation.projectActivity === undefined ? {} : { projectActivity: observation.projectActivity },
       artifacts: observation.artifacts,
       truncation: {
@@ -556,6 +663,73 @@ export class GatewayManager {
         : error instanceof Error ? error.name : 'UNKNOWN'
       return { ...observation, journal: { recorded: false, recordId, warning: `run journal write failed (${code})` } }
     }
+  }
+
+  /** Discover supervised runs from DSH's authoritative session store after client/context loss. */
+  async runs(allowLaunch = true): Promise<Record<string, unknown>> {
+    const entries: Array<Record<string, unknown>> = []
+    const failures: string[] = []
+    let reachable = 0
+    for (const url of this.knownUrls) {
+      const connection = this.connection(url)
+      try {
+        await connection.ensureConnected()
+        reachable++
+        for (const row of await connection.listSessions()) {
+          const snapshot = await connection.refreshSession(row.sessionId)
+          const packet = parseTaskPacket(snapshot.events)
+          // Child seeds contain the root packet too; only the packet's addressed
+          // session is a recoverable root run entry.
+          if (packet?.schemaVersion !== 2 || packet.sessionId !== row.sessionId) continue
+          const observation = this.observationForRun(snapshot, packet.sessionId, packet.runId)
+          this.sessionHosts.set(packet.sessionId, connection.baseUrl)
+          entries.push({
+            hostBaseUrl: connection.baseUrl,
+            hostInstanceId: observation.hostInstanceId,
+            sessionId: packet.sessionId,
+            runId: packet.runId,
+            ...packet.requestId === undefined ? {} : { requestId: packet.requestId },
+            objective: packet.objective,
+            status: observation.status,
+            workerState: observation.workerState,
+            stage: observation.stage,
+            asOfSeq: observation.asOfSeq,
+            ...packet.budget === undefined ? {} : { tokenBudget: packet.budget, budget: observation.budget },
+          })
+        }
+      } catch (error) {
+        failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    if (reachable === 0 && allowLaunch && this.config.launch !== undefined) {
+      await this.launchConfiguredHost()
+      return this.runs(false)
+    }
+    if (reachable === 0) throw new Error(`could not connect to any configured DSH Host: ${failures.join('; ')}`)
+    return {
+      schemaVersion: 1,
+      authoritativeSource: 'DSH_HOST_SESSIONS',
+      entries,
+      unavailableHosts: failures.length,
+    }
+  }
+
+  /** Reattach to one durable run without replaying or duplicating its task prompt. */
+  async recover(input: SessionAddress & { runId?: string | undefined }): Promise<Observation> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    const snapshot = await connection.refreshSession(sessionId)
+    const observation = this.observationForRun(snapshot, sessionId, input.runId)
+    const recovered: Observation = observation.recovery?.kind === 'CONTINUATION_REQUIRED'
+      ? observation
+      : {
+          ...observation,
+          recovery: {
+            kind: 'REATTACHED',
+            reason: 'MCP_OR_CODEX_CLIENT_RECONNECTED',
+          },
+        }
+    return this.withRunJournal(recovered, snapshot)
   }
 
   async wait(input: SessionAddress & { runId?: string | undefined; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {

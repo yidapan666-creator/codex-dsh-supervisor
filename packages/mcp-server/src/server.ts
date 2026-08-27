@@ -50,9 +50,12 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'progress — step/tool/token deltas plus compact project edit/verification activity — since the prior observation; do not '
       + 're-poll on ordinary event churn. Surface activity coverage and runtime verification evidence separately from worker claims, and recap steps, tools, token deltas, project activity, '
       + 'and verification results at terminal state. '
-      + 'Terminal observations also report whether the token-free run journal was recorded; journal warnings never change the task outcome. '
+      + 'Terminal observations also report whether the model-free run journal was recorded; journal warnings never change the task outcome. '
       + 'Treat decisionShadow as observer-only comparison data; only decision controls the current run. '
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
+      + 'Always give dsh_task a fresh requestId and reuse that same requestId after an ambiguous client disconnect; task dispatch is reconciled from the durable packet and is not duplicated. '
+      + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree; the external dsh-usage-monitor reading is optional observability and never budget authority. '
+      + 'After MCP/Codex reconnect, use dsh_runs to rediscover identity and dsh_recover to reattach before waiting. Do not replay the objective. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
       + 'or take over completed child work. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '
       + 'Never stop the independently owned DSH Host. '
@@ -67,13 +70,15 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.startOrConnect(input)))
 
   server.registerTool('dsh_task', {
-    description: 'Queue one supervised run in a durable session. Returns a unique runId; every later wait/control call must carry sessionId + runId. One writer per working tree is enforced; use an independent worktree for parallel writers.',
+    description: 'Queue one supervised run in a durable session. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host packet makes dispatch idempotently reconcilable. Optional tokenBudget.maxTokens is a Host-enforced whole-run-tree limit using provider-reported input/cache/output tokens; overshoot is bounded by model responses already in flight across concurrent agents. Returns a unique runId; every later wait/control call must carry sessionId + runId. One writer per working tree is enforced; use an independent worktree for parallel writers.',
     inputSchema: z.object({
+      requestId: z.string().uuid().optional(),
       sessionId: z.string(), taskId: z.string().optional(), objective: z.string().min(1), writerMode: z.enum(['writer', 'read_only']).optional(),
       provider: z.string().optional(), model: z.string().optional(), reasoningEffort: z.string().optional(),
       context: z.string().optional(), allowedScope: z.array(z.string()).optional(), constraints: z.array(z.string()).optional(),
       acceptanceCriteria: z.array(z.string()).optional(), verification: z.array(z.string()).optional(),
       escalationConditions: z.array(z.string()).optional(),
+      tokenBudget: z.object({ maxTokens: z.number().int().positive() }).optional(),
       parentRunId: z.string().uuid().optional(),
       baseline: z.object({ head: z.string().optional(), statusSummary: z.string() }).optional(),
       authority: z.object({
@@ -83,6 +88,17 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       }).optional(),
     }),
   }, guarded(input => manager.task(input)))
+
+  server.registerTool('dsh_runs', {
+    description: 'Rediscover durable supervised run identities from configured DSH Hosts after MCP/Codex context loss. This is read-only and never replays a task.',
+    inputSchema: z.object({}),
+  }, guarded(() => manager.runs()))
+
+  server.registerTool('dsh_recover', {
+    description: 'Reattach to one existing durable run after MCP/Codex reconnect without replaying its objective. If a Host crash interrupted the in-flight turn, returns CONTINUATION_REQUIRED; start a new bounded dsh_task with parentRunId instead of guessing success.',
+    inputSchema: z.object({ sessionId: z.string(), taskId: z.string().optional(), runId: z.string().uuid().optional() }),
+    outputSchema: observationSchema,
+  }, guarded(input => manager.recover(input)))
 
   server.registerTool('dsh_wait', {
     description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early when the attached explainable decision says timing=immediate; protocol boundaries are locked and structured worker requests are policy-evaluated. Follow decision.action/audience/reasonCode. A WAITING/TIMEOUT return is the cadence observation: aggregate progress since afterAsOfSeq, including step/tool/token deltas, compact project edit/verification activity, and the latest accepted bounded semantic milestone. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',

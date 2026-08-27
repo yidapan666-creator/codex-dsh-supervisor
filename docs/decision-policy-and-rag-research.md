@@ -2,7 +2,7 @@
 
 Status: first implementation and research baseline, 2026-08-26.
 
-Update: the runtime now persists one token-free structured record for each
+Update: the runtime now persists one model-free structured record for each
 durable terminal run through `@dsh-gate/run-journal`. These records are the
 canonical future retrieval source; `rag-context` can convert them into overview,
 change, decision, and verification chunks, but no retrieval result is injected

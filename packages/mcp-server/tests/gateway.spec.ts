@@ -254,6 +254,63 @@ describe('Web-visible task identity', () => {
     expect(secondPacket).toMatchObject({ schemaVersion: 2, sessionId: 's1', runId: second.runId })
   })
 
+  it('reconciles an ambiguous repeated dispatch by requestId without queueing twice', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const requestId = '33333333-3333-4333-8333-333333333333'
+    const input = {
+      sessionId: 's1', requestId, objective: 'bounded read', writerMode: 'read_only' as const,
+      tokenBudget: { maxTokens: 123_456 },
+    }
+
+    const first = await manager.task(input)
+    const eventCount = api.rows.get('s1')?.events.length
+    const second = await manager.task(input)
+
+    expect(second).toMatchObject({
+      requestId, runId: first.runId, accepted: true, reconciled: true,
+      tokenBudget: { maxTokens: 123_456 },
+    })
+    expect(api.rows.get('s1')?.events).toHaveLength(eventCount ?? 0)
+    expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
+      schemaVersion: 2, requestId, runId: first.runId, budget: { maxTokens: 123_456 },
+    })
+  })
+
+  it('rejects reuse of a requestId with a changed payload', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const requestId = '33333333-3333-4333-8333-333333333333'
+    await manager.task({ sessionId: 's1', requestId, objective: 'first', writerMode: 'read_only' })
+    await expect(manager.task({ sessionId: 's1', requestId, objective: 'changed', writerMode: 'read_only' }))
+      .rejects.toThrow(/different task payload/)
+  })
+
+  it('rediscovers and reattaches to a durable run after the MCP manager restarts', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const firstManager = managerWith(api, sameDomain)
+    const run = await firstManager.task({
+      sessionId: 's1',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      objective: 'survive client restart',
+      writerMode: 'read_only',
+    })
+    firstManager.stopClients()
+
+    const secondManager = managerWith(api, sameDomain)
+    await expect(secondManager.runs()).resolves.toMatchObject({
+      authoritativeSource: 'DSH_HOST_SESSIONS',
+      entries: [{ sessionId: 's1', runId: run.runId, status: 'WAITING' }],
+    })
+    await expect(secondManager.recover({ sessionId: 's1', runId: run.runId as string })).resolves.toMatchObject({
+      sessionId: 's1', runId: run.runId, status: 'WAITING',
+      recovery: { kind: 'REATTACHED' },
+    })
+  })
+
   it('keeps the policy pinned by the run after a manager restart', async () => {
     const api = new FakeApi()
     api.addRow('s1', { cwd: '/work/tree' })

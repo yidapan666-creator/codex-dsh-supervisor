@@ -45,6 +45,14 @@ export interface RunRecord {
   verification: Array<{ command: string; outcome: string; summary: string }>
   decisions: RunDecisionRecord[]
   failure?: { kind: string; message: string; retryable: boolean }
+  budget?: {
+    limitTokens: number
+    observedTokens: number
+    remainingTokens: number
+    exhausted: boolean
+    coverage: 'root_session' | 'run_tree'
+    enforcement: 'DSH_HOST_RUNTIME'
+  }
   projectActivity?: unknown
   artifacts: Array<{ path: string; bytes: number; sha256: string }>
   truncation: { files: boolean; verification: boolean }

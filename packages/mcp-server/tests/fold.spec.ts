@@ -562,4 +562,62 @@ describe('project activity summarization', () => {
     expect(observationSchema.safeParse(deriveObservation(runtime)).success).toBe(true)
     expect(observationSchema.safeParse(progressObservation(deriveObservation(runtime), runtime, 0)).success).toBe(true)
   })
+
+  it('surfaces Host-enforced run-tree token budget exhaustion as escalation', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'bounded work',
+      writerMode: 'writer',
+      budget: { maxTokens: 100 },
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('assistant/message', 2, {
+        turn: 1, step: 1, usage: { inputTokens: 40, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 10 },
+      }),
+      event('turn/end', 3, {
+        turn: 1,
+        reason: { kind: 'aborted', reason: { kind: 'hook', reason: `dsh-gate:token-budget-exhausted;runId=${packetV2.runId};used=130;limit=100` } },
+      }),
+    ]))
+    expect(observed).toMatchObject({
+      status: 'ESCALATION_REQUIRED',
+      stage: 'token-budget-exhausted',
+      budget: {
+        limitTokens: 100, observedTokens: 130, remainingTokens: 0,
+        exhausted: true, coverage: 'run_tree', enforcement: 'DSH_HOST_RUNTIME',
+      },
+    })
+    expect(observationSchema.safeParse(observed).success).toBe(true)
+  })
+
+  it('requires an explicit continuation after Host crash recovery interrupts a turn', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'recoverable work',
+      writerMode: 'writer',
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('turn/end', 2, { turn: 1, reason: { kind: 'interrupted' } }),
+    ]))
+    expect(observed).toMatchObject({
+      status: 'FAILED',
+      stage: 'host-restart-interrupted',
+      failure: { kind: 'HOST_FAILED', retryable: true },
+      recovery: { kind: 'CONTINUATION_REQUIRED', parentRunId: packetV2.runId },
+    })
+  })
 })

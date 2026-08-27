@@ -56,6 +56,15 @@ export function parseTaskPacket(events: readonly DshEvent[]): TaskPacket | undef
   return taskPacketBoundary(events)?.packet
 }
 
+/** Every valid durable packet boundary, oldest first (used for stateless request reconciliation). */
+export function taskPacketEntries(events: readonly DshEvent[]): Array<{ packet: TaskPacket; seq: number }> {
+  return events.flatMap((event) => {
+    if (event.type !== 'user/message') return []
+    const boundary = taskPacketBoundary([event])
+    return boundary === undefined ? [] : [boundary]
+  })
+}
+
 /**
  * Sequence of the latest durable task-packet boundary, or undefined when the
  * session history has no valid packet. Used to bound the in-memory event cache:
@@ -419,6 +428,23 @@ function base(state: TaskRuntimeState, packet: TaskPacket | undefined): Omit<Obs
     verification: [],
     artifacts: [],
     ...state.telemetry === undefined ? {} : { telemetry: state.telemetry },
+    ...packet?.schemaVersion === 2 && packet.budget !== undefined ? {
+      budget: (() => {
+        const activity = projectActivityIn(state.events, packetBoundarySeq, asOfSeq, state.cwd)
+        const tokens = activity.tokenUsage
+        const observedTokens = tokens.uncachedInputTokens + tokens.outputTokens
+          + tokens.cacheReadTokens + tokens.cacheWriteTokens
+        return {
+          limitTokens: packet.budget.maxTokens,
+          observedTokens,
+          remainingTokens: Math.max(0, packet.budget.maxTokens - observedTokens),
+          exhausted: observedTokens >= packet.budget.maxTokens,
+          coverage: 'root_session' as const,
+          enforcement: 'DSH_HOST_RUNTIME' as const,
+          overshootBound: 'IN_FLIGHT_MODEL_RESPONSES' as const,
+        }
+      })(),
+    } : {},
     asOfSeq,
     boundarySeq: asOfSeq,
   }
@@ -612,6 +638,58 @@ function exhaustedFailureObservation(
   return undefined
 }
 
+function budgetTurnObservation(
+  state: TaskRuntimeState,
+  packet: TaskPacket,
+  turnEnd: DshEvent,
+): Observation | undefined {
+  const reason = (turnEnd.data as { reason?: { kind?: unknown; reason?: { kind?: unknown; reason?: unknown } } }).reason
+  if (reason?.kind !== 'aborted' || reason.reason?.kind !== 'hook' || typeof reason.reason.reason !== 'string') return undefined
+  const text = reason.reason.reason
+  const exhausted = /^dsh-gate:token-budget-exhausted;/.test(text)
+  const accountingFailed = /^dsh-gate:token-budget-accounting-failed;/.test(text)
+  if (!exhausted && !accountingFailed) return undefined
+  const fields = new Map(text.split(';').slice(1).flatMap(part => {
+    const separator = part.indexOf('=')
+    return separator < 0 ? [] : [[part.slice(0, separator), part.slice(separator + 1)] as const]
+  }))
+  const used = Number(fields.get('used'))
+  const limit = Number(fields.get('limit'))
+  const common = {
+    ...base(state, packet),
+    boundarySeq: turnEnd.seq,
+    projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
+  }
+  if (accountingFailed) return {
+    ...common,
+    status: 'FAILED',
+    stage: 'token-budget-accounting',
+    summary: 'Host stopped the run because durable token accounting could not be reconciled safely.',
+    failure: { kind: 'HOST_FAILED', message: 'token budget accounting failed closed', retryable: true },
+  }
+  const observedTokens = Number.isSafeInteger(used) && used >= 0
+    ? used
+    : common.budget?.observedTokens ?? 0
+  const limitTokens = Number.isSafeInteger(limit) && limit > 0
+    ? limit
+    : common.budget?.limitTokens ?? observedTokens
+  return {
+    ...common,
+    status: 'ESCALATION_REQUIRED',
+    stage: 'token-budget-exhausted',
+    summary: `Host-enforced task token budget exhausted (${observedTokens}/${limitTokens}).`,
+    budget: {
+      limitTokens,
+      observedTokens,
+      remainingTokens: 0,
+      exhausted: true,
+      coverage: 'run_tree',
+      enforcement: 'DSH_HOST_RUNTIME',
+      overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
+    },
+  }
+}
+
 function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionPolicy, shadowPolicy?: DecisionPolicy): Observation {
   const boundary = taskPacketBoundary(state.events)
   const packet = boundary?.packet
@@ -685,19 +763,33 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
     if (handoff !== undefined) return handoff
     const exhausted = exhaustedFailureObservation(scopedState, packet, turnEnd)
     if (exhausted !== undefined) return exhausted
+    const budget = budgetTurnObservation(scopedState, packet, turnEnd)
+    if (budget !== undefined) return budget
     const reason = (turnEnd.data as { reason?: { kind?: unknown } }).reason?.kind
     const missing = reason === 'completed'
+    const interrupted = reason === 'interrupted'
     return {
       ...common,
       status: 'FAILED',
       boundarySeq: turnEnd.seq,
-      stage: 'turn-ended',
-      summary: missing ? 'Turn ended without a valid supervisor handoff.' : `Worker turn ended: ${String(reason ?? 'unknown')}.`,
+      stage: interrupted ? 'host-restart-interrupted' : 'turn-ended',
+      summary: missing
+        ? 'Turn ended without a valid supervisor handoff.'
+        : interrupted
+          ? 'The Host recovered the durable session, but the in-flight turn was interrupted and requires a bounded continuation.'
+          : `Worker turn ended: ${String(reason ?? 'unknown')}.`,
       failure: {
-        kind: missing ? 'MISSING_HANDOFF' : 'WORKER_FAILED',
+        kind: missing ? 'MISSING_HANDOFF' : interrupted ? 'HOST_FAILED' : 'WORKER_FAILED',
         message: missing ? 'turn/end is not success without a valid matching supervisor_handoff result' : `turn ended with ${String(reason ?? 'unknown')}`,
-        retryable: missing,
+        retryable: missing || interrupted,
       },
+      ...interrupted && packet.schemaVersion === 2 ? {
+        recovery: {
+          kind: 'CONTINUATION_REQUIRED' as const,
+          reason: 'HOST_RESTART_INTERRUPTED',
+          parentRunId: packet.runId,
+        },
+      } : {},
     }
   }
   return { ...common, status: 'WAITING', stage: state.workerState === 'RUNNING' ? 'running' : 'idle', summary: 'No completed supervisor boundary observed.' }

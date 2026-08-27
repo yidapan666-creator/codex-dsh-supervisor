@@ -171,6 +171,36 @@ started outside dsh-gate is never touched.
   `http://127.0.0.1:8080`. Bootstrap and host commands never open a browser
   (`--no-open`); open the URL manually when you want the UI.
 
+### Disconnect and crash behavior
+
+- **Codex/MCP exit or network interruption:** the Host-owned agent and session
+  keep running. The network client reconnects with bounded backoff; after an MCP
+  restart use `dsh_runs` when identity is unknown, then `dsh_recover` and
+  `dsh_wait`. Never replay the objective.
+- **Ambiguous task dispatch:** retry `dsh_task` with the original `requestId`
+  and byte-equivalent task fields. The durable packet returns the existing
+  `runId`; changing the payload under one request id is rejected.
+- **Host process crash:** no client-side adapter can keep an in-memory model
+  request alive. With `DSH_HOST_LAUNCH`, the next locate/recover call relaunches
+  the detached Host; DSH reloads the durable session and closes the orphaned
+  turn as `interrupted`. `dsh_recover` returns `CONTINUATION_REQUIRED`; queue a
+  new bounded task with `parentRunId` instead of guessing success or replaying
+  the full prompt. Continuous automatic Host restart requires an OS process
+  supervisor and is intentionally outside this MCP adapter.
+
+### Per-task token budget
+
+Pass `tokenBudget.maxTokens` to `dsh_task`, or configure
+`DSH_DEFAULT_TASK_TOKEN_BUDGET`. The value is pinned in the task packet and the
+DSH-side plugin enforces it even when Codex/MCP is disconnected. It aggregates
+provider-reported uncached input, cache read/write, and output across the run's
+root and persisted descendants; it never converts tokens to estimated money.
+Overshoot is bounded by model responses already in flight across concurrent
+agents. Optional
+`DSH_USAGE_MONITOR_URL=http://127.0.0.1:41999` reads the existing
+`dsh-usage-monitor` bridge for comparison only; monitor downtime cannot stop a
+task, and monitor totals are never enforcement authority.
+
 ## Wiring Codex
 
 1. `pnpm bootstrap` (once).

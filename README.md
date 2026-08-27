@@ -4,11 +4,11 @@
 
 The workspace contains:
 
-- `@dsh-gate/mcp-server`: nine MCP tools over DSH's public network client and reconnect controller;
-- `@dsh-gate/supervisor-tools`: DSH-side handoff, artifact admission, and reported-failure budget tools;
+- `@dsh-gate/mcp-server`: eleven MCP tools over DSH's public network client and reconnect controller;
+- `@dsh-gate/supervisor-tools`: DSH-side handoff, artifact admission, reported-failure budget, and Host-enforced task-token guard;
 - `@dsh-gate/decision-policy`: dependency-free, explainable intervention policy with locked protocol invariants;
 - `@dsh-gate/rag-context`: standalone retrieval contracts, lexical baseline, and rank fusion; intentionally not connected to MCP or DSH;
-- `@dsh-gate/run-journal`: atomic, token-free terminal run records used as the durable source for future retrieval;
+- `@dsh-gate/run-journal`: atomic, model-free terminal run records used as the durable source for future retrieval;
 - two narrow operator skills, example Codex/DSH configuration, and a deterministic bootstrap/doctor/Host workflow.
 
 ## Deploy, verify, and start
@@ -53,6 +53,10 @@ When several Host URLs are configured, reconnect by `sessionId` discovers the ex
 
 DSH session identity and supervised execution identity are separate. `dsh_start_or_connect` returns the durable `sessionId`; every `dsh_task` returns a new UUID `runId`. Wait, answer, steer, cancel, child-observation, and interrupt calls carry both values, so a delayed control for an older run is rejected before it can affect a newer turn in the same session.
 
+Every new dispatch can also carry a caller-minted UUID `requestId`. If the MCP response is lost, retrying the exact payload with the same id reconciles the already-durable task packet and returns its existing `runId`; it never queues the objective twice. After broader context loss, `dsh_runs` rediscovers root runs from DSH's authoritative sessions and `dsh_recover` reattaches without prompt replay.
+
+An optional `tokenBudget.maxTokens` (or deployment default `DSH_DEFAULT_TASK_TOKEN_BUDGET`) is fixed in the durable task packet and enforced inside the independent Host across the root/descendant run tree. The accounting uses provider-reported disjoint uncached-input, cache-read, cache-write, and output buckets; cost estimation is deliberately excluded. Streaming/final samples use replacement semantics, persisted child suffixes are reconciled before every model step, and overshoot is bounded by model responses already in flight across concurrent agents. `DSH_USAGE_MONITOR_URL` optionally reads the existing `dsh-usage-monitor` `/api/sessions` bridge for session-level comparison, but failure is contained and those readings never control the budget.
+
 Decision rules live as immutable, versioned JSON files under `config/decision-policies/`. New runs pin the active policy version plus its canonical SHA-256 digest in the durable task packet; an optional shadow policy is pinned the same way but never controls timing or action. After an MCP restart the gateway resolves the pinned version from the catalog and fails closed if the file is missing or changed. To inspect a decision without running DSH, build once and run `pnpm policy:explain -- --policy config/decision-policies/2026-08-26.v1.json --facts '{"signal":"WORKER_DECISION","category":"information","impact":"low","blocking":false}'`; add `--shadow <file>` for an observer-only comparison. `dry-run` is an equivalent CLI command. The legacy `DSH_DECISION_POLICY_JSON` input remains migration-only; file configuration is preferred.
 
 The queued prompt starts with the human-readable objective and embeds the durable task packet afterward. This keeps protocol validation unchanged while making new supervised sessions recognizable by task name in the DSH Web sidebar.
@@ -61,7 +65,7 @@ The queued prompt starts with the human-readable objective and embeds the durabl
 
 `supervisor_handoff.summary` is capped at 2048 characters. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<runId>/` (legacy v1: taskId) inside the session cwd, pass the relative path in `artifacts`, and reference it from the concise summary. The directory is gitignored. The handoff tool rejects over-limit summaries with exactly this instruction and never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
 
-## Token-free run journal
+## Model-free run journal
 
 At a durable run terminal state, the gateway writes one atomic JSON record under `.dsh-state/memory/runs/`. It reuses the existing task packet, accepted handoff, runtime project activity, verification, failure kind, and bounded decision history; it never calls a model (`modelCallsUsed: 0`) and never records heartbeat narration, reasoning, tool arguments, outputs, or user-message contents. Repeated terminal waits reuse the same run-id record. A journal write failure is reported as a warning on the observation and never changes the DSH outcome. Temporary Host/protocol failures and stale-run requests are not recorded as terminal work history. `@dsh-gate/rag-context` can convert these records into small cited retrieval chunks, but retrieval is not yet injected into `dsh_task` or `dsh_wait`.
 
