@@ -6,6 +6,7 @@ import type {
   HostDescription, HostFrame, IApiClient, MuxFrame, RpcRequest, SessionSummary,
 } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { DshEvent } from '../src/contracts.js'
+import type { TaskAdmissionReceipt, TaskAdmissionRequest } from '../src/host.js'
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -20,6 +21,10 @@ export class FakeApi {
   readonly rows = new Map<string, FakeRow>()
   historyCalls = 0
   listCalls = 0
+  promptCalls = 0
+  failAfterAdmissionOnce = false
+  private admissionTail: Promise<void> = Promise.resolve()
+  private readonly admissions = new Map<string, TaskAdmissionReceipt>()
   private readonly muxFrames: RpcRequest<MuxFrame>[] = []
   private readonly hostFrames: RpcRequest<HostFrame>[] = []
   private nextSeq = 1
@@ -96,6 +101,7 @@ export class FakeApi {
       }),
       selectModel: async () => this.ok({ selected: true }),
       prompt: async (payload: { sessionId: string; content: { type: string; text: string }[] }) => {
+        this.promptCalls++
         const row = this.rows.get(payload.sessionId)
         if (row === undefined) return { result: { ok: false as const, error: { code: 'SESSION_NOT_FOUND', message: 'no such session' } } }
         const text = payload.content.map(block => block.text).join('\n')
@@ -126,6 +132,48 @@ export class FakeApi {
     },
     respond: async () => ({ accepted: true }),
   } as unknown as IApiClient
+
+  async admitTask(request: TaskAdmissionRequest): Promise<TaskAdmissionReceipt> {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const previous = this.admissionTail
+    this.admissionTail = previous.then(() => gate)
+    await previous
+    try {
+      const key = `${request.sessionId}:${request.requestId}`
+      const existing = this.admissions.get(key)
+      if (existing !== undefined) {
+        if (existing.requestDigest !== request.requestDigest) {
+          throw new Error(`REQUEST_ID_CONFLICT: requestId ${request.requestId} was already used with a different task payload`)
+        }
+        return { ...existing, reconciled: true }
+      }
+      const prompt = await this.api.sessions.prompt({
+        sessionId: request.sessionId as never,
+        mode: 'queue',
+        content: [{ type: 'text', text: request.prompt }],
+      }) as unknown as { result: { ok: true; value: unknown } | { ok: false; error: { code: string; message: string } } }
+      if (!prompt.result.ok) throw new Error(`${prompt.result.error.code}: ${prompt.result.error.message}`)
+      const row = this.rows.get(request.sessionId)
+      const receipt: TaskAdmissionReceipt = {
+        schemaVersion: 1,
+        sessionId: request.sessionId,
+        requestId: request.requestId,
+        requestDigest: request.requestDigest,
+        runId: request.runId,
+        reconciled: false,
+        asOfSeq: row?.events.at(-1)?.seq ?? -1,
+      }
+      this.admissions.set(key, receipt)
+      if (this.failAfterAdmissionOnce) {
+        this.failAfterAdmissionOnce = false
+        throw new Error('simulated response loss after durable admission')
+      }
+      return receipt
+    } finally {
+      release()
+    }
+  }
 }
 
 /** Let a queued frame be pumped into the controller's sinks before asserting. */

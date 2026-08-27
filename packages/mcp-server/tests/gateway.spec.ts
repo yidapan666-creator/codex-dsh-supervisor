@@ -20,7 +20,7 @@ afterEach(() => {
 })
 
 function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
-  const connection = new HostConnection(baseUrl, api.api)
+  const connection = new HostConnection(baseUrl, api.api, request => api.admitTask(request))
   live.push(connection)
   return connection
 }
@@ -276,6 +276,49 @@ describe('Web-visible task identity', () => {
     expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
       schemaVersion: 2, requestId, runId: first.runId, budget: { maxTokens: 123_456 },
     })
+  })
+
+  it('serializes the same request across two MCP managers at the Host admission boundary', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const firstManager = managerWith(api, sameDomain)
+    const secondManager = managerWith(api, sameDomain)
+    const input = {
+      sessionId: 's1',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      objective: 'one durable dispatch',
+      writerMode: 'read_only' as const,
+    }
+
+    const [first, second] = await Promise.all([firstManager.task(input), secondManager.task(input)])
+
+    expect(first.runId).toBe(second.runId)
+    expect([first.reconciled, second.reconciled].sort()).toEqual([false, true])
+    expect(api.promptCalls).toBe(1)
+  })
+
+  it('reconciles after the Host committed admission but the MCP response was lost', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    api.failAfterAdmissionOnce = true
+    const firstManager = managerWith(api, sameDomain)
+    const input = {
+      sessionId: 's1',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      objective: 'survive an ambiguous response',
+      writerMode: 'read_only' as const,
+    }
+
+    await expect(firstManager.task(input)).rejects.toThrow(/response loss/)
+    firstManager.stopClients()
+    const secondManager = managerWith(api, sameDomain)
+
+    await expect(secondManager.task(input)).resolves.toMatchObject({
+      accepted: true,
+      reconciled: true,
+      requestId: input.requestId,
+    })
+    expect(api.promptCalls).toBe(1)
   })
 
   it('rejects reuse of a requestId with a changed payload', async () => {

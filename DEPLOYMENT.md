@@ -178,8 +178,9 @@ started outside dsh-gate is never touched.
   restart use `dsh_runs` when identity is unknown, then `dsh_recover` and
   `dsh_wait`. Never replay the objective.
 - **Ambiguous task dispatch:** retry `dsh_task` with the original `requestId`
-  and byte-equivalent task fields. The durable packet returns the existing
-  `runId`; changing the payload under one request id is rejected.
+  and byte-equivalent task fields. Host-side atomic admission returns the
+  existing durable `runId` receipt; changing the payload under one request id
+  is rejected. A genuinely new task waits until the session is idle.
 - **Host process crash:** no client-side adapter can keep an in-memory model
   request alive. With `DSH_HOST_LAUNCH`, the next locate/recover call relaunches
   the detached Host; DSH reloads the durable session and closes the orphaned

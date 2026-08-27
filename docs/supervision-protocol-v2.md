@@ -207,9 +207,12 @@ Admission is held while a writer run is queued or its turn is active and is
 released at the corresponding turn end, including blocked, checkpoint, and
 escalation handoffs. A continuation reacquires admission as a new run.
 
-The current implementation can serialize only within one MCP manager. Protocol
-v2 must not claim cross-process or cross-Host atomicity until the Host exposes a
-generic atomic session-admission capability. No filesystem lock service is added.
+The Host supervisor plugin owns per-session task admission. It serializes
+callers from multiple MCP processes, durably flushes the DSH inbox insertion,
+and returns the stored request receipt. This closes same-session `requestId`
+replay without changing DSH core. Writer exclusion across different sessions,
+MCP processes, or Hosts remains a separate limitation; no filesystem lock
+service is added.
 
 ## Wait and reconnect
 

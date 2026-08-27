@@ -4,11 +4,26 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { admitArtifacts } from './artifacts.js'
+import {
+  registerTaskAdmissionRoute,
+  TaskAdmissionCoordinator,
+  type TaskAdmissionRuntime,
+} from './admission.js'
 
 export { admitArtifact, admitArtifacts, type ArtifactManifestEntry } from './artifacts.js'
+export {
+  registerTaskAdmissionRoute,
+  TASK_ADMISSION_PATH,
+  TaskAdmissionCoordinator,
+  TaskAdmissionError,
+  type TaskAdmissionErrorCode,
+  type TaskAdmissionReceipt,
+  type TaskAdmissionRequest,
+  type TaskAdmissionRuntime,
+} from './admission.js'
 
 export const name = 'dsh-gate-supervisor-tools'
-export const inject = ['tools', 'systemPrompt', 'agents', 'sessions', 'sessionPersistence']
+export const inject = ['tools', 'systemPrompt', 'agents', 'sessions', 'sessionPersistence', 'apiProxy', 'webServer']
 
 export interface Config {
   /** Exact worker-reported failure signatures accepted before forced escalation. */
@@ -135,6 +150,8 @@ interface SupervisorRuntimeContext {
     listener: (payload: { agent: RuntimeAgent }, next: () => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: unknown[] }>)
       => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: unknown[] }>,
   ): void
+  apiProxy: TaskAdmissionRuntime['apiProxy']
+  webServer: Parameters<typeof registerTaskAdmissionRoute>[0]
 }
 
 function latestTaskIdentityBoundary(
@@ -508,6 +525,10 @@ export function reportedFailureDecision(
 export function apply(ctx: Context, config: Config = {}): void {
   const resolved = Config(config) as Required<Config>
   const runtime = ctx as unknown as SupervisorRuntimeContext
+  ctx.effect(() => registerTaskAdmissionRoute(
+    runtime.webServer,
+    new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
+  ), 'dsh-gate task admission route')
   const durableUsageCache = new Map<
     string,
     { revision: string; runId: string | undefined; tokens: TokenBuckets | undefined }

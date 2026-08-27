@@ -13,10 +13,14 @@ The worker receives a durable task packet containing the durable `sessionId`, a 
 A completed `turn/end` without those facts is `FAILED` with `MISSING_HANDOFF`. Other failures use `WORKER_FAILED`, `HOST_FAILED`, or `PROTOCOL_ERROR`. Every wait and control call for a v2 run carries `sessionId + runId`; a stale run is rejected before it can observe or mutate the newer execution.
 
 Schema v2 may pin a caller `requestId`, its task-payload digest, and a
-`budget.maxTokens`. Repeating the same request id and digest reconciles the
-existing durable packet; a digest mismatch is a protocol error. The budget is
-enforced by the DSH Host plugin rather than MCP, so client disconnect does not
-reset it.
+`budget.maxTokens`. Admission is a Host-owned operation: the supervisor plugin
+serializes requests per session, checks every durable inbox/message packet
+carrying the request id, queues the prompt through the Host API, and flushes the
+inbox insertion before returning its stable run receipt. A same-id, same-digest
+retry returns the original run id; a different digest is rejected. New
+admission to a running session is rejected rather than parked in an unconfirmed
+next-turn queue. The budget is enforced by the DSH Host plugin rather than MCP,
+so client disconnect does not reset it.
 
 ## Observation cursor
 

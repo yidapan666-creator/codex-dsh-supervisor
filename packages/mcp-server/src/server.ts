@@ -53,7 +53,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'Terminal observations also report whether the model-free run journal was recorded; journal warnings never change the task outcome. '
       + 'Treat decisionShadow as observer-only comparison data; only decision controls the current run. '
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
-      + 'Always give dsh_task a fresh requestId and reuse that same requestId after an ambiguous client disconnect; task dispatch is reconciled from the durable packet and is not duplicated. '
+      + 'Always give dsh_task a fresh requestId and reuse that same requestId after an ambiguous client disconnect; Host-side atomic admission returns the durable receipt and does not duplicate the task. '
       + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree; the external dsh-usage-monitor reading is optional observability and never budget authority. '
       + 'After MCP/Codex reconnect, use dsh_runs to rediscover identity and dsh_recover to reattach before waiting. Do not replay the objective. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
@@ -70,7 +70,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.startOrConnect(input)))
 
   server.registerTool('dsh_task', {
-    description: 'Queue one supervised run in a durable session. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host packet makes dispatch idempotently reconcilable. Optional tokenBudget.maxTokens is a Host-enforced whole-run-tree limit using provider-reported input/cache/output tokens; overshoot is bounded by model responses already in flight across concurrent agents. Returns a unique runId; every later wait/control call must carry sessionId + runId. One writer per working tree is enforced; use an independent worktree for parallel writers.',
+    description: 'Atomically admit one supervised run into an idle durable session. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits a durable inbox receipt and returns the original runId without duplicating the task. A different new task is rejected while the session is running. Optional tokenBudget.maxTokens is a Host-enforced whole-run-tree limit using provider-reported input/cache/output tokens; overshoot is bounded by model responses already in flight across concurrent agents. Every later wait/control call must carry sessionId + runId. One writer per working tree is enforced; use an independent worktree for parallel writers.',
     inputSchema: z.object({
       requestId: z.string().uuid().optional(),
       sessionId: z.string(), taskId: z.string().optional(), objective: z.string().min(1), writerMode: z.enum(['writer', 'read_only']).optional(),

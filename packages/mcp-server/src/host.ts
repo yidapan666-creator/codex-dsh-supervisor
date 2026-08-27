@@ -22,6 +22,27 @@ export interface HostLaunchConfig {
 
 export type SessionSnapshot = TaskRuntimeState
 
+export interface TaskAdmissionRequest {
+  schemaVersion: 1
+  sessionId: string
+  requestId: string
+  requestDigest: string
+  runId: string
+  prompt: string
+}
+
+export interface TaskAdmissionReceipt {
+  schemaVersion: 1
+  sessionId: string
+  requestId: string
+  requestDigest: string
+  runId: string
+  reconciled: boolean
+  asOfSeq: number
+}
+
+export type TaskAdmissionTransport = (request: TaskAdmissionRequest) => Promise<TaskAdmissionReceipt>
+
 interface CachedSessionMetadata {
   cwd?: string
   telemetry?: TaskRuntimeState['telemetry']
@@ -30,6 +51,51 @@ interface CachedSessionMetadata {
 function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; error: { code: string; message: string } } }): T {
   if (!response.result.ok) throw new Error(`${response.result.error.code}: ${response.result.error.message}`)
   return response.result.value
+}
+
+function taskAdmissionReceipt(value: unknown, request: TaskAdmissionRequest): TaskAdmissionReceipt {
+  if (typeof value !== 'object' || value === null) throw new Error('malformed dsh-gate admission receipt')
+  const receipt = value as Record<string, unknown>
+  if (receipt.schemaVersion !== 1
+    || receipt.sessionId !== request.sessionId
+    || receipt.requestId !== request.requestId
+    || receipt.requestDigest !== request.requestDigest
+    || typeof receipt.runId !== 'string'
+    || typeof receipt.reconciled !== 'boolean'
+    || typeof receipt.asOfSeq !== 'number' || !Number.isSafeInteger(receipt.asOfSeq)) {
+    throw new Error('malformed dsh-gate admission receipt')
+  }
+  return receipt as unknown as TaskAdmissionReceipt
+}
+
+async function postTaskAdmission(baseUrl: string, request: TaskAdmissionRequest): Promise<TaskAdmissionReceipt> {
+  const rpcId = `dsh-gate-admit-${request.requestId}`
+  const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.admit`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId, method: 'dsh-gate.admit', payload: request }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (response.status === 404) {
+    throw new Error('PROTOCOL_ERROR: DSH Host does not expose atomic task admission; reinstall the supervisor plugin and restart the Host')
+  }
+  if (!response.ok) throw new Error(`dsh-gate admission carrier returned HTTP ${String(response.status)}`)
+  const value = await response.json() as unknown
+  if (typeof value !== 'object' || value === null) throw new Error('malformed dsh-gate admission response')
+  const envelope = value as Record<string, unknown>
+  if (envelope.type !== 'server-response' || envelope.rpcId !== rpcId
+    || typeof envelope.result !== 'object' || envelope.result === null) {
+    throw new Error('malformed dsh-gate admission response')
+  }
+  const result = envelope.result as Record<string, unknown>
+  if (result.ok === false) {
+    const error = typeof result.error === 'object' && result.error !== null
+      ? result.error as Record<string, unknown>
+      : {}
+    throw new Error(`${String(error.code ?? 'INTERNAL')}: ${String(error.message ?? 'task admission failed')}`)
+  }
+  if (result.ok !== true) throw new Error('malformed dsh-gate admission result')
+  return taskAdmissionReceipt(result.value, request)
 }
 
 export function needsOlderHistoryPage(
@@ -76,7 +142,11 @@ export class HostConnection {
   private readonly questions = new Map<string, PendingQuestion>()
   private readonly metadata = new Map<string, CachedSessionMetadata>()
 
-  constructor(readonly baseUrl: string, readonly api: IApiClient = new WebApiClient(baseUrl)) {
+  constructor(
+    readonly baseUrl: string,
+    readonly api: IApiClient = new WebApiClient(baseUrl),
+    private readonly admissionTransport: TaskAdmissionTransport = request => postTaskAdmission(baseUrl, request),
+  ) {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
         this.description = description
@@ -182,6 +252,11 @@ export class HostConnection {
 
   currentDescription(): HostDescription | undefined {
     return this.description
+  }
+
+  /** Atomically queue one idempotent supervised task through the Host plugin. */
+  admitTask(request: TaskAdmissionRequest): Promise<TaskAdmissionReceipt> {
+    return this.admissionTransport(request)
   }
 
   async listSessions(): Promise<SessionSummary[]> {

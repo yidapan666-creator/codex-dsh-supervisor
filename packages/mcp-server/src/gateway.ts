@@ -445,31 +445,16 @@ export class GatewayManager {
       budget,
     })).digest('hex')
 
-    const reconciledResponse = (candidate: typeof snapshot): Record<string, unknown> | undefined => {
+    const existingRequest = (candidate: typeof snapshot): boolean => {
       const entry = taskPacketEntries(candidate.events).find(({ packet }) =>
         packet.schemaVersion === 2 && packet.requestId === requestId)
-      if (entry === undefined || entry.packet.schemaVersion !== 2) return undefined
+      if (entry === undefined || entry.packet.schemaVersion !== 2) return false
       if (entry.packet.requestDigest !== requestDigest) {
         throw new Error(`requestId ${requestId} was already used with a different task payload`)
       }
-      return {
-        schemaVersion: 1,
-        hostInstanceId: candidate.hostInstanceId,
-        sessionId,
-        taskId: sessionId,
-        requestId,
-        runId: entry.packet.runId,
-        objective: entry.packet.objective,
-        writerMode: entry.packet.writerMode,
-        accepted: true,
-        reconciled: true,
-        asOfSeq: candidate.events.at(-1)?.seq ?? -1,
-        ...entry.packet.budget === undefined ? {} : { tokenBudget: entry.packet.budget },
-        disconnectBehavior: 'HOST_CONTINUES',
-      }
+      return true
     }
-    const existing = reconciledResponse(snapshot)
-    if (existing !== undefined) return existing
+    const alreadyVisible = existingRequest(snapshot)
 
     const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
@@ -521,40 +506,39 @@ export class GatewayManager {
       + 'runId, and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
       + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature. '
       + 'The DSH Host enforces any task token budget even when the external supervisor is disconnected.'
-    const queueAndConfirm = async (): Promise<Record<string, unknown>> => {
-      unwrap(await connection.api.sessions.prompt({
-        sessionId: sessionId as SessionId,
-        mode: 'queue',
-        content: [{ type: 'text', text: prompt }],
-      }))
-      const packetDeadline = Date.now() + 10_000
-      let refreshed = await connection.refreshSession(sessionId)
-      while (parseTaskPacket(refreshed.events)?.completionToken !== packet.completionToken) {
-        if (Date.now() >= packetDeadline) throw new Error('task prompt was accepted but its durable task packet was not observed')
-        await connection.waitForChange(250)
-        refreshed = await connection.refreshSession(sessionId)
-      }
+    const admit = async (): Promise<Record<string, unknown>> => {
+      const receipt = await connection.admitTask({
+        schemaVersion: 1,
+        sessionId,
+        requestId,
+        requestDigest,
+        runId,
+        prompt,
+      })
+      const refreshed = await connection.refreshSession(sessionId)
       return {
         schemaVersion: 1,
         hostInstanceId: refreshed.hostInstanceId,
         sessionId,
         taskId: sessionId,
         requestId,
-        runId,
+        runId: receipt.runId,
         objective: input.objective,
         writerMode,
         accepted: true,
-        asOfSeq: refreshed.events.at(-1)?.seq ?? -1,
+        reconciled: receipt.reconciled,
+        asOfSeq: Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1),
         ...budget === undefined ? {} : { tokenBudget: budget },
         disconnectBehavior: 'HOST_CONTINUES',
       }
     }
     return this.exclusiveWriterAdmission(async () => {
       const latest = await connection.refreshSession(sessionId)
-      const reconciled = reconciledResponse(latest)
-      if (reconciled !== undefined) return reconciled
-      if (writerMode === 'writer') await this.assertWriterAvailable(connection, sessionCwd)
-      return queueAndConfirm()
+      const visibleNow = existingRequest(latest)
+      if (writerMode === 'writer' && !alreadyVisible && !visibleNow) {
+        await this.assertWriterAvailable(connection, sessionCwd)
+      }
+      return admit()
     })
   }
 
