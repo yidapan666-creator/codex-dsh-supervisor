@@ -134,6 +134,16 @@ describe('Host task admission', () => {
     expect(test.calls.prompt).toBe(1)
   })
 
+  it('rejects an embedded task packet addressed to another session', async () => {
+    const test = harness()
+    const mismatched = request()
+    mismatched.prompt = mismatched.prompt.replace('"sessionId":"s1"', '"sessionId":"s2"')
+
+    await expect(test.coordinator.admit(mismatched))
+      .rejects.toMatchObject<TaskAdmissionError>({ code: 'BAD_REQUEST' })
+    expect(test.calls.prompt).toBe(0)
+  })
+
   it('does not queue a new supervised task into a busy session', async () => {
     const test = harness({ running: true })
     await expect(test.coordinator.admit(request()))

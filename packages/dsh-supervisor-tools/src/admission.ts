@@ -93,6 +93,7 @@ export interface TaskAdmissionRuntime {
 
 interface PacketIdentity {
   message?: AdmissionMessage
+  sessionId: string
   requestId: string
   requestDigest: string
   runId: string
@@ -136,11 +137,13 @@ function packetIdentities(events: readonly AdmissionEvent[]): PacketIdentity[] {
         try {
           const value = JSON.parse(text.slice(start + TASK_PACKET_START.length, end).trim()) as Record<string, unknown>
           if (value.schemaVersion === 2
+            && typeof value.sessionId === 'string' && value.sessionId.length > 0
             && typeof value.requestId === 'string' && UUID_PATTERN.test(value.requestId)
             && typeof value.requestDigest === 'string' && DIGEST_PATTERN.test(value.requestDigest)
             && typeof value.runId === 'string' && UUID_PATTERN.test(value.runId)) {
             identities.push({
               message,
+              sessionId: value.sessionId,
               requestId: value.requestId,
               requestDigest: value.requestDigest,
               runId: value.runId,
@@ -175,6 +178,7 @@ function validateRequest(value: unknown): TaskAdmissionRequest {
     type: 'user/message', seq: 0, data: { content: [{ type: 'text', text: candidate.prompt }] },
   }]).find(identity => identity.requestId === candidate.requestId)
   if (embedded === undefined
+    || embedded.sessionId !== candidate.sessionId
     || embedded.requestDigest !== candidate.requestDigest
     || embedded.runId !== candidate.runId) {
     throw new TaskAdmissionError('BAD_REQUEST', 'outer admission identity does not match the embedded task packet')
@@ -217,7 +221,7 @@ export class TaskAdmissionCoordinator {
       )
     }
     const matches = packetIdentities(agent.session.events)
-      .filter(identity => identity.requestId === request.requestId)
+      .filter(identity => identity.sessionId === request.sessionId && identity.requestId === request.requestId)
     if (matches.length > 0) {
       if (matches.some(identity => identity.requestDigest !== request.requestDigest)) {
         throw new TaskAdmissionError(

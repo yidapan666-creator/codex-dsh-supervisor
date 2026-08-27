@@ -1,40 +1,52 @@
 import { describe, expect, it } from 'vitest'
-import { liveTokenBudgetState } from '../src/index.js'
+import { installTokenBudgetGuards, liveTokenBudgetState } from '../src/index.js'
 
 const runId = '11111111-1111-4111-8111-111111111111'
-const packet = {
+const oldRunId = '33333333-3333-4333-8333-333333333333'
+const nestedRunId = '44444444-4444-4444-8444-444444444444'
+const packetFor = (id: string, sessionId = 'root') => ({
   schemaVersion: 2,
-  sessionId: 'root',
-  runId,
+  sessionId,
+  runId: id,
   completionToken: '22222222-2222-4222-8222-222222222222',
   objective: 'bounded work',
   writerMode: 'writer',
   budget: { maxTokens: 150 },
-}
+})
 
-const packetEvent = {
-  type: 'user/message', seq: 0, data: {
-    content: [{ type: 'text', text: `<dsh-supervised-task>\n${JSON.stringify(packet)}\n</dsh-supervised-task>` }],
+const packetEvent = (seq: number, time: number, id = runId, sessionId = 'root') => ({
+  type: 'user/message', seq, time, data: {
+    content: [{ type: 'text', text: `<dsh-supervised-task>\n${JSON.stringify(packetFor(id, sessionId))}\n</dsh-supervised-task>` }],
   },
-}
+})
 
-const usage = (seq: number, turn: number, step: number, inputTokens: number, outputTokens: number) => ({
-  type: 'assistant/message', seq, data: { turn, step, usage: { inputTokens, outputTokens } },
+const userMessage = (seq: number, time: number, text = 'delegated work') => ({
+  type: 'user/message', seq, time, data: { content: [{ type: 'text', text }] },
+})
+
+const usage = (seq: number, time: number, turn: number, step: number, inputTokens: number, outputTokens: number) => ({
+  type: 'assistant/message', seq, time, data: { turn, step, usage: { inputTokens, outputTokens } },
 })
 
 describe('Host token budget fold', () => {
-  it('aggregates root and descendant suffixes without double-counting inherited seed usage', () => {
+  it('aggregates a fork child suffix without double-counting its inherited seed', () => {
     const root = {
       header: { id: 'root' },
-      events: [packetEvent, usage(1, 1, 1, 60, 40)],
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 60, 40)],
     }
     const child = {
-      header: { id: 'child', parentSession: 'root', seedLength: 2 },
-      events: [packetEvent, usage(1, 1, 1, 60, 40), usage(2, 2, 1, 30, 20)],
+      header: { id: 'child', createdAt: 120, parentSession: 'root', seedLength: 2 },
+      events: [
+        packetEvent(0, 100),
+        usage(1, 110, 1, 1, 60, 40),
+        { type: 'session/end-seed', seq: 2, time: 120, data: {} },
+        userMessage(3, 121),
+        usage(4, 130, 2, 1, 30, 20),
+      ],
     }
     const unrelated = {
       header: { id: 'other' },
-      events: [packetEvent, usage(1, 1, 1, 999, 999)],
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 999, 999)],
     }
 
     expect(liveTokenBudgetState([root, child, unrelated], 'root', runId, 150)).toMatchObject({
@@ -47,17 +59,160 @@ describe('Host token budget fold', () => {
     })
   })
 
+  it('affiliates fresh spawn descendants from durable lineage and accepted work boundaries', () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 20, 10)],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 120, parentSession: 'root' },
+      events: [userMessage(0, 121), usage(1, 130, 1, 1, 30, 20)],
+    }
+    const grandchild = {
+      header: { id: 'grandchild', createdAt: 140, parentSession: 'child' },
+      events: [userMessage(0, 141), usage(1, 150, 1, 1, 25, 15)],
+    }
+
+    expect(liveTokenBudgetState([root, child, grandchild], 'root', runId, 120)).toMatchObject({
+      usedTokens: 120,
+      exhausted: true,
+      sessions: 3,
+    })
+  })
+
+  it('excludes an old child until it accepts new work inside the current run window', () => {
+    const root = {
+      header: { id: 'root' },
+      events: [
+        packetEvent(0, 10, oldRunId),
+        usage(1, 20, 1, 1, 10, 10),
+        packetEvent(2, 100),
+        usage(3, 110, 2, 1, 15, 5),
+      ],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 30, parentSession: 'root' },
+      events: [userMessage(0, 31, 'old work'), usage(1, 40, 1, 1, 500, 500)],
+    }
+
+    expect(liveTokenBudgetState([root, child], 'root', runId, 100)).toMatchObject({
+      usedTokens: 20,
+      sessions: 1,
+    })
+
+    child.events.push(userMessage(2, 120, 'new work'), usage(3, 130, 2, 1, 30, 10))
+    expect(liveTokenBudgetState([root, child], 'root', runId, 100)).toMatchObject({
+      usedTokens: 60,
+      sessions: 2,
+    })
+  })
+
+  it('keeps a separately supervised nested root out of its ancestor budget', () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 15, 5)],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 120, parentSession: 'root' },
+      events: [
+        packetEvent(0, 121, nestedRunId, 'child'),
+        usage(1, 130, 1, 1, 30, 20),
+      ],
+    }
+
+    expect(liveTokenBudgetState([root, child], 'root', runId, 100)).toMatchObject({
+      usedTokens: 20,
+      sessions: 1,
+    })
+    expect(liveTokenBudgetState([root, child], 'child', nestedRunId, 100)).toMatchObject({
+      usedTokens: 50,
+      sessions: 1,
+    })
+  })
+
   it('replaces a streaming usage sample with the finalized sample for the same step', () => {
     const root = {
       header: { id: 'root' },
       events: [
-        packetEvent,
-        { type: 'assistant/chunk', seq: 1, data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 20, outputTokens: 10 } } } },
-        usage(2, 1, 1, 25, 15),
+        packetEvent(0, 100),
+        { type: 'assistant/chunk', seq: 1, time: 110, data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 20, outputTokens: 10 } } } },
+        usage(2, 120, 1, 1, 25, 15),
       ],
     }
     expect(liveTokenBudgetState([root], 'root', runId, 100)).toMatchObject({
       usedTokens: 40, exhausted: false, remainingTokens: 60,
     })
+  })
+
+  it('reconciles a persisted cold child before a post-restart root step', async () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 60, 40)],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 120, parentSession: 'root' },
+      events: [userMessage(0, 121), usage(1, 130, 1, 1, 30, 20)],
+    }
+    const cancellations: string[] = []
+    const rootAgent = {
+      session: root,
+      cancel: ({ reason }: { reason: string }) => { cancellations.push(reason) },
+    }
+    let preStep: ((
+      payload: { agent: typeof rootAgent },
+      next: () => Promise<{ kind: 'enter'; messages: unknown[] }>,
+    ) => Promise<{ kind: string; messages?: unknown[] }>) | undefined
+    const ctx = {
+      sessions: { list: () => [root] },
+      agents: { list: () => [rootAgent] },
+      on(name: string, listener: unknown) {
+        if (name === 'agent/pre-step') preStep = listener as typeof preStep
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [{ header: child.header, revision: 'child-r1' }],
+        inspect: async () => ({ meta: child.header, events: child.events }),
+      },
+    }
+    installTokenBudgetGuards(ctx as never)
+    const decision = await preStep?.({ agent: rootAgent }, async () => ({ kind: 'enter', messages: [] }))
+
+    expect(decision).toEqual({ kind: 'reject' })
+    expect(cancellations).toHaveLength(1)
+    expect(cancellations[0]).toContain('dsh-gate:token-budget-exhausted')
+    expect(cancellations[0]).toContain('used=150')
+  })
+
+  it('immediately cancels the whole live run tree when a child usage event exhausts the budget', () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 60, 40)],
+    }
+    const childUsage = usage(1, 130, 1, 1, 30, 20)
+    const child = {
+      header: { id: 'child', createdAt: 120, parentSession: 'root' },
+      events: [userMessage(0, 121), childUsage],
+    }
+    const cancelled = new Set<string>()
+    const agents = [root, child].map(session => ({
+      session,
+      cancel: () => { cancelled.add(session.header.id) },
+    }))
+    let sessionEvent: ((session: typeof child, event: typeof childUsage) => void) | undefined
+    const ctx = {
+      sessions: { list: () => [root, child] },
+      agents: { list: () => agents },
+      on(name: string, listener: unknown) {
+        if (name === 'session/event') sessionEvent = listener as typeof sessionEvent
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [],
+        inspect: async () => { throw new Error('not used') },
+      },
+    }
+    installTokenBudgetGuards(ctx as never)
+
+    sessionEvent?.(child, childUsage)
+
+    expect([...cancelled].sort()).toEqual(['child', 'root'])
   })
 })

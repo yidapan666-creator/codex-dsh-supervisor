@@ -196,6 +196,10 @@ Pass `tokenBudget.maxTokens` to `dsh_task`, or configure
 DSH-side plugin enforces it even when Codex/MCP is disconnected. It aggregates
 provider-reported uncached input, cache read/write, and output across the run's
 root and persisted descendants; it never converts tokens to estimated money.
+Spawn, fork, nested, and reused continuable-child activations are affiliated
+from durable `parentSession`, task-packet, and accepted-work boundaries. This
+does not inject another model message or spend tokens, and inherited fork seed
+usage is not counted twice. Cold descendants are reconciled after Host restart.
 Overshoot is bounded by model responses already in flight across concurrent
 agents. Optional
 `DSH_USAGE_MONITOR_URL=http://127.0.0.1:41999` reads the existing

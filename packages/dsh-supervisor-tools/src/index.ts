@@ -113,7 +113,7 @@ type TaskIdentity = {
   tokenBudget?: number | undefined
 }
 
-type TaskIdentityBoundary = { identity: TaskIdentity; boundarySeq: number }
+type TaskIdentityBoundary = { identity: TaskIdentity; boundarySeq: number; boundaryTime?: number }
 
 interface RuntimeSessionHeader {
   id: string
@@ -124,6 +124,7 @@ interface RuntimeSessionHeader {
 interface RuntimeEvent {
   type: string
   seq: number
+  time?: number
   data: unknown
 }
 
@@ -155,7 +156,7 @@ interface SupervisorRuntimeContext {
 }
 
 function latestTaskIdentityBoundary(
-  events: readonly { type: string; seq?: number; data: unknown }[],
+  events: readonly { type: string; seq?: number; time?: number; data: unknown }[],
 ): TaskIdentityBoundary | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
@@ -188,6 +189,7 @@ function latestTaskIdentityBoundary(
                 : {},
             },
             boundarySeq: event.seq ?? index,
+            ...event.time === undefined ? {} : { boundaryTime: event.time },
           }
         }
         if (value.schemaVersion === 1
@@ -198,6 +200,7 @@ function latestTaskIdentityBoundary(
           return {
             identity: { schemaVersion: 1, sessionId: value.taskId, completionToken: value.completionToken },
             boundarySeq: event.seq ?? index,
+            ...event.time === undefined ? {} : { boundaryTime: event.time },
           }
         }
       } catch { /* Try an earlier opening marker in the same message. */ }
@@ -207,7 +210,9 @@ function latestTaskIdentityBoundary(
   return undefined
 }
 
-function latestTaskIdentity(events: readonly { type: string; seq?: number; data: unknown }[]): TaskIdentity | undefined {
+function latestTaskIdentity(
+  events: readonly { type: string; seq?: number; time?: number; data: unknown }[],
+): TaskIdentity | undefined {
   return latestTaskIdentityBoundary(events)?.identity
 }
 
@@ -255,12 +260,78 @@ function usageSample(event: { type: string; data: unknown }): { key: string; buc
   }
 }
 
-function ownRunTokens(session: RuntimeSession, runId: string): TokenBuckets | undefined {
-  const packet = latestTaskIdentityBoundary(session.events)
-  if (packet?.identity.schemaVersion !== 2 || packet.identity.runId !== runId) return undefined
-  // A child seed contains its parent's already-accounted events. Count only the
-  // child's suffix; a root counts from immediately after its latest task packet.
-  const fromSeq = Math.max(packet.boundarySeq + 1, session.header.seedLength ?? 0)
+function ownTaskBoundaries(session: RuntimeSession): TaskIdentityBoundary[] {
+  const ownStart = session.header.seedLength ?? 0
+  return session.events.flatMap((event) => {
+    if (event.seq < ownStart) return []
+    const boundary = latestTaskIdentityBoundary([event])
+    return boundary === undefined ? [] : [boundary]
+  })
+}
+
+function eventWithinRunWindow(
+  event: RuntimeEvent,
+  startTime: number | undefined,
+  endTime: number | undefined,
+): boolean {
+  if (event.time === undefined) return true
+  return (startTime === undefined || event.time >= startTime)
+    && (endTime === undefined || event.time < endTime)
+}
+
+/**
+ * Find the durable boundary where one session joined a supervised run.
+ *
+ * Root sessions join at their own task packet. Descendants join when their own
+ * suffix first accepts work during that root packet's time window. Fork seeds
+ * are excluded by `seedLength`, so inherited parent usage is never counted.
+ * A descendant with its own supervised task packet forms a nested run root and
+ * is deliberately excluded from the outer run.
+ */
+function runAffiliationBoundary(
+  session: RuntimeSession,
+  root: RuntimeSession,
+  runId: string,
+): number | undefined {
+  const rootBoundaries = ownTaskBoundaries(root)
+  const rootIndex = rootBoundaries.findIndex(boundary =>
+    boundary.identity.schemaVersion === 2
+    && boundary.identity.sessionId === root.header.id
+    && boundary.identity.runId === runId)
+  if (rootIndex < 0) return undefined
+  const rootBoundary = rootBoundaries[rootIndex]
+  if (rootBoundary === undefined) return undefined
+  if (session.header.id === root.header.id) return rootBoundary.boundarySeq
+
+  const nextRootBoundary = rootBoundaries[rootIndex + 1]
+  const nested = ownTaskBoundaries(session).find(boundary => eventWithinRunWindow(
+    {
+      type: 'user/message',
+      seq: boundary.boundarySeq,
+      data: null,
+      ...boundary.boundaryTime === undefined ? {} : { time: boundary.boundaryTime },
+    },
+    rootBoundary.boundaryTime,
+    nextRootBoundary?.boundaryTime,
+  ))
+  if (nested !== undefined) {
+    return nested.identity.schemaVersion === 2
+      && nested.identity.sessionId === session.header.id
+      && nested.identity.runId === runId
+      ? nested.boundarySeq
+      : undefined
+  }
+
+  const ownStart = session.header.seedLength ?? 0
+  return session.events.find(event => event.seq >= ownStart
+    && event.type === 'user/message'
+    && eventWithinRunWindow(event, rootBoundary.boundaryTime, nextRootBoundary?.boundaryTime))?.seq
+}
+
+function ownRunTokens(session: RuntimeSession, root: RuntimeSession, runId: string): TokenBuckets | undefined {
+  const affiliationBoundary = runAffiliationBoundary(session, root, runId)
+  if (affiliationBoundary === undefined) return undefined
+  const fromSeq = Math.max(affiliationBoundary + 1, session.header.seedLength ?? 0)
   const samples = new Map<string, TokenBuckets>()
   for (const event of session.events) {
     if (event.seq < fromSeq) continue
@@ -297,6 +368,7 @@ function isDescendantOf(
 }
 
 function sumBudget(
+  rootId: string,
   runId: string,
   limitTokens: number,
   sessions: readonly RuntimeSession[],
@@ -304,9 +376,11 @@ function sumBudget(
   const buckets: TokenBuckets = {
     uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
   }
+  const root = sessions.find(session => session.header.id === rootId)
+  if (root === undefined) return budgetFromBuckets(runId, limitTokens, buckets, 0)
   let counted = 0
   for (const session of sessions) {
-    const own = ownRunTokens(session, runId)
+    const own = ownRunTokens(session, root, runId)
     if (own === undefined) continue
     counted++
     buckets.uncachedInputTokens += own.uncachedInputTokens
@@ -344,7 +418,12 @@ export function liveTokenBudgetState(
   limitTokens: number,
 ): TokenBudgetState {
   const headers = new Map(sessions.map(session => [session.header.id, session.header]))
-  return sumBudget(runId, limitTokens, sessions.filter(session => isDescendantOf(session.header, rootId, headers)))
+  return sumBudget(
+    rootId,
+    runId,
+    limitTokens,
+    sessions.filter(session => isDescendantOf(session.header, rootId, headers)),
+  )
 }
 
 async function durableTokenBudgetState(
@@ -352,64 +431,74 @@ async function durableTokenBudgetState(
   rootId: string,
   runId: string,
   limitTokens: number,
-  cache: Map<string, { revision: string; runId: string | undefined; tokens: TokenBuckets | undefined }>,
+  cache: Map<string, { revision: string; session: RuntimeSession }>,
 ): Promise<TokenBudgetState> {
   const live = new Map(ctx.sessions.list().map(session => [session.header.id, session]))
   const snapshots = await ctx.sessionPersistence.listSnapshots()
   const headers = new Map(snapshots.map(snapshot => [snapshot.header.id, snapshot.header]))
   for (const session of live.values()) headers.set(session.header.id, session.header)
   const related = [...headers.values()].filter(header => isDescendantOf(header, rootId, headers))
-  const liveState = sumBudget(runId, limitTokens, related.flatMap(header => {
-    const current = live.get(header.id)
-    return current === undefined ? [] : [current]
-  }))
-  const buckets: TokenBuckets = {
-    uncachedInputTokens: liveState.uncachedInputTokens,
-    outputTokens: liveState.outputTokens,
-    cacheReadTokens: liveState.cacheReadTokens,
-    cacheWriteTokens: liveState.cacheWriteTokens,
-  }
-  let counted = liveState.sessions
   const revisions = new Map(snapshots.map(snapshot => [snapshot.header.id, snapshot.revision]))
+  const durableSessions: RuntimeSession[] = []
   for (const header of related) {
-    if (live.has(header.id)) continue
+    const resident = live.get(header.id)
+    if (resident !== undefined) {
+      durableSessions.push(resident)
+      continue
+    }
     const revision = revisions.get(header.id)
     if (revision === undefined) continue
     let cached = cache.get(header.id)
     if (cached?.revision !== revision) {
       const inspected = await ctx.sessionPersistence.inspect(header.id)
-      const identity = latestTaskIdentity(inspected.events)
       cached = {
         revision,
-        runId: identity?.runId,
-        tokens: identity?.runId === undefined
-          ? undefined
-          : ownRunTokens({ header: inspected.meta, events: inspected.events }, identity.runId),
+        session: { header: inspected.meta, events: inspected.events },
       }
       cache.set(header.id, cached)
     }
-    if (cached.runId !== runId || cached.tokens === undefined) continue
-    counted++
-    buckets.uncachedInputTokens += cached.tokens.uncachedInputTokens
-    buckets.outputTokens += cached.tokens.outputTokens
-    buckets.cacheReadTokens += cached.tokens.cacheReadTokens
-    buckets.cacheWriteTokens += cached.tokens.cacheWriteTokens
+    durableSessions.push(cached.session)
   }
   for (const id of cache.keys()) {
     if (!headers.has(id)) cache.delete(id)
   }
-  return budgetFromBuckets(runId, limitTokens, buckets, counted)
+  return sumBudget(rootId, runId, limitTokens, durableSessions)
 }
 
 const BUDGET_REASON = 'dsh-gate:token-budget-exhausted'
 const BUDGET_ACCOUNTING_REASON = 'dsh-gate:token-budget-accounting-failed'
 
-function cancelRun(ctx: SupervisorRuntimeContext, runId: string, reason: string): void {
+function cancelRun(ctx: SupervisorRuntimeContext, rootId: string, runId: string, reason: string): void {
+  const sessions = ctx.sessions.list()
+  const headers = new Map(sessions.map(session => [session.header.id, session.header]))
+  const related = sessions.filter(session => isDescendantOf(session.header, rootId, headers))
+  const root = related.find(session => session.header.id === rootId)
+  if (root === undefined) return
   for (const candidate of ctx.agents.list()) {
-    if (latestTaskIdentity(candidate.session.events)?.runId === runId) {
+    if (related.some(session => session.header.id === candidate.session.header.id)
+      && ownRunTokens(candidate.session, root, runId) !== undefined) {
       candidate.cancel({ kind: 'hook', reason })
     }
   }
+}
+
+function budgetIdentityForSession(
+  session: RuntimeSession,
+  sessions: readonly RuntimeSession[],
+): TaskIdentity | undefined {
+  const headers = new Map(sessions.map(candidate => [candidate.header.id, candidate.header]))
+  const candidates = sessions.flatMap((root) => {
+    if (!isDescendantOf(session.header, root.header.id, headers)) return []
+    const boundary = latestTaskIdentityBoundary(root.events)
+    if (boundary?.identity.schemaVersion !== 2
+      || boundary.identity.sessionId !== root.header.id
+      || boundary.identity.runId === undefined
+      || boundary.identity.tokenBudget === undefined
+      || ownRunTokens(session, root, boundary.identity.runId) === undefined) return []
+    return [{ identity: boundary.identity, time: boundary.boundaryTime ?? -1, seq: boundary.boundarySeq }]
+  })
+  candidates.sort((left, right) => left.time - right.time || left.seq - right.seq)
+  return candidates.at(-1)?.identity
 }
 
 function budgetReason(state: TokenBudgetState): string {
@@ -522,17 +611,9 @@ export function reportedFailureDecision(
   return { count, exhausted: count >= budget }
 }
 
-export function apply(ctx: Context, config: Config = {}): void {
-  const resolved = Config(config) as Required<Config>
-  const runtime = ctx as unknown as SupervisorRuntimeContext
-  ctx.effect(() => registerTaskAdmissionRoute(
-    runtime.webServer,
-    new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
-  ), 'dsh-gate task admission route')
-  const durableUsageCache = new Map<
-    string,
-    { revision: string; runId: string | undefined; tokens: TokenBuckets | undefined }
-  >()
+/** Install Host-owned live and post-restart token-budget enforcement. */
+export function installTokenBudgetGuards(runtime: SupervisorRuntimeContext): void {
+  const durableUsageCache = new Map<string, { revision: string; session: RuntimeSession }>()
 
   // The guard lives in the independently owned Host process, so loss of the
   // MCP/Codex client cannot reset or disable it. A stream usage sample gives an
@@ -540,27 +621,43 @@ export function apply(ctx: Context, config: Config = {}): void {
   // descendants so Host restart and completed children remain accounted for.
   runtime.on('session/event', (session, event) => {
     if (usageSample(event) === undefined) return
-    const packet = latestTaskIdentity(session.events)
+    const sessions = runtime.sessions.list()
+    const packet = budgetIdentityForSession(session, sessions)
     if (packet?.schemaVersion !== 2 || packet.runId === undefined || packet.tokenBudget === undefined) return
-    const state = liveTokenBudgetState(runtime.sessions.list(), packet.sessionId, packet.runId, packet.tokenBudget)
-    if (state.exhausted) cancelRun(runtime, packet.runId, budgetReason(state))
+    const state = liveTokenBudgetState(sessions, packet.sessionId, packet.runId, packet.tokenBudget)
+    if (state.exhausted) cancelRun(runtime, packet.sessionId, packet.runId, budgetReason(state))
   })
 
   runtime.on('agent/pre-step', async ({ agent }, next) => {
-    const packet = latestTaskIdentity(agent.session.events)
+    const packet = budgetIdentityForSession(agent.session, runtime.sessions.list())
     if (packet?.schemaVersion !== 2 || packet.runId === undefined || packet.tokenBudget === undefined) return next()
     try {
       const state = await durableTokenBudgetState(
         runtime, packet.sessionId, packet.runId, packet.tokenBudget, durableUsageCache,
       )
       if (!state.exhausted) return next()
-      cancelRun(runtime, packet.runId, budgetReason(state))
+      cancelRun(runtime, packet.sessionId, packet.runId, budgetReason(state))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      cancelRun(runtime, packet.runId, `${BUDGET_ACCOUNTING_REASON};runId=${packet.runId};error=${message.slice(0, 256)}`)
+      cancelRun(
+        runtime,
+        packet.sessionId,
+        packet.runId,
+        `${BUDGET_ACCOUNTING_REASON};runId=${packet.runId};error=${message.slice(0, 256)}`,
+      )
     }
     return { kind: 'reject' }
   })
+}
+
+export function apply(ctx: Context, config: Config = {}): void {
+  const resolved = Config(config) as Required<Config>
+  const runtime = ctx as unknown as SupervisorRuntimeContext
+  ctx.effect(() => registerTaskAdmissionRoute(
+    runtime.webServer,
+    new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
+  ), 'dsh-gate task admission route')
+  installTokenBudgetGuards(runtime)
 
   ctx.systemPrompt.section({
     name: 'tool:supervisor-handoff',

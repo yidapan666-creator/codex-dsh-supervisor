@@ -50,7 +50,11 @@ Codex must surface aggregated progress during long runs and repeat root step/too
 
 When a task packet carries a token budget, the Host folds provider-reported
 usage with DSH's streaming/final replacement semantics, excludes inherited
-child seed usage, and aggregates the root plus durable descendants. Reaching
+child seed usage, and aggregates the root plus durable descendants. Run
+affiliation is derived without an extra model call from durable lineage, the
+root task-packet window, and each descendant's accepted-work boundary. This
+covers spawn, fork, nested descendants, and a continuable child that accepts
+new work in a later run while excluding its earlier work. Reaching
 the limit cancels the run tree with a durable hook reason and yields
 `ESCALATION_REQUIRED/token-budget-exhausted`; the current in-flight model
 responses across concurrent agents bound overshoot. Ordinary observations label their visible budget
