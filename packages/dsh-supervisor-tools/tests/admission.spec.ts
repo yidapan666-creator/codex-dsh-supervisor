@@ -33,6 +33,7 @@ function request(runId = firstRunId, requestDigest = digest): TaskAdmissionReque
     requestDigest,
     runId,
     prompt: `atomic work\n\n<dsh-supervised-task>\n${JSON.stringify(packet)}\n</dsh-supervised-task>`,
+    modelSelection: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
   }
 }
 
@@ -40,13 +41,13 @@ function harness(options: { running?: boolean; seed?: ReturnType<typeof inboxEve
   coordinator: TaskAdmissionCoordinator
   events: ReturnType<typeof inboxEvent>[]
   pending: Array<{ id: string; content: unknown[] }>
-  calls: { prompt: number; flush: number; rearm: number }
+  calls: { prompt: number; flush: number; rearm: number; selectModel: number }
 } {
   const events = [...(options.seed ?? [])]
   const pending = events.flatMap(event => event.type === 'agent/inbox/spliced'
     ? ((event.data as { inserted?: Array<{ id: string; content: unknown[] }> }).inserted ?? [])
     : [])
-  const calls = { prompt: 0, flush: 0, rearm: 0 }
+  const calls = { prompt: 0, flush: 0, rearm: 0, selectModel: 0 }
   const agent: {
     status: 'idle' | 'running'
     session: { header: { id: string }; events: typeof events }
@@ -84,6 +85,10 @@ function harness(options: { running?: boolean; seed?: ReturnType<typeof inboxEve
     sessions: { flush: async () => { calls.flush++; return true } },
     apiProxy: {
       sessions: {
+        selectModel: async () => {
+          calls.selectModel++
+          return { result: { ok: true as const, value: {} } }
+        },
         prompt: async (input) => {
           calls.prompt++
           const message = {
@@ -123,7 +128,109 @@ describe('Host task admission', () => {
     expect(first).toMatchObject({ runId: firstRunId, reconciled: false })
     expect(second).toMatchObject({ runId: firstRunId, reconciled: true })
     expect(test.calls).toMatchObject({ prompt: 1, flush: 1 })
+    expect(test.calls.selectModel).toBe(1)
     expect(test.events).toHaveLength(1)
+  })
+
+  it('serializes writer admission across sessions in one Host worktree domain', async () => {
+    const first = request()
+    const secondRequestId = '55555555-5555-4555-8555-555555555555'
+    const secondRun = '66666666-6666-4666-8666-666666666666'
+    const secondPacket = {
+      schemaVersion: 2, sessionId: 's2', runId: secondRun,
+      completionToken: '77777777-7777-4777-8777-777777777777',
+      requestId: secondRequestId, requestDigest: 'b'.repeat(64), objective: 'other writer', writerMode: 'writer',
+    }
+    const second: TaskAdmissionRequest = {
+      schemaVersion: 1, sessionId: 's2', requestId: secondRequestId, requestDigest: 'b'.repeat(64), runId: secondRun,
+      prompt: `other writer\n\n<dsh-supervised-task>\n${JSON.stringify(secondPacket)}\n</dsh-supervised-task>`,
+      modelSelection: { provider: 'provider-b', model: 'model-b' },
+    }
+    first.prompt = first.prompt.replace('"writerMode":"read_only"', '"writerMode":"writer"')
+    const agents = [
+      { id: 's1', cwd: '/work/tree/a', request: first, events: [] as ReturnType<typeof inboxEvent>[], status: 'idle' as 'idle' | 'running' },
+      { id: 's2', cwd: '/work/tree/b', request: second, events: [] as ReturnType<typeof inboxEvent>[], status: 'idle' as 'idle' | 'running' },
+    ]
+    let prompts = 0
+    let selections = 0
+    const runtime: TaskAdmissionRuntime = {
+      agents: {
+        list: () => agents.map(entry => ({
+          status: entry.status,
+          session: { header: { id: entry.id, cwd: entry.cwd }, events: entry.events },
+          inbox: { nextTurn: [], nextStep: [], remove: () => false },
+          followup: () => undefined,
+        })),
+      },
+      sessions: { flush: async () => true },
+      apiProxy: {
+        sessions: {
+          selectModel: async () => { selections++; return { result: { ok: true as const, value: {} } } },
+          prompt: async (input) => {
+            prompts++
+            const entry = agents.find(candidate => candidate.id === input.payload.sessionId)
+            if (entry === undefined) throw new Error('missing test agent')
+            entry.events.push(inboxEvent(entry.events.length, {
+              id: `message-${entry.id}`, content: input.payload.content,
+            }))
+            entry.status = 'running'
+            return { result: { ok: true as const, value: { accepted: true as const } } }
+          },
+        },
+      },
+    }
+    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/work/tree')
+
+    const results = await Promise.allSettled([coordinator.admit(first), coordinator.admit(second)])
+
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = results.find(result => result.status === 'rejected') as PromiseRejectedResult
+    expect(rejected.reason).toMatchObject<TaskAdmissionError>({ code: 'WRITER_CONFLICT' })
+    expect(prompts).toBe(1)
+    expect(selections).toBe(1)
+  })
+
+  it('keeps the root writer lease while an affiliated descendant is still running', async () => {
+    const first = request()
+    first.prompt = first.prompt.replace('"writerMode":"read_only"', '"writerMode":"writer"')
+    const secondRequestId = '55555555-5555-4555-8555-555555555555'
+    const secondRun = '66666666-6666-4666-8666-666666666666'
+    const secondPacket = {
+      schemaVersion: 2, sessionId: 's2', runId: secondRun,
+      completionToken: '77777777-7777-4777-8777-777777777777',
+      requestId: secondRequestId, requestDigest: 'b'.repeat(64), objective: 'second writer', writerMode: 'writer',
+    }
+    const second: TaskAdmissionRequest = {
+      schemaVersion: 1, sessionId: 's2', requestId: secondRequestId, requestDigest: 'b'.repeat(64), runId: secondRun,
+      prompt: `second writer\n\n<dsh-supervised-task>\n${JSON.stringify(secondPacket)}\n</dsh-supervised-task>`,
+      modelSelection: { provider: 'provider-b', model: 'model-b' },
+    }
+    const rootEvents: Array<{ type: string; seq: number; data: unknown }> = []
+    const agents = [
+      { status: 'idle' as 'idle' | 'running', session: { header: { id: 's1', cwd: '/worktree/a' }, events: rootEvents } },
+      { status: 'running' as 'idle' | 'running', session: { header: { id: 'child', parentSession: 's1' }, events: [] } },
+      { status: 'idle' as 'idle' | 'running', session: { header: { id: 's2', cwd: '/worktree/b' }, events: [] } },
+    ]
+    const runtime: TaskAdmissionRuntime = {
+      agents: { list: () => agents.map(agent => ({
+        ...agent,
+        inbox: { nextTurn: [], nextStep: [], remove: () => false },
+        followup: () => undefined,
+      })) },
+      sessions: { flush: async () => true },
+      apiProxy: { sessions: {
+        selectModel: async () => ({ result: { ok: true as const, value: {} } }),
+        prompt: async (input) => {
+          rootEvents.push(inboxEvent(1, { id: 'root-task', content: input.payload.content }))
+          return { result: { ok: true as const, value: { accepted: true as const } } }
+        },
+      } },
+    }
+    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/worktree')
+    await coordinator.admit(first)
+    rootEvents.push({ type: 'turn/end', seq: 2, data: { turn: 1 } })
+
+    await expect(coordinator.admit(second)).rejects.toMatchObject({ code: 'WRITER_CONFLICT' })
   })
 
   it('rejects reuse of a durable request id with a different digest', async () => {

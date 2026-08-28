@@ -1,4 +1,5 @@
 /** DSH tools that make an external supervisor handoff explicit and durable. */
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -65,6 +66,7 @@ export const HANDOFF_ARTIFACTS_LIMIT = 16
 export const HANDOFF_ARTIFACT_PATH_LIMIT = 512
 /** Ordinary semantic progress records are accepted at most once per minute. */
 export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
+export const TOKEN_BUDGET_STATE_PATH = '/api/dsh-gate.budget-state'
 
 /**
  * Validate the handoff summary length. Returns undefined when the summary is at
@@ -379,6 +381,20 @@ export interface TokenBudgetState extends TokenBuckets {
   sessions: number
 }
 
+export interface TokenBudgetStateRequest {
+  schemaVersion: 1
+  sessionId: string
+  runId: string
+}
+
+export interface TokenBudgetStateReceipt extends TokenBudgetState {
+  schemaVersion: 1
+  sessionId: string
+  coverage: 'run_tree'
+  enforcement: 'DSH_HOST_RUNTIME'
+  overshootBound: 'IN_FLIGHT_MODEL_RESPONSES'
+}
+
 function tokenNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
 }
@@ -612,7 +628,101 @@ async function durableTokenBudgetState(
   return sumBudget(rootId, runId, limitTokens, durableSessions)
 }
 
+async function budgetRootSession(
+  ctx: SupervisorRuntimeContext,
+  sessionId: string,
+): Promise<RuntimeSession | undefined> {
+  const resident = ctx.sessions.list().find(session => session.header.id === sessionId)
+  if (resident !== undefined) return resident
+  const snapshots = await ctx.sessionPersistence.listSnapshots()
+  if (!snapshots.some(snapshot => snapshot.header.id === sessionId)) return undefined
+  const inspected = await ctx.sessionPersistence.inspect(sessionId)
+  return { header: inspected.meta, events: inspected.events }
+}
+
+/** Read-only Host projection of the same durable run-tree accounting used by the guards. */
+export async function tokenBudgetStateForRun(
+  ctx: SupervisorRuntimeContext,
+  request: TokenBudgetStateRequest,
+): Promise<TokenBudgetStateReceipt> {
+  if (request.schemaVersion !== 1 || request.sessionId.trim() === '' || !UUID_PATTERN.test(request.runId)) {
+    throw new Error('invalid token budget state request')
+  }
+  const root = await budgetRootSession(ctx, request.sessionId)
+  if (root === undefined) throw new Error(`DSH session not found: ${request.sessionId}`)
+  const boundary = ownTaskBoundaries(root).findLast(candidate => candidate.identity.schemaVersion === 2
+    && candidate.identity.sessionId === request.sessionId
+    && candidate.identity.runId === request.runId)
+  if (boundary?.identity.tokenBudget === undefined) {
+    throw new Error(`run ${request.runId} has no Host-enforced token budget`)
+  }
+  const state = await durableTokenBudgetState(
+    ctx,
+    request.sessionId,
+    request.runId,
+    boundary.identity.tokenBudget,
+    new Map(),
+  )
+  return {
+    schemaVersion: 1,
+    sessionId: request.sessionId,
+    ...state,
+    coverage: 'run_tree',
+    enforcement: 'DSH_HOST_RUNTIME',
+    overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
+  }
+}
+
+/** Register a bounded Host-local endpoint for budget observability without a model call. */
+export function registerTokenBudgetStateRoute(
+  webServer: SupervisorRuntimeContext['webServer'],
+  runtime: SupervisorRuntimeContext,
+): () => void {
+  return webServer.register({
+    kind: 'exact',
+    path: TOKEN_BUDGET_STATE_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      let rpcId = 'invalid'
+      const send = (result: unknown): void => {
+        if (res.destroyed) return
+        const body = JSON.stringify({ type: 'server-response', rpcId, result })
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'content-length': Buffer.byteLength(body),
+        })
+        res.end(body)
+      }
+      try {
+        if (req.method !== 'POST') throw new Error('token budget state requires POST')
+        const chunks: Buffer[] = []
+        let size = 0
+        for await (const chunk of req) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          size += buffer.length
+          if (size > 16 * 1024) throw new Error('token budget state body is too large')
+          chunks.push(buffer)
+        }
+        const envelope = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>
+        if (envelope.type !== 'client-request' || typeof envelope.rpcId !== 'string'
+          || envelope.method !== 'dsh-gate.budget-state') {
+          throw new Error('invalid token budget state request envelope')
+        }
+        rpcId = envelope.rpcId
+        const value = await tokenBudgetStateForRun(runtime, envelope.payload as TokenBudgetStateRequest)
+        send({ ok: true, value })
+      } catch (error) {
+        send({ ok: false, error: {
+          code: 'BUDGET_STATE_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+        } })
+      }
+    },
+  })
+}
+
 const BUDGET_REASON = 'dsh-gate:token-budget-exhausted'
+const BUDGET_REQUEST_REASON = 'dsh-gate:token-budget-request-rejected'
 const BUDGET_ACCOUNTING_REASON = 'dsh-gate:token-budget-accounting-failed'
 
 type BudgetReservation = {
@@ -1018,9 +1128,13 @@ export function installTokenBudgetGuards(
           const runReservations = reservations.get(runKey) ?? new Map<string, BudgetReservation>()
           const otherReserved = reservedTokens(runReservations, requestKey)
           const actualRemaining = state.remainingTokens
-          if (state.exhausted || actualRemaining <= inputTokens) {
+          if (state.exhausted) {
             runReservations.delete(requestKey)
             return { kind: 'exhausted' as const, state }
+          }
+          if (actualRemaining <= inputTokens) {
+            runReservations.delete(requestKey)
+            return { kind: 'insufficient' as const, state, inputTokens }
           }
           const available = actualRemaining - otherReserved
           if (available <= inputTokens) {
@@ -1050,6 +1164,11 @@ export function installTokenBudgetGuards(
         cancelRun(runtime, rootId, runId, budgetReason(admission.state))
         return proposed
       }
+      if (admission.kind === 'insufficient') {
+        cancelRun(runtime, rootId, runId,
+          `${BUDGET_REQUEST_REASON};runId=${runId};used=${admission.state.usedTokens};limit=${tokenBudget};remaining=${admission.state.remainingTokens};requiredInput=${admission.inputTokens}`)
+        return proposed
+      }
       const message = admission.error instanceof Error ? admission.error.message : String(admission.error)
       cancelRun(runtime, rootId, runId,
         `${BUDGET_ACCOUNTING_REASON};runId=${runId};error=${message.slice(0, 256)}`)
@@ -1069,6 +1188,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.webServer,
     new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
   ), 'dsh-gate task admission route')
+  ctx.effect(() => registerTokenBudgetStateRoute(
+    runtime.webServer,
+    runtime,
+  ), 'dsh-gate token budget state route')
   installDirectChildAuthorityGuards(runtime, { directChildToolNames })
   installTokenBudgetGuards(runtime, {
     maxReservedOutputTokensPerRequest: resolved.maxReservedOutputTokensPerRequest,

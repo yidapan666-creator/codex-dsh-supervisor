@@ -32,4 +32,39 @@ describe('file run journal', () => {
     const directory = await mkdtemp(join(tmpdir(), 'dsh-run-journal-'))
     await expect(new FileRunJournal(directory).record({ ...record(), recordId: 'wrong' })).rejects.toThrow(/identity/)
   })
+
+  it('publishes exactly one winner under concurrent terminal writes', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-run-journal-'))
+    const journal = new FileRunJournal(directory)
+
+    const results = await Promise.all(Array.from({ length: 16 }, () => journal.record(record())))
+
+    expect(results.filter(result => result.created)).toHaveLength(1)
+    expect(results.every(result => result.recordId === record().recordId)).toBe(true)
+    expect(await journal.list()).toHaveLength(1)
+  })
+
+  it('bounds retention and reads records through opaque cursor pages', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-run-journal-'))
+    const journal = new FileRunJournal(directory, {
+      maxRecords: 2, maxAgeMs: 60_000, maxBytes: 1_000_000,
+    })
+    for (let index = 0; index < 3; index++) {
+      const sessionId = `session-${index}`
+      const runId = `11111111-1111-4111-8111-11111111111${index}`
+      await journal.record({
+        ...record(), sessionId, runId, recordId: runRecordId(sessionId, runId),
+        recordedAt: `2026-08-26T00:00:0${index}.000Z`,
+      })
+      await new Promise(resolve => setTimeout(resolve, 2))
+    }
+
+    expect(await journal.list()).toHaveLength(2)
+    const first = await journal.page({ limit: 1 })
+    expect(first.records).toHaveLength(1)
+    expect(first.nextCursor).toEqual(expect.any(String))
+    const second = await journal.page({ limit: 1, cursor: first.nextCursor })
+    expect(second.records).toHaveLength(1)
+    expect(second.nextCursor).toBeUndefined()
+  })
 })

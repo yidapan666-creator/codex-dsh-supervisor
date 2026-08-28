@@ -21,7 +21,7 @@
     "host:start": "node scripts/dsh-gate.mjs host start",
     "host:status": "node scripts/dsh-gate.mjs host status",
     "host:stop": "node scripts/dsh-gate.mjs host stop",
-    "verify": "pnpm check && pnpm test && pnpm build"
+    "verify": "pnpm build && pnpm check && pnpm test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

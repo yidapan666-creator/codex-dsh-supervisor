@@ -3,6 +3,7 @@ import {
   installDirectChildAuthorityGuards,
   installTokenBudgetGuards,
   liveTokenBudgetState,
+  tokenBudgetStateForRun,
 } from '../src/index.js'
 
 const runId = '11111111-1111-4111-8111-111111111111'
@@ -44,6 +45,29 @@ const usage = (seq: number, time: number, turn: number, step: number, inputToken
 })
 
 describe('Host token budget fold', () => {
+  it('exposes the durable run-tree projection without a model call', async () => {
+    const root = {
+      header: { id: 'root' },
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, 60, 40)],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 120, parentSession: 'root' },
+      events: [userMessage(0, 121), usage(1, 130, 1, 1, 30, 20)],
+    }
+    const result = await tokenBudgetStateForRun({
+      sessions: { list: () => [root] },
+      sessionPersistence: {
+        listSnapshots: async () => [{ header: child.header, revision: 'child-r1' }],
+        inspect: async () => ({ meta: child.header, events: child.events }),
+      },
+    } as never, { schemaVersion: 1, sessionId: 'root', runId })
+
+    expect(result).toMatchObject({
+      sessionId: 'root', runId, limitTokens: 150, usedTokens: 150,
+      sessions: 2, coverage: 'run_tree', enforcement: 'DSH_HOST_RUNTIME',
+    })
+  })
+
   it('aggregates a fork child suffix without double-counting its inherited seed', () => {
     const root = {
       header: { id: 'root' },

@@ -2,6 +2,9 @@ export interface UsageMonitorObservation {
   source: 'dsh-usage-monitor'
   authoritativeForBudget: false
   available: boolean
+  found: boolean
+  scope: 'session_lifetime'
+  includesDescendants: false
   sessionRawTokens?: number
   requestCount?: number
   warning?: string
@@ -43,6 +46,9 @@ export class UsageMonitorClient {
         source: 'dsh-usage-monitor',
         authoritativeForBudget: false,
         available: true,
+        found: row !== undefined,
+        scope: 'session_lifetime',
+        includesDescendants: false,
         ...sessionRawTokens === undefined ? {} : { sessionRawTokens },
         ...requestCount === undefined ? {} : { requestCount },
       }
@@ -54,6 +60,9 @@ export class UsageMonitorClient {
         source: 'dsh-usage-monitor',
         authoritativeForBudget: false,
         available: false,
+        found: false,
+        scope: 'session_lifetime',
+        includesDescendants: false,
         warning: `optional usage monitor unavailable (${code})`,
       }
     }

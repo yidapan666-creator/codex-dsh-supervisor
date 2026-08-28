@@ -32,6 +32,27 @@ function handoffEvents(includeTurnEnd = true): DshEvent[] {
 }
 
 describe('authoritative completion fold', () => {
+  it('recognizes an atomically admitted task from the durable inbox before user/message materializes', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'newly admitted',
+      writerMode: 'read_only',
+    }
+    const admitted = event('agent/inbox/spliced', 6, {
+      inserted: [{
+        id: 'message-1',
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }],
+    })
+
+    expect(deriveObservation(state([admitted], { workerState: 'RUNNING' }))).toMatchObject({
+      status: 'WAITING', sessionId: 's1', runId: packetV2.runId, objective: 'newly admitted',
+    })
+  })
+
   it('requires both a valid handoff result and the corresponding turn end', () => {
     expect(deriveObservation(state(handoffEvents(false))).status).toBe('WAITING')
     const complete = deriveObservation(state(handoffEvents()))
@@ -657,6 +678,37 @@ describe('project activity summarization', () => {
       },
     })
     expect(observationSchema.safeParse(observed).success).toBe(true)
+  })
+
+  it('distinguishes a request that cannot fit from already-consumed budget exhaustion', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'bounded work',
+      writerMode: 'read_only',
+      budget: { maxTokens: 8_000 },
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('turn/end', 2, {
+        turn: 1,
+        reason: { kind: 'aborted', reason: { kind: 'hook', reason: `dsh-gate:token-budget-request-rejected;runId=${packetV2.runId};used=0;limit=8000;remaining=8000;requiredInput=12000` } },
+      }),
+    ]))
+    expect(observed).toMatchObject({
+      status: 'ESCALATION_REQUIRED',
+      stage: 'token-budget-request-rejected',
+      budget: {
+        limitTokens: 8_000, observedTokens: 0, remainingTokens: 8_000,
+        exhausted: false, coverage: 'run_tree',
+      },
+    })
+    expect(observed.summary).toContain('12000 input tokens required')
   })
 
   it('requires an explicit continuation after Host crash recovery interrupts a turn', () => {

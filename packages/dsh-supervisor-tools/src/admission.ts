@@ -1,5 +1,7 @@
 /** Host-owned atomic admission for one supervised DSH task. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { lstat, realpath } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 export const TASK_ADMISSION_PATH = '/api/dsh-gate.admit'
 const TASK_PACKET_START = '<dsh-supervised-task>'
@@ -15,6 +17,11 @@ export interface TaskAdmissionRequest {
   requestDigest: string
   runId: string
   prompt: string
+  modelSelection: {
+    provider: string
+    model: string
+    reasoningEffort?: string
+  }
 }
 
 export interface TaskAdmissionReceipt {
@@ -31,6 +38,7 @@ export type TaskAdmissionErrorCode =
   | 'BAD_REQUEST'
   | 'SESSION_NOT_ATTACHED'
   | 'SESSION_BUSY'
+  | 'WRITER_CONFLICT'
   | 'REQUEST_ID_CONFLICT'
   | 'ADMISSION_CORRUPT'
   | 'PROMPT_REJECTED'
@@ -56,7 +64,7 @@ interface AdmissionEvent {
 }
 
 interface AdmissionSession {
-  header: { id: string }
+  header: { id: string; cwd?: string; parentSession?: string }
   events: readonly AdmissionEvent[]
 }
 
@@ -87,6 +95,18 @@ export interface TaskAdmissionRuntime {
         result: { ok: true; value: { accepted: true } }
           | { ok: false; error: { code: string; message: string } }
       }>
+      selectModel(request: {
+        rpcId: string
+        payload: {
+          sessionId: string
+          provider: string
+          model: string
+          reasoningEffort?: string
+        }
+      }): Promise<{
+        result: { ok: true; value: unknown }
+          | { ok: false; error: { code: string; message: string } }
+      }>
     }
   }
 }
@@ -97,7 +117,33 @@ interface PacketIdentity {
   requestId: string
   requestDigest: string
   runId: string
+  writerMode: 'writer' | 'read_only'
   seq: number
+}
+
+type ValidatedTaskAdmissionRequest = TaskAdmissionRequest & {
+  writerMode: 'writer' | 'read_only'
+}
+
+/** Resolve the nearest Git worktree root, or the exact canonical cwd outside Git. */
+export async function resolveAdmissionWriterDomain(cwd: string): Promise<string> {
+  const resolved = await realpath(cwd)
+  let candidate = resolved
+  while (true) {
+    try {
+      await lstat(join(candidate, '.git'))
+      return candidate
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
+    }
+    const parent = dirname(candidate)
+    if (parent === candidate) break
+    candidate = parent
+  }
+  return resolved
 }
 
 function contentText(value: unknown): string {
@@ -147,6 +193,9 @@ function packetIdentities(events: readonly AdmissionEvent[]): PacketIdentity[] {
               requestId: value.requestId,
               requestDigest: value.requestDigest,
               runId: value.runId,
+              // Schema-v2 packets require writerMode. Treat malformed/older
+              // packets as writers so admission fails closed.
+              writerMode: value.writerMode === 'read_only' ? 'read_only' : 'writer',
               seq: event.seq,
             })
           }
@@ -158,7 +207,7 @@ function packetIdentities(events: readonly AdmissionEvent[]): PacketIdentity[] {
   return identities
 }
 
-function validateRequest(value: unknown): TaskAdmissionRequest {
+function validateRequest(value: unknown): ValidatedTaskAdmissionRequest {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TaskAdmissionError('BAD_REQUEST', 'admission payload must be an object')
   }
@@ -168,7 +217,12 @@ function validateRequest(value: unknown): TaskAdmissionRequest {
     || typeof candidate.requestId !== 'string' || !UUID_PATTERN.test(candidate.requestId)
     || typeof candidate.requestDigest !== 'string' || !DIGEST_PATTERN.test(candidate.requestDigest)
     || typeof candidate.runId !== 'string' || !UUID_PATTERN.test(candidate.runId)
-    || typeof candidate.prompt !== 'string' || candidate.prompt.length === 0) {
+    || typeof candidate.prompt !== 'string' || candidate.prompt.length === 0
+    || typeof candidate.modelSelection !== 'object' || candidate.modelSelection === null
+    || typeof (candidate.modelSelection as Record<string, unknown>).provider !== 'string'
+    || typeof (candidate.modelSelection as Record<string, unknown>).model !== 'string'
+    || ((candidate.modelSelection as Record<string, unknown>).reasoningEffort !== undefined
+      && typeof (candidate.modelSelection as Record<string, unknown>).reasoningEffort !== 'string')) {
     throw new TaskAdmissionError('BAD_REQUEST', 'invalid task admission payload')
   }
   if (Buffer.byteLength(candidate.prompt, 'utf8') > MAX_ADMISSION_BODY_BYTES) {
@@ -183,36 +237,51 @@ function validateRequest(value: unknown): TaskAdmissionRequest {
     || embedded.runId !== candidate.runId) {
     throw new TaskAdmissionError('BAD_REQUEST', 'outer admission identity does not match the embedded task packet')
   }
-  return candidate as unknown as TaskAdmissionRequest
+  return { ...(candidate as unknown as TaskAdmissionRequest), writerMode: embedded.writerMode }
 }
 
 /** Serializes admissions per durable session and commits the inbox insertion before returning. */
 export class TaskAdmissionCoordinator {
   private readonly tails = new Map<string, Promise<void>>()
 
-  constructor(private readonly runtime: TaskAdmissionRuntime) {}
+  constructor(
+    private readonly runtime: TaskAdmissionRuntime,
+    private readonly resolveWriterDomain: (cwd: string) => Promise<string> = resolveAdmissionWriterDomain,
+  ) {}
 
   async admit(input: unknown): Promise<TaskAdmissionReceipt> {
     const request = validateRequest(input)
-    return this.exclusive(request.sessionId, () => this.admitExclusive(request))
+    return this.exclusive(`session:${request.sessionId}`, async () => {
+      if (request.writerMode === 'read_only') return this.admitExclusive(request)
+      const agent = this.runtime.agents.list().find(candidate => candidate.session.header.id === request.sessionId)
+      const cwd = agent?.session.header.cwd
+      if (cwd === undefined) {
+        throw new TaskAdmissionError('BAD_REQUEST', `writer session ${request.sessionId} has no authoritative cwd`)
+      }
+      const domain = await this.resolveWriterDomain(cwd)
+      return this.exclusive(`writer:${domain}`, () => this.admitExclusive(request, domain))
+    })
   }
 
-  private async exclusive<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.tails.get(sessionId) ?? Promise.resolve()
+  private async exclusive<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve()
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })
     const tail = previous.then(() => gate)
-    this.tails.set(sessionId, tail)
+    this.tails.set(key, tail)
     await previous
     try {
       return await operation()
     } finally {
       release()
-      if (this.tails.get(sessionId) === tail) this.tails.delete(sessionId)
+      if (this.tails.get(key) === tail) this.tails.delete(key)
     }
   }
 
-  private async admitExclusive(request: TaskAdmissionRequest): Promise<TaskAdmissionReceipt> {
+  private async admitExclusive(
+    request: ValidatedTaskAdmissionRequest,
+    writerDomain?: string,
+  ): Promise<TaskAdmissionReceipt> {
     const agent = this.runtime.agents.list().find(candidate => candidate.session.header.id === request.sessionId)
     if (agent === undefined) {
       throw new TaskAdmissionError(
@@ -236,10 +305,36 @@ export class TaskAdmissionCoordinator {
       await this.rearmPendingAfterRestart(agent, matches)
       return this.receipt(request, matches[0]?.runId as string, true, agent.session.events.at(-1)?.seq ?? -1)
     }
+    if (writerDomain !== undefined) {
+      const owner = await this.activeWriterOwner(writerDomain)
+      if (owner !== undefined) {
+        throw new TaskAdmissionError(
+          'WRITER_CONFLICT',
+          `working tree already has writer session ${owner}; use read_only or an independent worktree`,
+        )
+      }
+    }
     if (agent.status !== 'idle') {
       throw new TaskAdmissionError(
         'SESSION_BUSY',
         `session ${request.sessionId} is already running; wait for its current supervised run before dispatching another`,
+      )
+    }
+    const selected = await this.runtime.apiProxy.sessions.selectModel({
+      rpcId: `${request.requestId}:model`,
+      payload: {
+        sessionId: request.sessionId,
+        provider: request.modelSelection.provider,
+        model: request.modelSelection.model,
+        ...request.modelSelection.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: request.modelSelection.reasoningEffort },
+      },
+    })
+    if (!selected.result.ok) {
+      throw new TaskAdmissionError(
+        'PROMPT_REJECTED',
+        `${selected.result.error.code}: ${selected.result.error.message}`,
       )
     }
     const response = await this.runtime.apiProxy.sessions.prompt({
@@ -272,6 +367,35 @@ export class TaskAdmissionCoordinator {
       throw new TaskAdmissionError('INTERNAL', 'durable inbox does not contain the admitted task identity')
     }
     return this.receipt(request, admitted.runId, false, admittedAgent.session.events.at(-1)?.seq ?? admitted.seq)
+  }
+
+  private async activeWriterOwner(domain: string): Promise<string | undefined> {
+    const agents = this.runtime.agents.list()
+    const headers = new Map(agents.map(candidate => [candidate.session.header.id, candidate.session.header]))
+    const isDescendant = (candidateId: string, rootId: string): boolean => {
+      let current = headers.get(candidateId)
+      const seen = new Set<string>()
+      while (current?.parentSession !== undefined) {
+        if (seen.has(current.id)) return false
+        seen.add(current.id)
+        if (current.parentSession === rootId) return true
+        current = headers.get(current.parentSession)
+      }
+      return false
+    }
+    for (const candidate of agents) {
+      const header = candidate.session.header
+      if (header.parentSession !== undefined || header.cwd === undefined) continue
+      const latest = packetIdentities(candidate.session.events).at(-1)
+      if (latest?.writerMode !== 'writer') continue
+      const rootEnded = candidate.session.events.some(event => event.type === 'turn/end' && event.seq > latest.seq)
+      const descendantRunning = agents.some(agent => agent.status === 'running'
+        && isDescendant(agent.session.header.id, header.id))
+      const rootHasPendingWork = candidate.inbox.nextTurn.length > 0 || candidate.inbox.nextStep.length > 0
+      if (rootEnded && !descendantRunning && !rootHasPendingWork) continue
+      if (await this.resolveWriterDomain(header.cwd) === domain) return header.id
+    }
+    return undefined
   }
 
   private async rearmPendingAfterRestart(agent: AdmissionAgent, matches: readonly PacketIdentity[]): Promise<void> {

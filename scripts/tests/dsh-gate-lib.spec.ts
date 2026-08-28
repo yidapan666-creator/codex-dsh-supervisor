@@ -9,6 +9,7 @@ import {
   DSH_FORK_URL,
   DSH_PINNED_COMMIT,
   checkLiveHost,
+  checkSessionModels,
   formatOutputTail,
   formatPhaseFailure,
   hostIsAlive,
@@ -102,9 +103,10 @@ describe('parseCliArgs', () => {
   })
 
   it('parses inline --flag=value forms', () => {
-    const { options } = parseCliArgs(['doctor', '--state=/tmp/s', '--live'])
+    const { options } = parseCliArgs(['doctor', '--state=/tmp/s', '--live', '--session', 'session-1'])
     expect(options.state).toBe('/tmp/s')
     expect(options.live).toBe(true)
+    expect(options.session).toBe('session-1')
   })
 
   it('parses host actions', () => {
@@ -112,6 +114,7 @@ describe('parseCliArgs', () => {
     expect(command).toBe('host')
     expect(hostAction).toBe('start')
     expect(options.host).toBe('http://127.0.0.1:9999')
+    expect(parseCliArgs(['host', 'run']).hostAction).toBe('run')
   })
 
   it('rejects unknown options', () => {
@@ -464,6 +467,28 @@ describe('checkLiveHost', () => {
   it('throws with the business error when the Host rejects the RPC', async () => {
     const io = makeFakeIo({ fetch: async () => ({ ok: true, json: async () => ({ result: { ok: false, error: { code: 'E_NO_HOST', message: 'nope' } } }) }) })
     await expect(checkLiveHost({ url: DEFAULT_HOST_URL, io })).rejects.toThrow(/E_NO_HOST: nope/)
+  })
+})
+
+describe('checkSessionModels', () => {
+  it('reads provider routing without issuing a model request', async () => {
+    const io = makeFakeIo({
+      fetch: async (url, init) => {
+        expect(url).toBe(`${DEFAULT_HOST_URL}/api/session.models`)
+        const body = JSON.parse(init.body)
+        expect(body).toMatchObject({ method: 'session.models', payload: { sessionId: 'session-1' } })
+        return {
+          ok: true,
+          json: async () => ({ result: { ok: true, value: {
+            current: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+            routable: true,
+            failures: [],
+          } } }),
+        }
+      },
+    })
+    await expect(checkSessionModels({ url: DEFAULT_HOST_URL, sessionId: 'session-1', io }))
+      .resolves.toMatchObject({ routable: true })
   })
 })
 

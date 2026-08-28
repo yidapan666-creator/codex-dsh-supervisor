@@ -5,7 +5,8 @@ import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/ne
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveSessionCwd, resolveWriterDomain, writerLeaseHeld,
+  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, HostDiscoveryError, attachChildObservations, resolveSessionCwd,
+  resolveWriterDomain, writerLeaseHeld,
 } from '../src/gateway.js'
 import { parseTaskPacket } from '../src/fold.js'
 import { HostConnection } from '../src/host.js'
@@ -20,7 +21,12 @@ afterEach(() => {
 })
 
 function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
-  const connection = new HostConnection(baseUrl, api.api, request => api.admitTask(request))
+  const connection = new HostConnection(
+    baseUrl,
+    api.api,
+    request => api.admitTask(request),
+    request => api.tokenBudgetState(request),
+  )
   live.push(connection)
   return connection
 }
@@ -276,6 +282,37 @@ describe('writer admission', () => {
       manager.task({ taskId: 's2', objective: 'write two' }),
     ])
     expect(results.every(result => result.status === 'fulfilled')).toBe(true)
+  })
+
+  it('fails closed for writers when more than one Host is configured', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = new GatewayManager({
+      hostUrls: ['http://host-one', 'http://host-two'], runJournal: false,
+    }, {
+      resolveWriterDomain: sameDomain,
+      createConnection: baseUrl => connected(api, baseUrl),
+    })
+
+    await expect(manager.task({ sessionId: 's1', objective: 'unsafe writer' }))
+      .rejects.toThrow(/exactly one configured DSH Host/)
+    await expect(manager.task({ sessionId: 's1', objective: 'safe review', writerMode: 'read_only' }))
+      .resolves.toMatchObject({ accepted: true, writerMode: 'read_only' })
+  })
+
+  it('passes the resolved model selection into atomic Host admission', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+
+    await manager.task({
+      sessionId: 's1', objective: 'model-bound work', writerMode: 'read_only',
+      provider: 'provider-a', model: 'model-a', reasoningEffort: 'medium',
+    })
+
+    expect(api.modelSelections).toEqual([{
+      sessionId: 's1', provider: 'provider-a', model: 'model-a', reasoningEffort: 'medium',
+    }])
   })
 })
 
@@ -544,6 +581,53 @@ describe('multi-Host reconnect', () => {
     await manager.task({ sessionId: 's-existing', objective: 'read it', writerMode: 'read_only' })
     expect(first.rows.has('s-existing')).toBe(false)
     expect(second.rows.get('s-existing')?.events).toHaveLength(1)
+  })
+
+  it('fails retryably when an unavailable Host prevents a conclusive session lookup', async () => {
+    const unavailable = {
+      baseUrl: 'http://host-one',
+      ensureConnected: async () => { throw new Error('connection refused') },
+    } as unknown as HostConnection
+    const reachable = {
+      baseUrl: 'http://host-two',
+      ensureConnected: async () => ({ protocolVersion: 1 }),
+      sessionExists: async () => false,
+    } as unknown as HostConnection
+    const manager = new GatewayManager({
+      hostUrls: ['http://host-one', 'http://host-two'], runJournal: false,
+    }, {
+      createConnection: baseUrl => baseUrl === 'http://host-one' ? unavailable : reachable,
+    })
+
+    await expect(manager.startOrConnect({ sessionId: 'session-on-offline-host' }))
+      .rejects.toMatchObject<HostDiscoveryError>({ name: 'HostDiscoveryError', retryable: true })
+  })
+
+  it('keeps healthy dsh_runs entries when another session on the Host is corrupt', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/good' })
+    let connection!: HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => {
+        connection = connected(api)
+        return connection
+      },
+    })
+    await manager.task({ sessionId: 's1', objective: 'healthy run', writerMode: 'read_only' })
+    api.addRow('bad', { cwd: '/work/bad' })
+    const refresh = connection.refreshSession.bind(connection)
+    connection.refreshSession = async sessionId => {
+      if (sessionId === 'bad') throw new Error('corrupt durable history')
+      return refresh(sessionId)
+    }
+
+    const runs = await manager.runs()
+
+    expect(runs).toMatchObject({
+      entries: [{ sessionId: 's1' }],
+      sessionErrors: [{ sessionId: 'bad', message: 'corrupt durable history' }],
+      unavailableHosts: 0,
+    })
   })
 
   it('restores a replayed pending interaction after the MCP manager restarts', async () => {
@@ -918,6 +1002,30 @@ describe('wait cadence', () => {
       status: 'COMPLETED',
       journal: { recorded: false, warning: 'run journal write failed (Error)' },
     })
+  })
+
+  it('journals a durable Host interruption but not a transient Host query failure', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [
+      s1Packet(1),
+      event('turn/start', 2, { turn: 1 }),
+      event('turn/end', 3, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const records: RunRecord[] = []
+    const journal: RunJournal = {
+      async record(value) { records.push(value); return { recordId: value.recordId, created: true } },
+      async get() { return undefined },
+      async list() { return records },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+
+    await expect(manager.wait({ sessionId: 's1', timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'FAILED', failure: { kind: 'HOST_FAILED' }, journal: { recorded: true },
+    })
+    expect(records).toHaveLength(1)
+    expect(records[0]?.failure?.kind).toBe('HOST_FAILED')
   })
 
   it('returns immediately for a pending approval', async () => {

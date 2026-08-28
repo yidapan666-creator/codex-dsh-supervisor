@@ -6,7 +6,10 @@ import type {
   HostDescription, HostFrame, IApiClient, MuxFrame, RpcRequest, SessionSummary,
 } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { DshEvent } from '../src/contracts.js'
-import type { TaskAdmissionReceipt, TaskAdmissionRequest } from '../src/host.js'
+import { parseTaskPacket } from '../src/fold.js'
+import type {
+  TaskAdmissionReceipt, TaskAdmissionRequest, TokenBudgetStateReceipt, TokenBudgetStateRequest,
+} from '../src/host.js'
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -25,6 +28,7 @@ export class FakeApi {
   historyCalls = 0
   listCalls = 0
   promptCalls = 0
+  readonly modelSelections: Array<{ sessionId: string; provider: string; model: string; reasoningEffort?: string }> = []
   failAfterAdmissionOnce = false
   private admissionTail: Promise<void> = Promise.resolve()
   private readonly admissions = new Map<string, TaskAdmissionReceipt>()
@@ -125,7 +129,10 @@ export class FakeApi {
         current: { provider: 'test-provider', model: 'test-model' },
         routable: true, groups: [], failures: [],
       }),
-      selectModel: async () => this.ok({ selected: true }),
+      selectModel: async (payload: { sessionId: string; provider: string; model: string; reasoningEffort?: string }) => {
+        this.modelSelections.push(payload)
+        return this.ok({ selected: true })
+      },
       prompt: async (payload: { sessionId: string; content: { type: string; text: string }[] }) => {
         this.promptCalls++
         const row = this.rows.get(payload.sessionId)
@@ -185,6 +192,14 @@ export class FakeApi {
         }
         return { ...existing, reconciled: true }
       }
+      await this.api.sessions.selectModel({
+        sessionId: request.sessionId as never,
+        provider: request.modelSelection.provider,
+        model: request.modelSelection.model,
+        ...request.modelSelection.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: request.modelSelection.reasoningEffort },
+      } as never)
       const prompt = await this.api.sessions.prompt({
         sessionId: request.sessionId as never,
         mode: 'queue',
@@ -209,6 +224,65 @@ export class FakeApi {
       return receipt
     } finally {
       release()
+    }
+  }
+
+  async tokenBudgetState(request: TokenBudgetStateRequest): Promise<TokenBudgetStateReceipt> {
+    const related = new Set([request.sessionId])
+    const visit = (parent: string): void => {
+      for (const child of this.childCatalog.get(parent) ?? []) {
+        related.add(child.id)
+        visit(child.id)
+      }
+    }
+    visit(request.sessionId)
+    let limitTokens = 0
+    let uncachedInputTokens = 0
+    let outputTokens = 0
+    let cacheReadTokens = 0
+    let cacheWriteTokens = 0
+    let minimumUsedTokens = 0
+    const rootPacket = parseTaskPacket(this.rows.get(request.sessionId)?.events ?? [])
+    if (rootPacket?.schemaVersion === 2 && rootPacket.runId === request.runId) {
+      limitTokens = rootPacket.budget?.maxTokens ?? 0
+    }
+    for (const id of related) {
+      for (const event of this.rows.get(id)?.events ?? []) {
+        const text = JSON.stringify(event.data)
+        const hook = text.match(new RegExp(`token-budget-exhausted;runId=${request.runId};used=(\\d+);limit=(\\d+)`))
+        if (hook !== null) {
+          minimumUsedTokens = Math.max(minimumUsedTokens, Number(hook[1]))
+          limitTokens = Number(hook[2])
+        }
+        const data = event.data as { usage?: Record<string, unknown> }
+        if (event.type === 'assistant/message' && data.usage !== undefined) {
+          uncachedInputTokens += Number(data.usage.inputTokens ?? 0)
+          outputTokens += Number(data.usage.outputTokens ?? 0)
+          cacheReadTokens += Number(data.usage.cacheReadTokens ?? 0)
+          cacheWriteTokens += Number(data.usage.cacheWriteTokens ?? 0)
+        }
+      }
+    }
+    if (limitTokens <= 0) throw new Error(`run ${request.runId} has no Host-enforced token budget`)
+    const sampledTokens = uncachedInputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+    if (minimumUsedTokens > sampledTokens) uncachedInputTokens += minimumUsedTokens - sampledTokens
+    const usedTokens = uncachedInputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+    return {
+      schemaVersion: 1,
+      sessionId: request.sessionId,
+      runId: request.runId,
+      limitTokens,
+      usedTokens,
+      remainingTokens: Math.max(0, limitTokens - usedTokens),
+      exhausted: usedTokens >= limitTokens,
+      sessions: related.size,
+      uncachedInputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      coverage: 'run_tree',
+      enforcement: 'DSH_HOST_RUNTIME',
+      overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
     }
   }
 }

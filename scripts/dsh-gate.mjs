@@ -273,6 +273,7 @@ async function runDoctorCommand({ paths, options }) {
     io,
     live: options.live,
     hostUrl: options.host ?? DEFAULT_HOST_URL,
+    readinessSession: options.session,
   })
   const summary = summarizeDoctor(results)
   process.stdout.write(`${summary.text}\n`)
@@ -359,7 +360,7 @@ async function runHost({ paths, options, hostAction }) {
     return false
   }
 
-  // host start
+  // host start / host run
   if (!(await io.exists(dshBin))) {
     fail(`no built dsh CLI at ${dshBin} — run 'pnpm bootstrap' first`)
     return false
@@ -378,15 +379,21 @@ async function runHost({ paths, options, hostAction }) {
 
   const argv = hostLaunchArgv({ dshBin, hostUrl })
   if (options.dryRun) {
-    log('DRY RUN — host would be launched with:')
+    log(`DRY RUN — host would be launched ${hostAction === 'run' ? 'in the foreground' : 'detached'} with:`)
     log(`  ${argv.join(' ')}`)
-    log(`  env DSH_HOME=${paths.dshHome}, cwd ${paths.root}, detached, stdio -> ${paths.hostLogFile}`)
+    log(`  env DSH_HOME=${paths.dshHome}, cwd ${paths.root}, ${hostAction === 'run' ? 'attached stdio' : `detached, stdio -> ${paths.hostLogFile}`}`)
     log(`  url ${hostUrl}`)
     return true
   }
 
   await io.mkdir(paths.hostDir)
   const releaseStartLease = await acquireHostStartLease(paths, io)
+  let startLeaseHeld = true
+  const releaseLease = async () => {
+    if (!startLeaseHeld) return
+    startLeaseHeld = false
+    await releaseStartLease()
+  }
   try {
     const record = await readHostPidFile(paths, io)
     const state = record === undefined ? 'none' : await probePid(record.pid, io)
@@ -422,6 +429,48 @@ async function runHost({ paths, options, hostAction }) {
       return false
     } catch {
       // port free — proceed
+    }
+
+    if (hostAction === 'run') {
+      const child = io.spawn(argv[0], argv.slice(1), {
+        cwd: paths.root,
+        env: { ...process.env, DSH_HOME: paths.dshHome },
+        detached: false,
+        stdio: 'inherit',
+      })
+      const pid = await new Promise((resolvePromise, rejectPromise) => {
+        child.once('error', rejectPromise)
+        child.once('spawn', () => resolvePromise(child.pid))
+      })
+      try {
+        const startedAt = new Date().toISOString()
+        await io.writeJson(paths.hostPidFile, { pid, argv, startedAt, url: hostUrl, dshHome: paths.dshHome, supervised: true })
+        await releaseLease()
+      } catch (error) {
+        child.kill('SIGTERM')
+        throw error
+      }
+      log(`Host attached as pid ${pid}; external process supervisor owns restart policy`)
+      let terminating = false
+      const forward = (signal) => {
+        terminating = true
+        if (!child.killed) child.kill(signal)
+      }
+      const onTerm = () => forward('SIGTERM')
+      const onInt = () => forward('SIGINT')
+      process.once('SIGTERM', onTerm)
+      process.once('SIGINT', onInt)
+      const result = await new Promise(resolvePromise => {
+        child.once('exit', (code, signal) => resolvePromise({ code, signal }))
+      })
+      process.removeListener('SIGTERM', onTerm)
+      process.removeListener('SIGINT', onInt)
+      const current = await readHostPidFile(paths, io)
+      if (current?.pid === pid) await io.rm(paths.hostPidFile, { force: true })
+      if (terminating) return true
+      if (result.code === 0) return true
+      fail(`attached Host exited unexpectedly (${result.signal ?? `code ${String(result.code)}`}); the process supervisor may restart it`)
+      return false
     }
 
     await io.mkdir(paths.logsDir)
@@ -461,7 +510,7 @@ async function runHost({ paths, options, hostAction }) {
     log(`Web UI: ${hostUrl} (the Host is independent of MCP; 'pnpm host:stop' stops it, MCP never does)`)
     return true
   } finally {
-    await releaseStartLease()
+    await releaseLease()
   }
 }
 

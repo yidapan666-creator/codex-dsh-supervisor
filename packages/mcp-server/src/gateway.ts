@@ -47,6 +47,24 @@ function normalizedUrl(value: string): string {
   return new URL(value).origin
 }
 
+function positiveIntegerEnvironment(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const raw = env[name]
+  if (raw === undefined) return undefined
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`)
+  return value
+}
+
+/** Discovery could not prove absence because at least one configured Host was unavailable. */
+export class HostDiscoveryError extends Error {
+  readonly retryable = true
+
+  constructor(message: string, readonly unavailableHosts: readonly string[]) {
+    super(message)
+    this.name = 'HostDiscoveryError'
+  }
+}
+
 /**
  * Identity of one writer domain for a cwd. Different subdirectories of the same
  * Git worktree resolve to the same worktree root, so they share a writer domain;
@@ -129,8 +147,11 @@ export function attachChildObservations<T extends { id: string }>(
 }
 
 interface RunTreeBudgetStop {
+  kind: 'exhausted' | 'request_rejected'
   usedTokens?: number
   limitTokens?: number
+  remainingTokens?: number
+  requiredInputTokens?: number
 }
 
 interface RunTreeConvergence {
@@ -151,7 +172,8 @@ function hookBudgetStop(events: readonly DshEvent[], afterSeq: number, runId: st
     const reason = (event.data as { reason?: { kind?: unknown; reason?: { kind?: unknown; reason?: unknown } } }).reason
     return reason?.kind === 'aborted' && reason.reason?.kind === 'hook'
       && typeof reason.reason.reason === 'string'
-      && reason.reason.reason.startsWith('dsh-gate:token-budget-exhausted;')
+      && (reason.reason.reason.startsWith('dsh-gate:token-budget-exhausted;')
+        || reason.reason.reason.startsWith('dsh-gate:token-budget-request-rejected;'))
       && reasonFields(reason.reason.reason).get('runId') === runId
   })
   if (terminal === undefined) return undefined
@@ -159,9 +181,14 @@ function hookBudgetStop(events: readonly DshEvent[], afterSeq: number, runId: st
   const fields = reasonFields(text)
   const used = Number(fields.get('used'))
   const limit = Number(fields.get('limit'))
+  const remaining = Number(fields.get('remaining'))
+  const requiredInput = Number(fields.get('requiredInput'))
   return {
+    kind: text.startsWith('dsh-gate:token-budget-request-rejected;') ? 'request_rejected' : 'exhausted',
     ...Number.isSafeInteger(used) && used >= 0 ? { usedTokens: used } : {},
     ...Number.isSafeInteger(limit) && limit > 0 ? { limitTokens: limit } : {},
+    ...Number.isSafeInteger(remaining) && remaining >= 0 ? { remainingTokens: remaining } : {},
+    ...Number.isSafeInteger(requiredInput) && requiredInput > 0 ? { requiredInputTokens: requiredInput } : {},
   }
 }
 
@@ -260,12 +287,13 @@ export class GatewayManager {
     const shadowPolicy = env.DSH_DECISION_SHADOW_POLICY_FILE === undefined
       ? undefined
       : readDecisionPolicy(env.DSH_DECISION_SHADOW_POLICY_FILE)
-    const defaultTaskTokenBudget = env.DSH_DEFAULT_TASK_TOKEN_BUDGET === undefined
-      ? undefined
-      : Number(env.DSH_DEFAULT_TASK_TOKEN_BUDGET)
-    if (defaultTaskTokenBudget !== undefined
-      && (!Number.isSafeInteger(defaultTaskTokenBudget) || defaultTaskTokenBudget <= 0)) {
-      throw new Error('DSH_DEFAULT_TASK_TOKEN_BUDGET must be a positive integer')
+    const defaultTaskTokenBudget = positiveIntegerEnvironment(env, 'DSH_DEFAULT_TASK_TOKEN_BUDGET')
+    const journalMaxRecords = positiveIntegerEnvironment(env, 'DSH_RUN_JOURNAL_MAX_RECORDS')
+    const journalMaxAgeDays = positiveIntegerEnvironment(env, 'DSH_RUN_JOURNAL_MAX_AGE_DAYS')
+    const journalMaxBytes = positiveIntegerEnvironment(env, 'DSH_RUN_JOURNAL_MAX_BYTES')
+    const journalMaxAgeMs = journalMaxAgeDays === undefined ? undefined : journalMaxAgeDays * 24 * 60 * 60 * 1_000
+    if (journalMaxAgeMs !== undefined && !Number.isSafeInteger(journalMaxAgeMs)) {
+      throw new Error('DSH_RUN_JOURNAL_MAX_AGE_DAYS is too large')
     }
     return new GatewayManager({
       hostUrls: urls,
@@ -282,7 +310,11 @@ export class GatewayManager {
         : { usageMonitor: new UsageMonitorClient(env.DSH_USAGE_MONITOR_URL) },
       runJournal: env.DSH_RUN_JOURNAL_ENABLED === 'false'
         ? false
-        : new FileRunJournal(env.DSH_RUN_JOURNAL_DIR ?? DEFAULT_RUN_JOURNAL_DIR),
+        : new FileRunJournal(env.DSH_RUN_JOURNAL_DIR ?? DEFAULT_RUN_JOURNAL_DIR, {
+            ...journalMaxRecords === undefined ? {} : { maxRecords: journalMaxRecords },
+            ...journalMaxAgeMs === undefined ? {} : { maxAgeMs: journalMaxAgeMs },
+            ...journalMaxBytes === undefined ? {} : { maxBytes: journalMaxBytes },
+          }),
     })
   }
 
@@ -431,10 +463,18 @@ export class GatewayManager {
         await this.launchConfiguredHost()
         return this.locate(taskId, false)
       }
-      throw new Error(`could not connect to any configured DSH Host while locating session ${taskId}: ${failures.join('; ')}`)
+      throw new HostDiscoveryError(
+        `could not connect to any configured DSH Host while locating session ${taskId}: ${failures.join('; ')}`,
+        failures,
+      )
     }
-    const unavailable = failures.length === 0 ? '' : ` (${failures.length} Host(s) unavailable)`
-    throw new Error(`session ${taskId} was not found on any reachable configured DSH Host${unavailable}`)
+    if (failures.length > 0) {
+      throw new HostDiscoveryError(
+        `partial DSH Host discovery cannot conclude that session ${taskId} is absent; ${failures.length} configured Host(s) were unavailable`,
+        failures,
+      )
+    }
+    throw new Error(`session ${taskId} was not found on any reachable configured DSH Host`)
   }
 
   private async assertWriterAvailable(connection: HostConnection, cwd: string): Promise<void> {
@@ -462,11 +502,9 @@ export class GatewayManager {
   }
 
   /**
-   * Run one writer admission (availability check through durable task packet) while
-   * no other admission for this GatewayManager is in flight. This closes the
-   * in-process check-then-act race: a concurrent writer admission waits until the
-   * previous packet is durable, then observes it. Distinct GatewayManager processes
-   * and distinct Hosts are not serialized.
+   * Defense-in-depth queue for one GatewayManager. The Host plugin owns the
+   * authoritative cross-MCP check-and-admit critical section; multi-Host writer
+   * topology is rejected before this point.
    */
   private async exclusiveWriterAdmission<T>(fn: () => Promise<T>): Promise<T> {
     let release!: () => void
@@ -505,6 +543,9 @@ export class GatewayManager {
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
     const sessionCwd = snapshot.cwd
     const writerMode = input.writerMode ?? 'writer'
+    if (writerMode === 'writer' && this.knownUrls.length !== 1) {
+      throw new Error('writer admission requires exactly one configured DSH Host; use read_only or isolate each writer in an independent worktree and single-Host deployment')
+    }
     const requestId = input.requestId ?? randomUUID()
     const budget = input.tokenBudget ?? (this.config.defaultTaskTokenBudget === undefined
       ? undefined
@@ -541,12 +582,11 @@ export class GatewayManager {
 
     const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
-    unwrap(await connection.api.sessions.selectModel({
-      sessionId: sessionId as SessionId,
+    const modelSelection = {
       provider: input.provider ?? this.config.defaultProvider ?? models.current.provider,
       model: input.model ?? this.config.defaultModel ?? models.current.model,
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
-    }))
+    }
 
     const runId = randomUUID()
     const packet = taskPacketSchema.parse({
@@ -597,6 +637,7 @@ export class GatewayManager {
         requestDigest,
         runId,
         prompt,
+        modelSelection,
       })
       const refreshed = await connection.refreshSession(sessionId)
       return {
@@ -731,18 +772,24 @@ export class GatewayManager {
     if (tree.budgetStop !== undefined) {
       const observedTokens = tree.budgetStop.usedTokens ?? observation.budget?.observedTokens ?? 0
       const limitTokens = tree.budgetStop.limitTokens ?? observation.budget?.limitTokens ?? Math.max(1, observedTokens)
+      const requestRejected = tree.budgetStop.kind === 'request_rejected'
+      const remainingTokens = requestRejected
+        ? tree.budgetStop.remainingTokens ?? Math.max(0, limitTokens - observedTokens)
+        : 0
       return {
         snapshot,
         observation: {
           ...observation,
           status: 'ESCALATION_REQUIRED',
-          stage: 'token-budget-exhausted',
-          summary: `A child exhausted the Host-enforced run-tree token budget (${String(observedTokens)}/${String(limitTokens)}).`,
+          stage: requestRejected ? 'token-budget-request-rejected' : 'token-budget-exhausted',
+          summary: requestRejected
+            ? `A child request could not fit within the Host-enforced run-tree token budget (${String(observedTokens)}/${String(limitTokens)} used, ${String(remainingTokens)} remaining${tree.budgetStop.requiredInputTokens === undefined ? '' : `, ${String(tree.budgetStop.requiredInputTokens)} input tokens required`}).`
+            : `A child exhausted the Host-enforced run-tree token budget (${String(observedTokens)}/${String(limitTokens)}).`,
           budget: {
             limitTokens,
             observedTokens,
-            remainingTokens: 0,
-            exhausted: true,
+            remainingTokens,
+            exhausted: !requestRejected,
             coverage: 'run_tree',
             enforcement: 'DSH_HOST_RUNTIME',
             overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
@@ -811,14 +858,44 @@ export class GatewayManager {
   private async withRunJournal(
     observation: Observation,
     snapshot: Parameters<typeof deriveObservation>[0],
+    connection: HostConnection,
   ): Promise<Observation> {
+    if (observation.budget !== undefined) {
+      const state = await connection.tokenBudgetState({
+        schemaVersion: 1,
+        sessionId: observation.sessionId,
+        runId: observation.runId,
+      })
+      observation = {
+        ...observation,
+        budget: {
+          limitTokens: state.limitTokens,
+          observedTokens: state.usedTokens,
+          remainingTokens: state.remainingTokens,
+          exhausted: state.exhausted,
+          coverage: state.coverage,
+          enforcement: state.enforcement,
+          overshootBound: state.overshootBound,
+          sessions: state.sessions,
+          uncachedInputTokens: state.uncachedInputTokens,
+          outputTokens: state.outputTokens,
+          cacheReadTokens: state.cacheReadTokens,
+          cacheWriteTokens: state.cacheWriteTokens,
+        },
+      }
+    }
     if (this.usageMonitor !== undefined) {
       observation = { ...observation, usageMonitor: await this.usageMonitor.observeSession(observation.sessionId) }
     }
     const journal = this.runJournal
     const packet = parseTaskPacket(snapshot.events)
+    const boundary = taskBoundarySeq(snapshot.events)
+    const durableTurnEnd = boundary !== undefined
+      && snapshot.events.some(event => event.type === 'turn/end' && event.seq > boundary)
     const journalableFailure = observation.status === 'FAILED'
-      && (observation.failure?.kind === 'WORKER_FAILED' || observation.failure?.kind === 'MISSING_HANDOFF')
+      && (observation.failure?.kind === 'WORKER_FAILED'
+        || observation.failure?.kind === 'MISSING_HANDOFF'
+        || (observation.failure?.kind === 'HOST_FAILED' && durableTurnEnd))
     if (journal === undefined || packet === undefined
       || (!isRunRecordOutcome(observation.status) || (observation.status === 'FAILED' && !journalableFailure))) return observation
     const recordId = runRecordId(observation.sessionId, observation.runId)
@@ -882,33 +959,66 @@ export class GatewayManager {
   async runs(allowLaunch = true): Promise<Record<string, unknown>> {
     const entries: Array<Record<string, unknown>> = []
     const failures: string[] = []
+    const sessionErrors: Array<{ hostBaseUrl: string; sessionId: string; message: string }> = []
     let reachable = 0
     for (const url of this.knownUrls) {
       const connection = this.connection(url)
       try {
         await connection.ensureConnected()
+        const rows = await connection.listSessions()
         reachable++
-        for (const row of await connection.listSessions()) {
-          const snapshot = await connection.refreshSession(row.sessionId)
-          const packet = parseTaskPacket(snapshot.events)
-          // Child seeds contain the root packet too; only the packet's addressed
-          // session is a recoverable root run entry.
-          if (packet?.schemaVersion !== 2 || packet.sessionId !== row.sessionId) continue
-          const observation = this.observationForRun(snapshot, packet.sessionId, packet.runId)
-          this.sessionHosts.set(packet.sessionId, connection.baseUrl)
-          entries.push({
-            hostBaseUrl: connection.baseUrl,
-            hostInstanceId: observation.hostInstanceId,
-            sessionId: packet.sessionId,
-            runId: packet.runId,
-            ...packet.requestId === undefined ? {} : { requestId: packet.requestId },
-            objective: packet.objective,
-            status: observation.status,
-            workerState: observation.workerState,
-            stage: observation.stage,
-            asOfSeq: observation.asOfSeq,
-            ...packet.budget === undefined ? {} : { tokenBudget: packet.budget, budget: observation.budget },
-          })
+        for (const row of rows) {
+          try {
+            const snapshot = await connection.refreshSession(row.sessionId)
+            const packet = parseTaskPacket(snapshot.events)
+            // Child seeds contain the root packet too; only the packet's addressed
+            // session is a recoverable root run entry.
+            if (packet?.schemaVersion !== 2 || packet.sessionId !== row.sessionId) continue
+            const observation = this.observationForRun(snapshot, packet.sessionId, packet.runId)
+            this.sessionHosts.set(packet.sessionId, connection.baseUrl)
+            const budget = observation.budget === undefined
+              ? undefined
+              : await connection.tokenBudgetState({
+                  schemaVersion: 1,
+                  sessionId: observation.sessionId,
+                  runId: observation.runId,
+                })
+            entries.push({
+              hostBaseUrl: connection.baseUrl,
+              hostInstanceId: observation.hostInstanceId,
+              sessionId: packet.sessionId,
+              runId: packet.runId,
+              ...packet.requestId === undefined ? {} : { requestId: packet.requestId },
+              objective: packet.objective,
+              status: observation.status,
+              workerState: observation.workerState,
+              stage: observation.stage,
+              asOfSeq: observation.asOfSeq,
+              ...packet.budget === undefined ? {} : {
+                tokenBudget: packet.budget,
+                budget: budget === undefined ? observation.budget : {
+                  limitTokens: budget.limitTokens,
+                  observedTokens: budget.usedTokens,
+                  remainingTokens: budget.remainingTokens,
+                  exhausted: budget.exhausted,
+                  coverage: budget.coverage,
+                  enforcement: budget.enforcement,
+                  overshootBound: budget.overshootBound,
+                  sessions: budget.sessions,
+                  uncachedInputTokens: budget.uncachedInputTokens,
+                  outputTokens: budget.outputTokens,
+                  cacheReadTokens: budget.cacheReadTokens,
+                  cacheWriteTokens: budget.cacheWriteTokens,
+                },
+              },
+            })
+          } catch (error) {
+            sessionErrors.push({
+              hostBaseUrl: connection.baseUrl,
+              sessionId: row.sessionId,
+              message: (error instanceof Error ? error.message : String(error)).slice(0, 512),
+            })
+          }
         }
       } catch (error) {
         failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`)
@@ -918,12 +1028,15 @@ export class GatewayManager {
       await this.launchConfiguredHost()
       return this.runs(false)
     }
-    if (reachable === 0) throw new Error(`could not connect to any configured DSH Host: ${failures.join('; ')}`)
+    if (reachable === 0) {
+      throw new HostDiscoveryError(`could not connect to any configured DSH Host: ${failures.join('; ')}`, failures)
+    }
     return {
       schemaVersion: 1,
       authoritativeSource: 'DSH_HOST_SESSIONS',
       entries,
       unavailableHosts: failures.length,
+      sessionErrors,
     }
   }
 
@@ -946,7 +1059,7 @@ export class GatewayManager {
             reason: 'MCP_OR_CODEX_CLIENT_RECONNECTED',
           },
         }
-    return this.withRunJournal(recovered, snapshot)
+    return this.withRunJournal(recovered, snapshot, connection)
   }
 
   async wait(input: SessionAddress & { runId?: string | undefined; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
@@ -982,7 +1095,7 @@ export class GatewayManager {
           nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
           continue
         }
-        return this.withRunJournal(observed, snapshot)
+        return this.withRunJournal(observed, snapshot, connection)
       }
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
@@ -999,9 +1112,9 @@ export class GatewayManager {
           const result = finalObservation.decision?.timing !== 'immediate'
             ? timeoutObservation(finalObserved, timeoutMs)
             : finalObserved
-          return this.withRunJournal(result, snapshot)
+          return this.withRunJournal(result, snapshot, connection)
         }
-        return this.withRunJournal(timeoutObservation(observed, timeoutMs), snapshot)
+        return this.withRunJournal(timeoutObservation(observed, timeoutMs), snapshot, connection)
       }
       const untilReconcile = Math.max(0, nextReconcileAt - Date.now())
       const changed = await connection.waitForChange(Math.min(remaining, untilReconcile))

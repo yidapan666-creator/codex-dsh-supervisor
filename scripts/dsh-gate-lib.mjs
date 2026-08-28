@@ -96,10 +96,10 @@ export function resolvePaths(options = {}) {
 
 export const COMMANDS = ['bootstrap', 'doctor', 'host']
 
-export const HOST_ACTIONS = ['start', 'status', 'stop']
+export const HOST_ACTIONS = ['start', 'run', 'status', 'stop']
 
 export const OPTION_SPEC = new Set([
-  '--state', '--dsh-repo', '--dsh-home', '--host', '--dry-run', '--force', '--live', '--help', '--version',
+  '--state', '--dsh-repo', '--dsh-home', '--host', '--session', '--dry-run', '--force', '--live', '--help', '--version',
 ])
 
 /**
@@ -121,7 +121,7 @@ export function parseCliArgs(argv) {
     }
     const [flag, ...rest] = token.split('=')
     if (!OPTION_SPEC.has(flag)) throw new Error(`unknown option ${flag}`)
-    if (['--state', '--dsh-repo', '--dsh-home', '--host'].includes(flag)) {
+    if (['--state', '--dsh-repo', '--dsh-home', '--host', '--session'].includes(flag)) {
       const inline = rest.join('=')
       const value = inline !== '' ? inline : argv[i + 1]
       if (value === undefined || value.startsWith('-')) throw new Error(`option ${flag} needs a value`)
@@ -141,7 +141,7 @@ export function parseCliArgs(argv) {
   let hostAction
   if (command === 'host') {
     hostAction = positionals.shift()
-    if (hostAction === undefined) throw new Error('host needs an action: start | status | stop')
+    if (hostAction === undefined) throw new Error('host needs an action: start | run | status | stop')
     if (!HOST_ACTIONS.includes(hostAction)) throw new Error(`unknown host action ${hostAction}`)
   }
   if (positionals.length > 0) throw new Error(`unexpected argument ${positionals[0]}`)
@@ -157,8 +157,8 @@ export function usageText() {
     '',
     'Usage:',
     '  node scripts/dsh-gate.mjs bootstrap [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--dry-run] [--force]',
-    '  node scripts/dsh-gate.mjs doctor   [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--live] [--host URL]',
-    '  node scripts/dsh-gate.mjs host     start|status|stop [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--host URL] [--dry-run]',
+    '  node scripts/dsh-gate.mjs doctor   [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--live] [--host URL] [--session ID]',
+    '  node scripts/dsh-gate.mjs host     start|run|status|stop [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--host URL] [--dry-run]',
     '',
     'Options:',
     '  --state DIR      state directory (default: <repo>/.dsh-state)',
@@ -169,6 +169,8 @@ export function usageText() {
     '  --dry-run        plan only: print phases/commands, change nothing',
     '  --force          re-run install/build phases even when markers say they are current',
     '  --live           doctor: also probe a live Host (protocolVersion, hostInstanceId, version)',
+    '  --session ID     doctor --live: verify the attached session has a routable provider/model (no model call)',
+    '  host run         keep the Host attached for launchd/systemd process supervision',
     '  --help, --version',
   ].join('\n')
 }
@@ -501,11 +503,31 @@ export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
   return result.value
 }
 
+export async function checkSessionModels({ url, sessionId, io, timeoutMs = 8000 }) {
+  const rpcId = `dsh-gate-models-${Date.now().toString(36)}`
+  const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/session.models`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'client-request', rpcId, method: 'session.models', payload: { sessionId },
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const envelope = await response.json()
+  const result = envelope?.result
+  if (result === undefined || result.ok !== true) {
+    const error = result?.error
+    throw new Error(error === undefined ? 'malformed sessions.models response' : `${error.code}: ${error.message}`)
+  }
+  return result.value
+}
+
 /**
  * Run every doctor check. `io` is the real or fake io; `live` enables the
  * optional Host probe. Returns an ordered list of check results.
  */
-export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOST_URL }) {
+export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOST_URL, readinessSession }) {
   const checks = []
   const add = (name, run) => checks.push({ name, run })
 
@@ -594,6 +616,29 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
         ? { ok: true, detail: `protocolVersion 1; hostInstanceId ${value.hostInstanceId}; version ${value.version}` }
         : { ok: false, detail: failures.join('; ') }
     })
+    if (readinessSession !== undefined) {
+      add('provider/model routing', async () => {
+        let value
+        try {
+          value = await checkSessionModels({ url: hostUrl, sessionId: readinessSession, io })
+        } catch (error) {
+          return { ok: false, detail: `session ${readinessSession}: ${error instanceof Error ? error.message : String(error)}` }
+        }
+        const provider = value?.current?.provider
+        const model = value?.current?.model
+        const failures = Array.isArray(value?.failures) ? value.failures : []
+        if (typeof provider !== 'string' || provider === '' || typeof model !== 'string' || model === '') {
+          return { ok: false, detail: `session ${readinessSession} has no current provider/model` }
+        }
+        if (value.routable === false || failures.length > 0) {
+          return { ok: false, detail: `${provider}/${model} is not routable: ${JSON.stringify(failures).slice(0, 512)}` }
+        }
+        return {
+          ok: true,
+          detail: `${provider}/${model} is routable for session ${readinessSession}; credentials are verified only by an explicit real task`,
+        }
+      })
+    }
   }
 
   const results = []

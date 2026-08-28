@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { toolFailureEnvelope } from '../src/server.js'
+import { HostDiscoveryError } from '../src/gateway.js'
+import { ProtocolContractError } from '../src/host.js'
 
 describe('structured MCP tool failures', () => {
   it('preserves Host connection failures as retryable HOST_FAILED envelopes', () => {
@@ -24,6 +26,22 @@ describe('structured MCP tool failures', () => {
   it('does not misclassify a reachable-Host session miss as a Host outage', () => {
     expect(toolFailureEnvelope(new Error(
       'session missing was not found on any reachable configured DSH Host',
+    ))).toMatchObject({
+      failure: { kind: 'PROTOCOL_ERROR', retryable: false },
+    })
+  })
+
+  it('classifies partial Host discovery as retryable instead of claiming absence', () => {
+    expect(toolFailureEnvelope(new HostDiscoveryError(
+      'partial DSH Host discovery cannot conclude absence', ['http://offline'],
+    ))).toMatchObject({
+      failure: { kind: 'HOST_FAILED', retryable: true },
+    })
+  })
+
+  it('classifies a reachable Host contract mismatch as non-retryable protocol failure', () => {
+    expect(toolFailureEnvelope(new ProtocolContractError(
+      'DSH Host does not expose atomic task admission',
     ))).toMatchObject({
       failure: { kind: 'PROTOCOL_ERROR', retryable: false },
     })

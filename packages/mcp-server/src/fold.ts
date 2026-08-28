@@ -108,26 +108,39 @@ function eventText(event: DshEvent): string {
   return textBlocks(data.content ?? data.message?.content)
 }
 
+function taskPacketTexts(event: DshEvent): string[] {
+  if (event.type === 'user/message') return [eventText(event)]
+  if (event.type !== 'agent/inbox/spliced') return []
+  const inserted = (event.data as { inserted?: unknown }).inserted
+  if (!Array.isArray(inserted)) return []
+  return inserted.flatMap((message) => {
+    if (typeof message !== 'object' || message === null) return []
+    const content = (message as { content?: unknown }).content
+    return [textBlocks(content)]
+  })
+}
+
 function taskPacketBoundary(events: readonly DshEvent[]): { packet: TaskPacket; seq: number } | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
-    if (event?.type !== 'user/message') continue
-    const text = eventText(event)
-    // The objective may itself mention either marker, including inside the
-    // serialized JSON. Anchor at the final closing marker and validate each
-    // preceding opening-marker candidate until the strict packet parses.
-    const end = text.lastIndexOf(TASK_PACKET_END)
-    if (end < 0) continue
-    let before = end
-    while (before >= 0) {
-      const start = text.lastIndexOf(TASK_PACKET_START, before)
-      if (start < 0) break
-      const raw = text.slice(start + TASK_PACKET_START.length, end).trim()
-      try {
-        const parsed = taskPacketSchema.safeParse(JSON.parse(raw))
-        if (parsed.success) return { packet: parsed.data, seq: event.seq }
-      } catch { /* Try an earlier opening marker in the same message. */ }
-      before = start - 1
+    if (event === undefined) continue
+    for (const text of taskPacketTexts(event).reverse()) {
+      // The objective may itself mention either marker, including inside the
+      // serialized JSON. Anchor at the final closing marker and validate each
+      // preceding opening-marker candidate until the strict packet parses.
+      const end = text.lastIndexOf(TASK_PACKET_END)
+      if (end < 0) continue
+      let before = end
+      while (before >= 0) {
+        const start = text.lastIndexOf(TASK_PACKET_START, before)
+        if (start < 0) break
+        const raw = text.slice(start + TASK_PACKET_START.length, end).trim()
+        try {
+          const parsed = taskPacketSchema.safeParse(JSON.parse(raw))
+          if (parsed.success) return { packet: parsed.data, seq: event.seq }
+        } catch { /* Try an earlier opening marker in the same message. */ }
+        before = start - 1
+      }
     }
   }
   return undefined
@@ -140,7 +153,7 @@ export function parseTaskPacket(events: readonly DshEvent[]): TaskPacket | undef
 /** Every valid durable packet boundary, oldest first (used for stateless request reconciliation). */
 export function taskPacketEntries(events: readonly DshEvent[]): Array<{ packet: TaskPacket; seq: number }> {
   return events.flatMap((event) => {
-    if (event.type !== 'user/message') return []
+    if (event.type !== 'user/message' && event.type !== 'agent/inbox/spliced') return []
     const boundary = taskPacketBoundary([event])
     return boundary === undefined ? [] : [boundary]
   })
@@ -745,14 +758,17 @@ function budgetTurnObservation(
   if (reason?.kind !== 'aborted' || reason.reason?.kind !== 'hook' || typeof reason.reason.reason !== 'string') return undefined
   const text = reason.reason.reason
   const exhausted = /^dsh-gate:token-budget-exhausted;/.test(text)
+  const requestRejected = /^dsh-gate:token-budget-request-rejected;/.test(text)
   const accountingFailed = /^dsh-gate:token-budget-accounting-failed;/.test(text)
-  if (!exhausted && !accountingFailed) return undefined
+  if (!exhausted && !requestRejected && !accountingFailed) return undefined
   const fields = new Map(text.split(';').slice(1).flatMap(part => {
     const separator = part.indexOf('=')
     return separator < 0 ? [] : [[part.slice(0, separator), part.slice(separator + 1)] as const]
   }))
   const used = Number(fields.get('used'))
   const limit = Number(fields.get('limit'))
+  const remaining = Number(fields.get('remaining'))
+  const requiredInput = Number(fields.get('requiredInput'))
   const common = {
     ...base(state, packet),
     boundarySeq: turnEnd.seq,
@@ -771,16 +787,21 @@ function budgetTurnObservation(
   const limitTokens = Number.isSafeInteger(limit) && limit > 0
     ? limit
     : common.budget?.limitTokens ?? observedTokens
+  const remainingTokens = requestRejected && Number.isSafeInteger(remaining) && remaining >= 0
+    ? remaining
+    : 0
   return {
     ...common,
     status: 'ESCALATION_REQUIRED',
-    stage: 'token-budget-exhausted',
-    summary: `Host-enforced task token budget exhausted (${observedTokens}/${limitTokens}).`,
+    stage: requestRejected ? 'token-budget-request-rejected' : 'token-budget-exhausted',
+    summary: requestRejected
+      ? `The next model request could not fit within the Host-enforced task token budget (${observedTokens}/${limitTokens} used, ${remainingTokens} remaining${Number.isSafeInteger(requiredInput) && requiredInput > 0 ? `, ${requiredInput} input tokens required` : ''}).`
+      : `Host-enforced task token budget exhausted (${observedTokens}/${limitTokens}).`,
     budget: {
       limitTokens,
       observedTokens,
-      remainingTokens: 0,
-      exhausted: true,
+      remainingTokens,
+      exhausted: !requestRejected,
       coverage: 'run_tree',
       enforcement: 'DSH_HOST_RUNTIME',
       overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',

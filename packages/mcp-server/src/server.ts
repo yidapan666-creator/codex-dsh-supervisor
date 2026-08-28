@@ -1,7 +1,8 @@
 import { McpServer, type CallToolResult } from '@modelcontextprotocol/server'
 import { z } from 'zod'
 import { observationSchema } from './contracts.js'
-import { GatewayManager } from './gateway.js'
+import { GatewayManager, HostDiscoveryError } from './gateway.js'
+import { ProtocolContractError } from './host.js'
 import { DECISION_CATEGORIES } from '@dsh-gate/decision-policy'
 
 type JsonRecord = Record<string, unknown>
@@ -13,8 +14,11 @@ function result(value: JsonRecord): CallToolResult {
 /** Keep tool failures machine-readable so Host outages are not flattened into session lookup errors. */
 export function toolFailureEnvelope(error: unknown): JsonRecord {
   const message = error instanceof Error ? error.message : String(error)
+  const discoveryFailure = error instanceof HostDiscoveryError
+  const protocolContractFailure = error instanceof ProtocolContractError
   const lookupFailure = /session .*\b(?:not found|does not exist|no longer present)\b/i.test(message)
-  const hostFailure = !lookupFailure && /DSH Host|configured Host|connecting to|connect to any/i.test(message)
+  const hostFailure = !protocolContractFailure
+    && (discoveryFailure || (!lookupFailure && /DSH Host|configured Host|connecting to|connect to any/i.test(message)))
   return {
     schemaVersion: 1,
     status: 'FAILED',
@@ -56,12 +60,12 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
       + 'When creating a session, pass the target project absolute cwd; reconnect preserves the durable session cwd and must not redirect it. '
       + 'Always give dsh_task a fresh requestId and reuse that same requestId after an ambiguous client disconnect; Host-side atomic admission returns the durable receipt and does not duplicate the task. '
-      + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree with request preflight, atomic reservations, and output caps; provider usage settles the estimate, so it is a cutoff rather than an exact billing cap. The external dsh-usage-monitor reading is optional observability and never budget authority. '
+      + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree with request preflight, atomic reservations, and output caps; provider usage settles the estimate, so it is a cutoff rather than an exact billing cap. Budgeted observations include the Host-owned cumulative run-tree buckets; cursor tokenDelta remains the root-session delta. The external dsh-usage-monitor reading is session-lifetime root observability only and never budget authority. '
       + 'After MCP/Codex reconnect, use dsh_runs to rediscover identity and dsh_recover to reattach before waiting. Do not replay the objective. '
       + 'DSH root exclusively manages its children: child reports and settled notices are delivered to root automatically. Never steer root to relay, acknowledge, '
       + 'or take over completed child work. A root handoff remains WAITING while affiliated children run; their durable budget stop overrides the older root handoff. dsh_agents is observation-only; interrupt a child only on an explicit human request or a clear safety emergency. '
       + 'Never stop the independently owned DSH Host. '
-      + 'Use one writer per real working tree; parallel writers require independent worktrees.',
+      + 'Use one writer per real working tree; the Host admits writers atomically across MCP clients, multi-Host writer topology fails closed, and parallel writers require independent worktrees.',
   })
 
   server.registerTool('dsh_start_or_connect', {
@@ -72,7 +76,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.startOrConnect(input)))
 
   server.registerTool('dsh_task', {
-    description: 'Atomically admit one supervised run into an idle durable session. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits a durable inbox receipt and returns the original runId without duplicating the task. A different new task is rejected while the session is running. Optional tokenBudget.maxTokens is a Host-enforced whole-run-tree cutoff: requests atomically reserve estimated full input plus capped output before dispatch, then settle with provider-reported input/cache/output usage. Concurrent requests cannot claim the same allowance; tokenizer/provider variance means this is not an exact billing cap. authority.maxDirectChildren is also enforced in the Host from durable child creations and in-flight start reservations, so allowed child use needs no repeat approval. Every later wait/control call must carry sessionId + runId. One writer per working tree is enforced; use an independent worktree for parallel writers.',
+    description: 'Atomically admit one supervised run into an idle durable session. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits a durable inbox receipt and returns the original runId without duplicating the task. A different new task is rejected while the session is running. Optional tokenBudget.maxTokens is a Host-enforced whole-run-tree cutoff: requests atomically reserve estimated full input plus capped output before dispatch, then settle with provider-reported input/cache/output usage. Concurrent requests cannot claim the same allowance; tokenizer/provider variance means this is not an exact billing cap. authority.maxDirectChildren is also enforced in the Host from durable child creations and in-flight start reservations, so allowed child use needs no repeat approval. Every later wait/control call must carry sessionId + runId. The Host atomically enforces one writer per working tree across MCP clients; writer dispatch fails closed under multi-Host configuration, and parallel writers require independent worktrees.',
     inputSchema: z.object({
       requestId: z.string().uuid().optional(),
       sessionId: z.string(), taskId: z.string().optional(), objective: z.string().min(1), writerMode: z.enum(['writer', 'read_only']).optional(),
@@ -103,7 +107,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.recover(input)))
 
   server.registerTool('dsh_wait', {
-    description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early when the attached explainable decision says timing=immediate; protocol boundaries are locked and structured worker requests are policy-evaluated. Follow decision.action/audience/reasonCode. A WAITING/TIMEOUT return is the cadence observation: aggregate progress since afterAsOfSeq, including step/tool/token deltas, compact project edit/verification activity, and the latest accepted bounded semantic milestone. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',
+    description: 'Wait the five-minute aggregated progress cadence (default 300000 ms). Returns early when the attached explainable decision says timing=immediate; protocol boundaries are locked and structured worker requests are policy-evaluated. Follow decision.action/audience/reasonCode. A WAITING/TIMEOUT return is the cadence observation: aggregate root-session progress since afterAsOfSeq, including step/tool/token deltas, compact project edit/verification activity, and the latest accepted bounded semantic milestone. Budgeted observations additionally report cumulative Host-owned run-tree token buckets and counted sessions. Surface the summary to the user; terminal reports must recap steps, tools, token deltas, and project activity. afterAsOfSeq is only an observation cursor, never DSH since.',
     inputSchema: z.object({
       sessionId: z.string(), runId: z.string().uuid(), taskId: z.string().optional(),
       afterAsOfSeq: z.number().int().min(-1).optional(), timeoutMs: z.number().int().min(0).max(300_000).optional(),

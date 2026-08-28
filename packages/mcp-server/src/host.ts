@@ -22,6 +22,16 @@ export interface HostLaunchConfig {
 
 export type SessionSnapshot = TaskRuntimeState
 
+/** A reachable Host violated the pinned wire/plugin contract; retrying unchanged cannot fix it. */
+export class ProtocolContractError extends Error {
+  readonly retryable = false
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'ProtocolContractError'
+  }
+}
+
 export interface TaskAdmissionRequest {
   schemaVersion: 1
   sessionId: string
@@ -29,6 +39,11 @@ export interface TaskAdmissionRequest {
   requestDigest: string
   runId: string
   prompt: string
+  modelSelection: {
+    provider: string
+    model: string
+    reasoningEffort?: string
+  }
 }
 
 export interface TaskAdmissionReceipt {
@@ -43,6 +58,32 @@ export interface TaskAdmissionReceipt {
 
 export type TaskAdmissionTransport = (request: TaskAdmissionRequest) => Promise<TaskAdmissionReceipt>
 
+export interface TokenBudgetStateRequest {
+  schemaVersion: 1
+  sessionId: string
+  runId: string
+}
+
+export interface TokenBudgetStateReceipt {
+  schemaVersion: 1
+  sessionId: string
+  runId: string
+  limitTokens: number
+  usedTokens: number
+  remainingTokens: number
+  exhausted: boolean
+  sessions: number
+  uncachedInputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  coverage: 'run_tree'
+  enforcement: 'DSH_HOST_RUNTIME'
+  overshootBound: 'IN_FLIGHT_MODEL_RESPONSES'
+}
+
+export type TokenBudgetStateTransport = (request: TokenBudgetStateRequest) => Promise<TokenBudgetStateReceipt>
+
 interface CachedSessionMetadata {
   cwd?: string
   telemetry?: TaskRuntimeState['telemetry']
@@ -54,7 +95,7 @@ function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; err
 }
 
 function taskAdmissionReceipt(value: unknown, request: TaskAdmissionRequest): TaskAdmissionReceipt {
-  if (typeof value !== 'object' || value === null) throw new Error('malformed dsh-gate admission receipt')
+  if (typeof value !== 'object' || value === null) throw new ProtocolContractError('malformed dsh-gate admission receipt')
   const receipt = value as Record<string, unknown>
   if (receipt.schemaVersion !== 1
     || receipt.sessionId !== request.sessionId
@@ -63,7 +104,7 @@ function taskAdmissionReceipt(value: unknown, request: TaskAdmissionRequest): Ta
     || typeof receipt.runId !== 'string'
     || typeof receipt.reconciled !== 'boolean'
     || typeof receipt.asOfSeq !== 'number' || !Number.isSafeInteger(receipt.asOfSeq)) {
-    throw new Error('malformed dsh-gate admission receipt')
+    throw new ProtocolContractError('malformed dsh-gate admission receipt')
   }
   return receipt as unknown as TaskAdmissionReceipt
 }
@@ -77,15 +118,15 @@ async function postTaskAdmission(baseUrl: string, request: TaskAdmissionRequest)
     signal: AbortSignal.timeout(30_000),
   })
   if (response.status === 404) {
-    throw new Error('PROTOCOL_ERROR: DSH Host does not expose atomic task admission; reinstall the supervisor plugin and restart the Host')
+    throw new ProtocolContractError('DSH Host does not expose atomic task admission; reinstall the supervisor plugin and restart the Host')
   }
   if (!response.ok) throw new Error(`dsh-gate admission carrier returned HTTP ${String(response.status)}`)
   const value = await response.json() as unknown
-  if (typeof value !== 'object' || value === null) throw new Error('malformed dsh-gate admission response')
+  if (typeof value !== 'object' || value === null) throw new ProtocolContractError('malformed dsh-gate admission response')
   const envelope = value as Record<string, unknown>
   if (envelope.type !== 'server-response' || envelope.rpcId !== rpcId
     || typeof envelope.result !== 'object' || envelope.result === null) {
-    throw new Error('malformed dsh-gate admission response')
+    throw new ProtocolContractError('malformed dsh-gate admission response')
   }
   const result = envelope.result as Record<string, unknown>
   if (result.ok === false) {
@@ -94,8 +135,70 @@ async function postTaskAdmission(baseUrl: string, request: TaskAdmissionRequest)
       : {}
     throw new Error(`${String(error.code ?? 'INTERNAL')}: ${String(error.message ?? 'task admission failed')}`)
   }
-  if (result.ok !== true) throw new Error('malformed dsh-gate admission result')
+  if (result.ok !== true) throw new ProtocolContractError('malformed dsh-gate admission result')
   return taskAdmissionReceipt(result.value, request)
+}
+
+function tokenBudgetStateReceipt(value: unknown, request: TokenBudgetStateRequest): TokenBudgetStateReceipt {
+  if (typeof value !== 'object' || value === null) throw new ProtocolContractError('malformed dsh-gate token budget state receipt')
+  const receipt = value as Record<string, unknown>
+  if (receipt.schemaVersion !== 1
+    || receipt.sessionId !== request.sessionId
+    || receipt.runId !== request.runId
+    || typeof receipt.limitTokens !== 'number' || !Number.isSafeInteger(receipt.limitTokens) || receipt.limitTokens <= 0
+    || typeof receipt.usedTokens !== 'number' || !Number.isSafeInteger(receipt.usedTokens) || receipt.usedTokens < 0
+    || typeof receipt.remainingTokens !== 'number' || !Number.isSafeInteger(receipt.remainingTokens) || receipt.remainingTokens < 0
+    || typeof receipt.exhausted !== 'boolean'
+    || typeof receipt.sessions !== 'number' || !Number.isSafeInteger(receipt.sessions) || receipt.sessions < 0
+    || receipt.coverage !== 'run_tree'
+    || receipt.enforcement !== 'DSH_HOST_RUNTIME'
+    || receipt.overshootBound !== 'IN_FLIGHT_MODEL_RESPONSES') {
+    throw new ProtocolContractError('malformed dsh-gate token budget state receipt')
+  }
+  for (const key of ['uncachedInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'] as const) {
+    if (typeof receipt[key] !== 'number' || !Number.isSafeInteger(receipt[key]) || receipt[key] < 0) {
+      throw new ProtocolContractError('malformed dsh-gate token budget state receipt')
+    }
+  }
+  const bucketTotal = Number(receipt.uncachedInputTokens) + Number(receipt.outputTokens)
+    + Number(receipt.cacheReadTokens) + Number(receipt.cacheWriteTokens)
+  if (receipt.usedTokens !== bucketTotal
+    || receipt.remainingTokens !== Math.max(0, Number(receipt.limitTokens) - bucketTotal)
+    || receipt.exhausted !== (bucketTotal >= Number(receipt.limitTokens))) {
+    throw new ProtocolContractError('inconsistent dsh-gate token budget state receipt')
+  }
+  return receipt as unknown as TokenBudgetStateReceipt
+}
+
+async function postTokenBudgetState(
+  baseUrl: string,
+  request: TokenBudgetStateRequest,
+): Promise<TokenBudgetStateReceipt> {
+  const rpcId = `dsh-gate-budget-${request.runId}`
+  const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.budget-state`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId, method: 'dsh-gate.budget-state', payload: request }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (response.status === 404) {
+    throw new ProtocolContractError('DSH Host does not expose run-tree token budget state; reinstall the supervisor plugin and restart the Host')
+  }
+  if (!response.ok) throw new Error(`dsh-gate token budget carrier returned HTTP ${String(response.status)}`)
+  const envelope = await response.json() as Record<string, unknown>
+  if (envelope.type !== 'server-response' || envelope.rpcId !== rpcId
+    || typeof envelope.result !== 'object' || envelope.result === null) {
+    throw new ProtocolContractError('malformed dsh-gate token budget state response')
+  }
+  const result = envelope.result as Record<string, unknown>
+  if (result.ok === false) {
+    const error = typeof result.error === 'object' && result.error !== null
+      ? result.error as Record<string, unknown>
+      : {}
+    throw new Error(`${String(error.code ?? 'INTERNAL')}: ${String(error.message ?? 'token budget state failed')}`)
+  }
+  if (result.ok !== true) throw new ProtocolContractError('malformed dsh-gate token budget state result')
+  return tokenBudgetStateReceipt(result.value, request)
 }
 
 export function needsOlderHistoryPage(
@@ -146,6 +249,7 @@ export class HostConnection {
     readonly baseUrl: string,
     readonly api: IApiClient = new WebApiClient(baseUrl),
     private readonly admissionTransport: TaskAdmissionTransport = request => postTaskAdmission(baseUrl, request),
+    private readonly budgetStateTransport: TokenBudgetStateTransport = request => postTokenBudgetState(baseUrl, request),
   ) {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
@@ -229,7 +333,7 @@ export class HostConnection {
   }
 
   async ensureConnected(timeoutMs = 10_000): Promise<HostDescription> {
-    if (this.protocolError !== undefined) throw new Error(this.protocolError)
+    if (this.protocolError !== undefined) throw new ProtocolContractError(this.protocolError)
     if (this.description !== undefined) return this.description
     return new Promise<HostDescription>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -240,7 +344,7 @@ export class HostConnection {
         if (this.protocolError !== undefined) {
           clearTimeout(timer)
           dispose()
-          reject(new Error(this.protocolError))
+          reject(new ProtocolContractError(this.protocolError))
         } else if (this.description !== undefined) {
           clearTimeout(timer)
           dispose()
@@ -257,6 +361,11 @@ export class HostConnection {
   /** Atomically queue one idempotent supervised task through the Host plugin. */
   admitTask(request: TaskAdmissionRequest): Promise<TaskAdmissionReceipt> {
     return this.admissionTransport(request)
+  }
+
+  /** Read the Host's durable run-tree token projection without invoking a model. */
+  tokenBudgetState(request: TokenBudgetStateRequest): Promise<TokenBudgetStateReceipt> {
+    return this.budgetStateTransport(request)
   }
 
   async listSessions(): Promise<SessionSummary[]> {
