@@ -115,6 +115,10 @@ when everything is already current — pass `--force` to rebuild):
 Bootstrap **never starts the Host** — that is a separate, explicit step
 (`pnpm host:start`, or the configured `DSH_HOST_LAUNCH`).
 
+The Codex MCP example sets `tool_timeout_sec = 360`: `dsh_wait` may use the
+full 300-second cadence and still needs bounded connection and authoritative
+refresh headroom before returning its aggregated observation.
+
 ### Operational state lives in `.dsh-state/` (gitignored)
 
 | Path | Contents |

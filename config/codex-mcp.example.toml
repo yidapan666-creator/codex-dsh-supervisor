@@ -14,7 +14,9 @@
 command = "node"
 args = ["<workspace-root>/packages/mcp-server/dist/cli.js"]
 startup_timeout_sec = 20
-tool_timeout_sec = 310
+# dsh_wait may hold for the full 300-second cadence, then perform a bounded
+# authoritative refresh before returning. Keep enough client-side headroom.
+tool_timeout_sec = 360
 
 [mcp_servers.dsh_gate.tools.dsh_answer_approval]
 approval_mode = "prompt"
