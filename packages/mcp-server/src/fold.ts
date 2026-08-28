@@ -5,11 +5,92 @@ import {
 } from '@dsh-gate/decision-policy'
 import type { RunDecisionRecord } from '@dsh-gate/run-journal'
 import {
+  HANDOFF_ARTIFACT_PATH_LIMIT, HANDOFF_ARTIFACTS_LIMIT, HANDOFF_BLOCKER_LIMIT,
+  HANDOFF_FAILURE_SIGNATURE_LIMIT, HANDOFF_FILES_LIMIT, HANDOFF_HYPOTHESES_LIMIT,
+  HANDOFF_HYPOTHESIS_LIMIT, HANDOFF_PATH_LIMIT, HANDOFF_STAGE_LIMIT, HANDOFF_SUMMARY_LIMIT,
+  HANDOFF_VERIFICATION_COMMAND_LIMIT, HANDOFF_VERIFICATION_LIMIT, HANDOFF_VERIFICATION_SUMMARY_LIMIT,
   TASK_PACKET_END, TASK_PACKET_START,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
   taskPacketSchema, supervisorProgressSchema,
   type ProjectActivity, type SupervisorProgress, type TaskPacket, type TaskRuntimeState,
 } from './contracts.js'
+
+type HandoffTruncatedField = NonNullable<Observation['handoffTruncated']>['fields'][number]
+
+function boundedHandoffString(
+  value: unknown,
+  limit: number,
+  field: HandoffTruncatedField,
+  truncated: Set<HandoffTruncatedField>,
+): string | undefined {
+  if (typeof value !== 'string') return undefined
+  if (value.length > limit) truncated.add(field)
+  return value.slice(0, limit)
+}
+
+function boundedHandoffStrings(
+  value: unknown,
+  maxItems: number,
+  maxLength: number,
+  field: HandoffTruncatedField,
+  truncated: Set<HandoffTruncatedField>,
+): string[] {
+  if (!Array.isArray(value)) return []
+  if (value.length > maxItems || value.some(item => typeof item !== 'string' || item.length > maxLength)) truncated.add(field)
+  return value.filter((item): item is string => typeof item === 'string')
+    .slice(0, maxItems)
+    .map(item => item.slice(0, maxLength))
+}
+
+function boundedHandoffVerification(
+  value: unknown,
+  truncated: Set<HandoffTruncatedField>,
+): Observation['verification'] {
+  if (!Array.isArray(value)) return []
+  if (value.length > HANDOFF_VERIFICATION_LIMIT) truncated.add('verification')
+  return value.slice(0, HANDOFF_VERIFICATION_LIMIT).flatMap((item) => {
+    if (typeof item !== 'object' || item === null) {
+      truncated.add('verification')
+      return []
+    }
+    const entry = item as Record<string, unknown>
+    if (typeof entry.command !== 'string' || typeof entry.summary !== 'string'
+      || !['passed', 'failed', 'not_run'].includes(String(entry.outcome))) {
+      truncated.add('verification')
+      return []
+    }
+    if (entry.command.length > HANDOFF_VERIFICATION_COMMAND_LIMIT
+      || entry.summary.length > HANDOFF_VERIFICATION_SUMMARY_LIMIT) truncated.add('verification')
+    return [{
+      command: entry.command.slice(0, HANDOFF_VERIFICATION_COMMAND_LIMIT),
+      outcome: entry.outcome as 'passed' | 'failed' | 'not_run',
+      summary: entry.summary.slice(0, HANDOFF_VERIFICATION_SUMMARY_LIMIT),
+    }]
+  })
+}
+
+function boundedHandoffArtifacts(
+  value: unknown,
+  truncated: Set<HandoffTruncatedField>,
+): Observation['artifacts'] {
+  if (!Array.isArray(value)) return []
+  if (value.length > HANDOFF_ARTIFACTS_LIMIT) truncated.add('artifacts')
+  return value.slice(0, HANDOFF_ARTIFACTS_LIMIT).flatMap((item) => {
+    if (typeof item !== 'object' || item === null) {
+      truncated.add('artifacts')
+      return []
+    }
+    const entry = item as Record<string, unknown>
+    if (typeof entry.path !== 'string' || typeof entry.bytes !== 'number'
+      || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0
+      || typeof entry.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(entry.sha256)) {
+      truncated.add('artifacts')
+      return []
+    }
+    if (entry.path.length > HANDOFF_ARTIFACT_PATH_LIMIT) truncated.add('artifacts')
+    return [{ path: entry.path.slice(0, HANDOFF_ARTIFACT_PATH_LIMIT), bytes: entry.bytes, sha256: entry.sha256 }]
+  })
+}
 
 function textBlocks(content: unknown): string {
   if (!Array.isArray(content)) return ''
@@ -576,20 +657,37 @@ function handoffObservation(
       if (args.taskId !== packet.taskId || args.completionToken !== packet.completionToken) continue
       handoff = args
     }
+    const truncated = new Set<HandoffTruncatedField>()
+    const stage = boundedHandoffString(handoff.stage, HANDOFF_STAGE_LIMIT, 'stage', truncated) ?? 'unknown'
+    const summary = boundedHandoffString(handoff.summary, HANDOFF_SUMMARY_LIMIT, 'summary', truncated) ?? ''
+    const files = boundedHandoffStrings(
+      handoff.files, HANDOFF_FILES_LIMIT, HANDOFF_PATH_LIMIT, 'files', truncated,
+    )
+    const verification = boundedHandoffVerification(handoff.verification, truncated)
+    const artifacts = boundedHandoffArtifacts(output.artifacts, truncated)
+    const blocker = boundedHandoffString(handoff.blocker, HANDOFF_BLOCKER_LIMIT, 'blocker', truncated)
+    const failureSignature = boundedHandoffString(
+      handoff.failureSignature, HANDOFF_FAILURE_SIGNATURE_LIMIT, 'failureSignature', truncated,
+    )
+    const attemptedHypotheses = Array.isArray(handoff.attemptedHypotheses)
+      ? boundedHandoffStrings(
+        handoff.attemptedHypotheses, HANDOFF_HYPOTHESES_LIMIT, HANDOFF_HYPOTHESIS_LIMIT,
+        'attemptedHypotheses', truncated,
+      )
+      : undefined
     const common = {
       ...base(state, packet),
       boundarySeq: turnEnd.seq,
-      stage: typeof handoff.stage === 'string' ? handoff.stage : 'unknown',
-      summary: typeof handoff.summary === 'string' ? handoff.summary.slice(0, 2_048) : '',
-      files: Array.isArray(handoff.files) ? handoff.files.filter((item): item is string => typeof item === 'string') : [],
-      verification: Array.isArray(handoff.verification) ? handoff.verification as Observation['verification'] : [],
-      artifacts: output.artifacts as Observation['artifacts'],
+      stage,
+      summary,
+      files,
+      verification,
+      artifacts,
       projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
-      ...typeof handoff.blocker === 'string' ? { blocker: handoff.blocker } : {},
-      ...typeof handoff.failureSignature === 'string' ? { failureSignature: handoff.failureSignature } : {},
-      ...Array.isArray(handoff.attemptedHypotheses)
-        ? { attemptedHypotheses: handoff.attemptedHypotheses.filter((item): item is string => typeof item === 'string') }
-        : {},
+      ...blocker === undefined ? {} : { blocker },
+      ...failureSignature === undefined ? {} : { failureSignature },
+      ...attemptedHypotheses === undefined ? {} : { attemptedHypotheses },
+      ...truncated.size === 0 ? {} : { handoffTruncated: { fields: [...truncated] } },
     }
     switch (handoff.status) {
       case 'completed': return { ...common, status: 'COMPLETED' }

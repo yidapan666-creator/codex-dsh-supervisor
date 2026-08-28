@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { deriveObservation, progressHeartbeat, progressObservation, projectActivityIn, timeoutObservation } from '../src/fold.js'
-import { observationSchema, progressHeartbeatSchema, TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type TaskRuntimeState } from '../src/contracts.js'
+import {
+  HANDOFF_ARTIFACTS_LIMIT, HANDOFF_FILES_LIMIT, HANDOFF_HYPOTHESES_LIMIT, HANDOFF_PATH_LIMIT,
+  HANDOFF_VERIFICATION_LIMIT, observationSchema, progressHeartbeatSchema,
+  TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type TaskRuntimeState,
+} from '../src/contracts.js'
 import { DEFAULT_DECISION_POLICY } from '@dsh-gate/decision-policy'
 
 const packet = { schemaVersion: 1, taskId: 's1', completionToken: 'token', objective: 'ship it', writerMode: 'writer' }
@@ -70,6 +74,64 @@ describe('authoritative completion fold', () => {
       status: 'COMPLETED', sessionId: 's1', runId: packetV2.runId,
       stage: 'verified', summary: 'canonical result',
     })
+  })
+
+  it('bounds every worker-controlled handoff collection before returning it to Codex', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+    }
+    const startV2 = event('user/message', 0, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+    })
+    const manifest = Array.from({ length: HANDOFF_ARTIFACTS_LIMIT + 1 }, (_, index) => ({
+      path: `${String(index)}.md`, bytes: 1, sha256: 'a'.repeat(64),
+    }))
+    const canonical = {
+      sessionId: packetV2.sessionId,
+      runId: packetV2.runId,
+      completionToken: packetV2.completionToken,
+      status: 'completed',
+      stage: 's'.repeat(1_000),
+      summary: 'x'.repeat(4_000),
+      files: Array.from({ length: HANDOFF_FILES_LIMIT + 1 }, () => 'f'.repeat(HANDOFF_PATH_LIMIT + 1)),
+      verification: Array.from({ length: HANDOFF_VERIFICATION_LIMIT + 1 }, () => ({
+        command: 'c'.repeat(1_000), outcome: 'passed', summary: 'v'.repeat(1_000),
+      })),
+      blocker: 'b'.repeat(2_000),
+      failureSignature: 'e'.repeat(1_000),
+      attemptedHypotheses: Array.from({ length: HANDOFF_HYPOTHESES_LIMIT + 1 }, () => 'h'.repeat(1_000)),
+    }
+    const observed = deriveObservation(state([
+      startV2,
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'large-handoff', name: 'supervisor_handoff', arguments: JSON.stringify(canonical),
+      }),
+      event('tool/result', 3, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'large-handoff' }, content: [{
+          type: 'tool-result',
+          content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff: canonical, artifacts: manifest }) }],
+        }] },
+      }),
+      event('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+    ]))
+
+    expect(observed.status).toBe('COMPLETED')
+    expect(observed.files).toHaveLength(HANDOFF_FILES_LIMIT)
+    expect(observed.files[0]).toHaveLength(HANDOFF_PATH_LIMIT)
+    expect(observed.verification).toHaveLength(HANDOFF_VERIFICATION_LIMIT)
+    expect(observed.attemptedHypotheses).toHaveLength(HANDOFF_HYPOTHESES_LIMIT)
+    expect(observed.artifacts).toHaveLength(HANDOFF_ARTIFACTS_LIMIT)
+    expect(observed.handoffTruncated?.fields).toEqual(expect.arrayContaining([
+      'stage', 'summary', 'files', 'verification', 'blocker', 'failureSignature', 'attemptedHypotheses', 'artifacts',
+    ]))
+    expect(observationSchema.safeParse(observed).success).toBe(true)
   })
 
   it('never guesses success from turn/end alone', () => {

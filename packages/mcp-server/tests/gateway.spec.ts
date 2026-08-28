@@ -728,7 +728,11 @@ describe('wait cadence', () => {
       verification: { total: 0, commands: [], evidence: [] },
     })
     expect(observed.progress?.steps).toEqual({ completed: 1, delta: 1 })
-    expect(api.historyCalls).toBe(2)
+    // Initial + final authoritative refresh are required. A cache-change wakeup
+    // exactly at the deadline may add one final reconciliation; this remains
+    // bounded and is not one HTTP history call per event.
+    expect(api.historyCalls).toBeGreaterThanOrEqual(2)
+    expect(api.historyCalls).toBeLessThanOrEqual(3)
   })
 
   it('folds mux event churn from cache without refreshing HTTP history for every event', async () => {

@@ -51,6 +51,18 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 
 /** Maximum length of `supervisor_handoff.summary`. Longer reports must become artifacts. */
 export const HANDOFF_SUMMARY_LIMIT = 2_048
+export const HANDOFF_STAGE_LIMIT = 128
+export const HANDOFF_FILES_LIMIT = 64
+export const HANDOFF_PATH_LIMIT = 256
+export const HANDOFF_VERIFICATION_LIMIT = 32
+export const HANDOFF_VERIFICATION_COMMAND_LIMIT = 256
+export const HANDOFF_VERIFICATION_SUMMARY_LIMIT = 512
+export const HANDOFF_BLOCKER_LIMIT = 1_024
+export const HANDOFF_FAILURE_SIGNATURE_LIMIT = 256
+export const HANDOFF_HYPOTHESES_LIMIT = 16
+export const HANDOFF_HYPOTHESIS_LIMIT = 512
+export const HANDOFF_ARTIFACTS_LIMIT = 16
+export const HANDOFF_ARTIFACT_PATH_LIMIT = 512
 /** Ordinary semantic progress records are accepted at most once per minute. */
 export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
 
@@ -86,6 +98,46 @@ type HandoffIdentityArgs = {
   sessionId?: string | undefined
   runId?: string | undefined
   completionToken: string
+}
+
+export type HandoffPayloadArgs = HandoffIdentityArgs & {
+  stage: string
+  summary: string
+  files: string[]
+  verification: Array<{ command: string; outcome: 'passed' | 'failed' | 'not_run'; summary: string }>
+  blocker?: string | undefined
+  failureSignature?: string | undefined
+  attemptedHypotheses?: string[] | undefined
+  artifacts: string[]
+}
+
+/** Defense-in-depth for programmatic callers that bypass the generated tool schema. */
+export function handoffPayloadError(args: HandoffPayloadArgs): string | undefined {
+  const checks: Array<[boolean, string]> = [
+    [args.stage.length > HANDOFF_STAGE_LIMIT, `stage exceeds ${HANDOFF_STAGE_LIMIT} characters`],
+    [args.files.length > HANDOFF_FILES_LIMIT, `files exceeds ${HANDOFF_FILES_LIMIT} entries`],
+    [args.files.some(value => value.length > HANDOFF_PATH_LIMIT), `a files path exceeds ${HANDOFF_PATH_LIMIT} characters`],
+    [args.verification.length > HANDOFF_VERIFICATION_LIMIT, `verification exceeds ${HANDOFF_VERIFICATION_LIMIT} entries`],
+    [args.verification.some(value => value.command.length > HANDOFF_VERIFICATION_COMMAND_LIMIT),
+      `a verification command exceeds ${HANDOFF_VERIFICATION_COMMAND_LIMIT} characters`],
+    [args.verification.some(value => value.summary.length > HANDOFF_VERIFICATION_SUMMARY_LIMIT),
+      `a verification summary exceeds ${HANDOFF_VERIFICATION_SUMMARY_LIMIT} characters`],
+    [(args.blocker?.length ?? 0) > HANDOFF_BLOCKER_LIMIT, `blocker exceeds ${HANDOFF_BLOCKER_LIMIT} characters`],
+    [(args.failureSignature?.length ?? 0) > HANDOFF_FAILURE_SIGNATURE_LIMIT,
+      `failureSignature exceeds ${HANDOFF_FAILURE_SIGNATURE_LIMIT} characters`],
+    [(args.attemptedHypotheses?.length ?? 0) > HANDOFF_HYPOTHESES_LIMIT,
+      `attemptedHypotheses exceeds ${HANDOFF_HYPOTHESES_LIMIT} entries`],
+    [args.attemptedHypotheses?.some(value => value.length > HANDOFF_HYPOTHESIS_LIMIT) === true,
+      `an attempted hypothesis exceeds ${HANDOFF_HYPOTHESIS_LIMIT} characters`],
+    [args.artifacts.length > HANDOFF_ARTIFACTS_LIMIT, `artifacts exceeds ${HANDOFF_ARTIFACTS_LIMIT} entries`],
+    [args.artifacts.some(value => value.length > HANDOFF_ARTIFACT_PATH_LIMIT),
+      `an artifact path exceeds ${HANDOFF_ARTIFACT_PATH_LIMIT} characters`],
+  ]
+  const failure = checks.find(([exceeded]) => exceeded)?.[1]
+  if (failure === undefined) return undefined
+  const runId = args.runId ?? args.taskId ?? '<runId>'
+  return `supervisor_handoff ${failure}. Keep the handoff compact; write complete detail under `
+    + `.dsh-handoff/${runId}/ inside the session cwd and reference that report in artifacts.`
 }
 
 type ProgressIdentityArgs = {
@@ -1007,7 +1059,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'for a legacy schemaVersion 1 packet, pass taskId and completionToken. '
       + 'Keep `supervisor_handoff.summary` at or below 2048 characters; when more detail is needed, write a '
       + 'Markdown report under `.dsh-handoff/<runId>/` inside the session cwd, include its relative path in '
-      + '`artifacts`, and reference it from the concise summary. '
+      + '`artifacts`, and reference it from the concise summary. Keep the file list, verification claims, blocker, '
+      + 'failure signature, hypotheses, and artifact manifest compact; their schemas are also bounded. '
       + 'Use `supervisor_progress` only for bounded milestone changes; it never ends the turn. When a decision is needed, '
       + 'include the structured decision category, impact, blocking state, request, options, and recommendation. '
       + '`needsSupervisor` is a migration hint; the runtime policy decides whether the request interrupts immediately or '
@@ -1126,31 +1179,41 @@ export function apply(ctx: Context, config: Config = {}): void {
     name: 'supervisor_handoff',
     description: 'Create the authoritative external-supervisor handoff and conclude this turn. Completion is valid '
       + 'only when the packet session/run identity and completionToken match and this successful tool result is followed by '
-      + 'the corresponding turn/end event.',
+      + 'the corresponding turn/end event. All model-facing fields and collection sizes are bounded; put complete detail '
+      + 'in an admitted .dsh-handoff/<runId>/ report instead of expanding the tool payload.',
     parameters: {
       taskId: { type: 'string', description: 'Legacy schemaVersion 1 session/task id.' },
       sessionId: { type: 'string', description: 'SchemaVersion 2 durable DSH session id.' },
       runId: { type: 'string', description: 'SchemaVersion 2 supervised run id.' },
       completionToken: { type: 'string', required: true },
       status: { type: 'string', required: true, enum: [...HANDOFF_STATUSES] },
-      stage: { type: 'string', required: true },
-      summary: { type: 'string', required: true },
-      files: { type: 'array', required: true, items: { type: 'string' } },
+      stage: { type: 'string', required: true, maxLength: HANDOFF_STAGE_LIMIT },
+      summary: { type: 'string', required: true, maxLength: HANDOFF_SUMMARY_LIMIT },
+      files: {
+        type: 'array', required: true, maxItems: HANDOFF_FILES_LIMIT,
+        items: { type: 'string', maxLength: HANDOFF_PATH_LIMIT },
+      },
       verification: {
-        type: 'array', required: true,
+        type: 'array', required: true, maxItems: HANDOFF_VERIFICATION_LIMIT,
         items: {
           type: 'object', additionalProperties: false,
           properties: {
-            command: { type: 'string', required: true },
+            command: { type: 'string', required: true, maxLength: HANDOFF_VERIFICATION_COMMAND_LIMIT },
             outcome: { type: 'string', required: true, enum: ['passed', 'failed', 'not_run'] },
-            summary: { type: 'string', required: true },
+            summary: { type: 'string', required: true, maxLength: HANDOFF_VERIFICATION_SUMMARY_LIMIT },
           },
         },
       },
-      blocker: { type: 'string' },
-      failureSignature: { type: 'string' },
-      attemptedHypotheses: { type: 'array', items: { type: 'string' } },
-      artifacts: { type: 'array', required: true, items: { type: 'string' } },
+      blocker: { type: 'string', maxLength: HANDOFF_BLOCKER_LIMIT },
+      failureSignature: { type: 'string', maxLength: HANDOFF_FAILURE_SIGNATURE_LIMIT },
+      attemptedHypotheses: {
+        type: 'array', maxItems: HANDOFF_HYPOTHESES_LIMIT,
+        items: { type: 'string', maxLength: HANDOFF_HYPOTHESIS_LIMIT },
+      },
+      artifacts: {
+        type: 'array', required: true, maxItems: HANDOFF_ARTIFACTS_LIMIT,
+        items: { type: 'string', maxLength: HANDOFF_ARTIFACT_PATH_LIMIT },
+      },
     },
     output: {
       schema: {
@@ -1179,6 +1242,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (identityError !== undefined) throw new Error(identityError)
       const summaryError = handoffSummaryError(args.summary, args.runId ?? args.taskId)
       if (summaryError !== undefined) throw new Error(summaryError)
+      const payloadError = handoffPayloadError(args)
+      if (payloadError !== undefined) throw new Error(payloadError)
       const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       const handoff = {
         ...args.taskId === undefined ? {} : { taskId: args.taskId },

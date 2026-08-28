@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
-  HANDOFF_SUMMARY_LIMIT, SUPERVISOR_PROGRESS_MIN_INTERVAL_MS,
-  handoffIdentityError, handoffSummaryError, progressIdentityError, supervisorProgressDecision,
+  HANDOFF_FILES_LIMIT, HANDOFF_PATH_LIMIT, HANDOFF_SUMMARY_LIMIT, SUPERVISOR_PROGRESS_MIN_INTERVAL_MS,
+  handoffIdentityError, handoffPayloadError, handoffSummaryError, progressIdentityError, supervisorProgressDecision,
+  type HandoffPayloadArgs,
 } from '../src/index.js'
 
 describe('handoff summary limit', () => {
@@ -25,6 +26,26 @@ describe('handoff summary limit', () => {
   it('falls back to a generic placeholder when no task id is available', () => {
     const error = handoffSummaryError('x'.repeat(HANDOFF_SUMMARY_LIMIT + 1))
     expect(error).toContain('.dsh-handoff/<taskId>/')
+  })
+})
+
+describe('handoff payload limits', () => {
+  const base = (): HandoffPayloadArgs => ({
+    sessionId: 'session-1', runId: '11111111-1111-4111-8111-111111111111', completionToken: 'token',
+    stage: 'done', summary: 'verified', files: [], verification: [], artifacts: [],
+  })
+
+  it('accepts compact fields at their boundaries', () => {
+    const args = base()
+    args.files = Array.from({ length: HANDOFF_FILES_LIMIT }, () => 'x'.repeat(HANDOFF_PATH_LIMIT))
+    expect(handoffPayloadError(args)).toBeUndefined()
+  })
+
+  it('rejects an oversized field with the artifact recovery convention', () => {
+    const args = base()
+    args.files = Array.from({ length: HANDOFF_FILES_LIMIT + 1 }, (_, index) => `file-${index}`)
+    expect(handoffPayloadError(args)).toMatch(/files exceeds 64 entries/)
+    expect(handoffPayloadError(args)).toContain(`.dsh-handoff/${args.runId}/`)
   })
 })
 

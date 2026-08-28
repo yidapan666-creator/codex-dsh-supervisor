@@ -41,7 +41,7 @@ Run the narrowest relevant verification after a coherent or high-risk edit batch
 
 Never stop the DSH Host when the MCP task ends. On MCP restart, reconnect to the configured Host and the same session id. Verify artifact hashes and paths from the returned manifest before relying on them.
 
-Worker handoff summaries stay at or below 2048 characters; detailed task reports arrive as admitted artifacts under `.dsh-handoff/<runId>/` inside the session cwd (gitignored; legacy v1 packets may use taskId). Do not treat an over-limit summary as a failure to report detail — the worker should shorten the summary and pass the report path in `artifacts`.
+Worker handoff summaries stay at or below 2048 characters, and the file list, verification claims, blocker/failure fields, hypotheses, and artifact list must remain within the bounded tool schema; detailed task reports arrive as admitted artifacts under `.dsh-handoff/<runId>/` inside the session cwd (gitignored; legacy v1 packets may use taskId). Do not treat an over-limit field as a failure to report detail — the worker should compact it and pass the report path in `artifacts`. If an observation carries `handoffTruncated`, tell the user which malformed or legacy fields MCP defensively bounded and rely on admitted artifacts for full detail.
 
 Keep authority separated: DSH handles safe local execution, Codex decides material engineering or architecture changes, and the human decides security-sensitive or external side effects.
 

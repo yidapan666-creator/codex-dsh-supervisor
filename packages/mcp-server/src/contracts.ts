@@ -9,14 +9,28 @@ export type FailureKind = z.infer<typeof failureKindSchema>
 export const workerStateSchema = z.enum(['RUNNING', 'IDLE', 'UNKNOWN'])
 export type WorkerState = z.infer<typeof workerStateSchema>
 
+export const HANDOFF_STAGE_LIMIT = 128
+export const HANDOFF_SUMMARY_LIMIT = 2_048
+export const HANDOFF_FILES_LIMIT = 64
+export const HANDOFF_PATH_LIMIT = 256
+export const HANDOFF_VERIFICATION_LIMIT = 32
+export const HANDOFF_VERIFICATION_COMMAND_LIMIT = 256
+export const HANDOFF_VERIFICATION_SUMMARY_LIMIT = 512
+export const HANDOFF_BLOCKER_LIMIT = 1_024
+export const HANDOFF_FAILURE_SIGNATURE_LIMIT = 256
+export const HANDOFF_HYPOTHESES_LIMIT = 16
+export const HANDOFF_HYPOTHESIS_LIMIT = 512
+export const HANDOFF_ARTIFACTS_LIMIT = 16
+export const HANDOFF_ARTIFACT_PATH_LIMIT = 512
+
 export const verificationSchema = z.object({
-  command: z.string(),
+  command: z.string().max(HANDOFF_VERIFICATION_COMMAND_LIMIT),
   outcome: z.enum(['passed', 'failed', 'not_run']),
-  summary: z.string(),
+  summary: z.string().max(HANDOFF_VERIFICATION_SUMMARY_LIMIT),
 })
 
 export const artifactSchema = z.object({
-  path: z.string(),
+  path: z.string().max(HANDOFF_ARTIFACT_PATH_LIMIT),
   bytes: z.number().int().nonnegative(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
 })
@@ -133,11 +147,11 @@ export const observationSchema = z.object({
     'SUPERVISOR_REQUIRED', 'MAJOR_CHECKPOINT', 'FAILED', 'ESCALATION_REQUIRED', 'WAITING',
   ]),
   workerState: workerStateSchema,
-  stage: z.string(),
+  stage: z.string().max(HANDOFF_STAGE_LIMIT),
   summary: z.string().max(2_048),
-  files: z.array(z.string()),
-  verification: z.array(verificationSchema),
-  blocker: z.string().optional(),
+  files: z.array(z.string().max(HANDOFF_PATH_LIMIT)).max(HANDOFF_FILES_LIMIT),
+  verification: z.array(verificationSchema).max(HANDOFF_VERIFICATION_LIMIT),
+  blocker: z.string().max(HANDOFF_BLOCKER_LIMIT).optional(),
   failure: z.object({
     kind: failureKindSchema,
     message: z.string(),
@@ -152,9 +166,14 @@ export const observationSchema = z.object({
     rpcId: z.string(), approvalId: z.string(), toolName: z.string(), callId: z.string().optional(), reason: z.string().optional(),
   }).optional(),
   question: z.object({ rpcId: z.string(), questions: z.array(z.unknown()) }).optional(),
-  failureSignature: z.string().optional(),
-  attemptedHypotheses: z.array(z.string()).optional(),
-  artifacts: z.array(artifactSchema),
+  failureSignature: z.string().max(HANDOFF_FAILURE_SIGNATURE_LIMIT).optional(),
+  attemptedHypotheses: z.array(z.string().max(HANDOFF_HYPOTHESIS_LIMIT)).max(HANDOFF_HYPOTHESES_LIMIT).optional(),
+  artifacts: z.array(artifactSchema).max(HANDOFF_ARTIFACTS_LIMIT),
+  handoffTruncated: z.object({
+    fields: z.array(z.enum([
+      'stage', 'summary', 'files', 'verification', 'blocker', 'failureSignature', 'attemptedHypotheses', 'artifacts',
+    ])).max(8),
+  }).strict().optional(),
   telemetry: z.object({
     asOfSeq: z.number().int().min(-1),
     tokenUsage: z.unknown().optional(),

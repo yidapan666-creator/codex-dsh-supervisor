@@ -65,7 +65,7 @@ The queued prompt starts with the human-readable objective and embeds the durabl
 
 ## Long handoff details
 
-`supervisor_handoff.summary` is capped at 2048 characters. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<runId>/` (legacy v1: taskId) inside the session cwd, pass the relative path in `artifacts`, and reference it from the concise summary. The directory is gitignored. The handoff tool rejects over-limit summaries with exactly this instruction and never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
+`supervisor_handoff.summary` is capped at 2048 characters. File lists (64), verification claims (32), attempted hypotheses (16), artifacts (16), and every model-facing string are bounded too; Host-side input validation rejects overflow, while the MCP fold defensively caps malformed or legacy output and reports the affected fields in `handoffTruncated`. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<runId>/` (legacy v1: taskId) inside the session cwd, pass the relative path in `artifacts`, and reference it from the concise summary. The directory is gitignored. The handoff tool never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
 
 ## Model-free run journal
 

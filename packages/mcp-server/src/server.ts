@@ -51,6 +51,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 're-poll on ordinary event churn. Surface activity coverage and runtime verification evidence separately from worker claims, and recap steps, tools, token deltas, project activity, '
       + 'and verification results at terminal state. '
       + 'Terminal observations also report whether the model-free run journal was recorded; journal warnings never change the task outcome. '
+      + 'If handoffTruncated is present, disclose which legacy or malformed handoff fields were defensively bounded; complete detail belongs in an admitted artifact. '
       + 'Treat decisionShadow as observer-only comparison data; only decision controls the current run. '
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
       + 'When creating a session, pass the target project absolute cwd; reconnect preserves the durable session cwd and must not redirect it. '
