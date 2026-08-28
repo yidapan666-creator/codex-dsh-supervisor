@@ -80,6 +80,8 @@ export interface GatewayDependencies {
   resolveWriterDomain?: (cwd: string) => Promise<string>
   /** Overridable for tests; defaults to a real {@link HostConnection}. */
   createConnection?: (baseUrl: string) => HostConnection
+  /** Overridable for tests; defaults to detached Host launch. */
+  launchHost?: (config: HostLaunchConfig) => Promise<void>
 }
 
 export function attachChildObservations<T extends { id: string }>(
@@ -190,6 +192,7 @@ export class GatewayManager {
   private readonly knownUrls: string[]
   private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
+  private readonly launchHost: (config: HostLaunchConfig) => Promise<void>
   private readonly decisionPolicy: DecisionPolicy
   private readonly shadowDecisionPolicy: DecisionPolicy | undefined
   private readonly decisionPolicies = new Map<string, DecisionPolicy>()
@@ -203,6 +206,7 @@ export class GatewayManager {
     this.knownUrls = [...new Set(config.hostUrls.map(normalizedUrl))]
     this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
     this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
+    this.launchHost = deps.launchHost ?? launchDetachedHost
     this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
     this.shadowDecisionPolicy = config.shadowDecisionPolicy
     for (const policy of [...config.decisionPolicyCatalog ?? [], this.decisionPolicy,
@@ -296,11 +300,14 @@ export class GatewayManager {
   }
 
   private async launchConfiguredHost(): Promise<void> {
-    if (this.config.launch === undefined) throw new Error('no DSH Host launch command is configured')
-    this.launchPromise ??= launchDetachedHost(this.config.launch).finally(() => { this.launchPromise = undefined })
+    const launchConfig = this.config.launch
+    if (launchConfig === undefined) throw new Error('no DSH Host launch command is configured')
+    this.launchPromise ??= (async () => {
+      await this.launchHost(launchConfig)
+      const first = this.knownUrls[0]
+      if (first !== undefined) await this.connection(first).ensureConnected(15_000)
+    })().finally(() => { this.launchPromise = undefined })
     await this.launchPromise
-    const first = this.knownUrls[0]
-    if (first !== undefined) await this.connection(first).ensureConnected(15_000)
   }
 
   async startOrConnect(input: {
@@ -321,7 +328,7 @@ export class GatewayManager {
         description = await connection.ensureConnected(2_000)
       } catch (firstError) {
         if (this.config.launch === undefined) throw firstError
-        await launchDetachedHost(this.config.launch)
+        await this.launchConfiguredHost()
         description = await connection.ensureConnected(15_000)
       }
     }

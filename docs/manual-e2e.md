@@ -9,6 +9,9 @@
    `dsh web --host 127.0.0.1 --port 8080 --no-open` with the project-local
    `DSH_HOME`). Leave it running; `pnpm host:status` shows the
    `hostInstanceId`. `pnpm run doctor --live` verifies `protocolVersion=1`.
+   In a disposable stopped-Host check, invoke two `pnpm host:start` commands
+   concurrently and confirm both succeed while `host:status` reports one PID
+   and one `hostInstanceId`; the startup lease file must be absent afterward.
 3. Add the MCP config from `config/codex-mcp.example.toml` to Codex and restart MCP. Replace the `<workspace-root>` placeholder with this checkout's absolute path.
    Build the decision package and run `pnpm policy:explain -- --policy config/decision-policies/2026-08-26.v1.json --facts '{"signal":"WORKER_DECISION","category":"information","impact":"low","blocking":false}'`. Confirm the matched rule and digest. Repeat with `--shadow config/decision-policies/2026-08-26.shadow-v1.json`; confirm only the comparison changes.
 4. Call `dsh_start_or_connect`, pass its `sessionId` to `dsh_task`, record the returned unique `runId`, and call `dsh_wait` with that exact `sessionId + runId` and the default timeout. Expect about one `WAITING/TIMEOUT` observation per five-minute window, each aggregating `progress` since the previous `asOfSeq` (step delta, tool counts, token deltas, and the compact `projectActivity` edits/verification summary); do not re-poll on ordinary churn. Have the worker publish ordinary `supervisor_progress` and confirm it is folded into the cadence. Then publish a low-impact non-blocking structured decision and confirm it stays in cadence, followed by a sensitive or blocking structured decision and confirm the returned `decision` explains whether `SUPERVISOR_REQUIRED` is immediate and which audience/action applies. Confirm later guidance consumes that request. Carry the returned `asOfSeq` into the next `afterAsOfSeq`.

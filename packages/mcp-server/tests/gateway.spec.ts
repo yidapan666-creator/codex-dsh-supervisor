@@ -498,6 +498,69 @@ describe('multi-Host reconnect', () => {
   })
 })
 
+describe('Host launch coalescing', () => {
+  it('launches only once when concurrent start_or_connect calls find the Host offline', async () => {
+    let launchRequested = false
+    let initialProbeCalls = 0
+    let launchCalls = 0
+    let signalInitialProbes!: () => void
+    let allowInitialProbesToFail!: () => void
+    let signalLaunchStarted!: () => void
+    let allowHostToBecomeReady!: () => void
+    const initialProbes = new Promise<void>(resolve => { signalInitialProbes = resolve })
+    const initialProbesMayFail = new Promise<void>(resolve => { allowInitialProbesToFail = resolve })
+    const launchStarted = new Promise<void>(resolve => { signalLaunchStarted = resolve })
+    const hostMayBecomeReady = new Promise<void>(resolve => { allowHostToBecomeReady = resolve })
+    let nextSession = 0
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => {
+        if (!launchRequested) {
+          initialProbeCalls++
+          if (initialProbeCalls === 2) signalInitialProbes()
+          await initialProbesMayFail
+          throw new Error('Host offline')
+        }
+        await hostMayBecomeReady
+        return { protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }
+      },
+      api: {
+        sessions: {
+          create: async () => ({ result: { ok: true, value: { sessionId: `s-${++nextSession}` } } }),
+        },
+      },
+      refreshSession: async () => ({ cwd: '/work/tree' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({
+      hostUrls: ['http://host'],
+      launch: { argv: ['host-start'] },
+      runJournal: false,
+    }, {
+      createConnection: () => connection,
+      launchHost: async () => {
+        launchCalls++
+        launchRequested = true
+        signalLaunchStarted()
+      },
+    })
+
+    const first = manager.startOrConnect({ cwd: '/work/tree' })
+    const second = manager.startOrConnect({ cwd: '/work/tree' })
+    await initialProbes
+    allowInitialProbesToFail()
+    await launchStarted
+    await sleep(5)
+    expect(launchCalls).toBe(1)
+    allowHostToBecomeReady()
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ sessionId: 's-1', hostInstanceId: 'host-1' }),
+      expect.objectContaining({ sessionId: 's-2', hostInstanceId: 'host-1' }),
+    ])
+    expect(launchCalls).toBe(1)
+  })
+})
+
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 const s1Packet = (seq: number): DshEvent => event('user/message', seq, {
   content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify({

@@ -12,6 +12,7 @@
 
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Compatibility contract constants
@@ -77,6 +78,7 @@ export function resolvePaths(options = {}) {
     hostDir: join(stateDir, 'host'),
     installJson: join(stateDir, 'install.json'),
     hostPidFile: join(stateDir, 'host', 'host.pid'),
+    hostStartLockFile: join(stateDir, 'host', 'host.start.lock'),
     hostLogFile: join(stateDir, 'logs', 'host.log'),
     linkPath: join(root, 'packages', 'mcp-server', 'node_modules', '@deepseek-ai', 'dsh-client-connection'),
     pluginPath: join(root, 'packages', 'dsh-supervisor-tools'),
@@ -630,6 +632,38 @@ export async function readHostPidFile(paths, io) {
     return JSON.parse(raw)
   } catch {
     return undefined
+  }
+}
+
+/**
+ * Acquire the short-lived cross-process Host startup lease. The lease protects
+ * only PID/port discovery plus startup; it is unrelated to working-tree writer
+ * admission. Contenders wait for the winner to publish a ready Host and then
+ * re-run the ordinary idempotent checks. An orphan is never guessed stale.
+ */
+export async function acquireHostStartLease(paths, io, options = {}) {
+  const waitMs = options.waitMs ?? 35_000
+  const retryMs = options.retryMs ?? 100
+  const deadline = Date.now() + waitMs
+  const ownedRecord = `${process.pid} ${randomUUID()}\n`
+  while (true) {
+    try {
+      await io.writeFileExclusive(paths.hostStartLockFile, ownedRecord)
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for Host startup lease ${paths.hostStartLockFile}; confirm no host:start process is running, then remove the orphaned lease manually`)
+    }
+    await (io.sleep?.(retryMs) ?? new Promise(resolveWait => setTimeout(resolveWait, retryMs)))
+  }
+  return async () => {
+    const current = await io.readFile(paths.hostStartLockFile).catch(() => undefined)
+    if (current !== ownedRecord) {
+      throw new Error(`Host startup lease ownership changed at ${paths.hostStartLockFile}; refusing to remove it`)
+    }
+    await io.rm(paths.hostStartLockFile, { force: true })
   }
 }
 

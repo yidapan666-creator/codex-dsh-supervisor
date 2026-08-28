@@ -122,6 +122,7 @@ Bootstrap **never starts the Host** — that is a separate, explicit step
 | `.dsh-state/install.json` | install metadata (pin, paths, versions) |
 | `.dsh-state/logs/host.log` | detached Host output |
 | `.dsh-state/host/host.pid` | Host process record (pid, argv, url) |
+| `.dsh-state/host/host.start.lock` | short-lived Host startup lease; absent outside startup |
 
 `.dsh-state/` is in `.gitignore`: none of it can enter the public repository.
 Normal workspace build products (`node_modules/`, package `dist/` directories,
@@ -160,13 +161,25 @@ recorded in `.dsh-state/host/host.pid` — and only after verifying its command
 line matches the dsh-gate Host, so it never kills an unrelated process. A Host
 started outside dsh-gate is never touched.
 
+Concurrent starts are safe at both layers. One MCP process coalesces its own
+overlapping launch requests, while `host:start` takes an exclusive,
+cross-process startup lease across PID/port discovery and the readiness probe.
+Other MCP processes wait, then reconnect to the winner instead of spawning a
+second Host. This lease is only for Host startup; it is not a working-tree
+writer lock manager. If a `host:start` process is killed before its `finally`
+cleanup, the lease is deliberately not guessed stale. Confirm that no
+`host:start` process remains, then remove
+`.dsh-state/host/host.start.lock` manually and retry.
+
 - **Stopping MCP never stops the Host.** The MCP server holds no kill
   capability; its connection close only stops its own client.
 - **Optional auto-launch:** set `DSH_HOST_LAUNCH` in the MCP environment to
   `{"argv":["node","<workspace-root>/scripts/dsh-gate.mjs","host","start"]}`
   (see `config/codex-mcp.example.toml`). The launch is detached with ignored
-  stdio; MCP never retains a kill capability, and `pnpm host:stop` remains
-  the stop path.
+  stdio; concurrent MCP launch requests converge through the startup lease,
+  MCP never retains a kill capability, and `pnpm host:stop` remains the stop
+  path. A custom launch command that bypasses `scripts/dsh-gate.mjs host
+  start` must provide its own cross-process idempotency.
 - **Browser visibility:** the Host serves the DSH Web UI itself at
   `http://127.0.0.1:8080`. Bootstrap and host commands never open a browser
   (`--no-open`); open the URL manually when you want the UI.

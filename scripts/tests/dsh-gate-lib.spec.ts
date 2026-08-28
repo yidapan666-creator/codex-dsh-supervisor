@@ -27,6 +27,7 @@ import {
   runDoctor,
   summarizeDoctor,
   validateCheckout,
+  acquireHostStartLease,
 } from '../dsh-gate-lib.mjs'
 
 const PIN = DSH_PINNED_COMMIT
@@ -49,12 +50,16 @@ function makeFakeIo(overrides = {}) {
       return typeof value === 'string' ? value : JSON.stringify(value)
     },
     writeFile: async (path, content) => { files.set(path, content) },
+    writeFileExclusive: async (path, content) => {
+      if (files.has(path)) throw Object.assign(new Error(`EEXIST: ${path}`), { code: 'EEXIST' })
+      files.set(path, content)
+    },
     rename: async (from, to) => { files.set(to, files.get(from)); files.delete(from) },
     mkdir: async () => {},
     realpath: async (path) => overrides.realpath?.(path) ?? path,
     lstat: async (path) => ({ isSymbolicLink: () => overrides.symlinkPaths?.includes(path) ?? false }),
     readlink: async () => '',
-    rm: async () => {},
+    rm: async (path) => { files.delete(path) },
     readJson: async (path) => JSON.parse(await (typeof files.get(path) === 'string' ? files.get(path) : JSON.stringify(files.get(path)))),
     writeJson: async (path, value) => { files.set(path, value) },
     exec: async (command, args) => {
@@ -135,6 +140,7 @@ describe('resolvePaths', () => {
     expect(paths.dshRepo).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/dsh`)
     expect(paths.dshHome).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/dsh-home`)
     expect(paths.hostPidFile).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/host/host.pid`)
+    expect(paths.hostStartLockFile).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/host/host.start.lock`)
     expect(paths.installJson).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/install.json`)
   })
 
@@ -498,6 +504,36 @@ describe('hostIsAlive', () => {
       exec: { 'ps -p 123 -o command=': { status: 0, stdout: 'node /d/apps/cli/lib/bin.js web\n', stderr: '' } },
     })
     expect(await hostIsAlive(123, io)).toBe(true)
+  })
+})
+
+describe('Host startup lease', () => {
+  it('serializes contenders and verifies ownership before release', async () => {
+    const paths = pathsFor()
+    const io = makeFakeIo()
+    const releaseFirst = await acquireHostStartLease(paths, io, { waitMs: 100, retryMs: 1 })
+    let secondAcquired = false
+    const second = acquireHostStartLease(paths, io, { waitMs: 100, retryMs: 1 }).then((release) => {
+      secondAcquired = true
+      return release
+    })
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(secondAcquired).toBe(false)
+    await releaseFirst()
+    const releaseSecond = await second
+    expect(secondAcquired).toBe(true)
+    await releaseSecond()
+    expect(io.files.has(paths.hostStartLockFile)).toBe(false)
+  })
+
+  it('times out without deleting another process lease', async () => {
+    const paths = pathsFor()
+    const io = makeFakeIo()
+    const release = await acquireHostStartLease(paths, io, { waitMs: 100, retryMs: 1 })
+    await expect(acquireHostStartLease(paths, io, { waitMs: 0, retryMs: 1 }))
+      .rejects.toThrow(/remove the orphaned lease manually/)
+    expect(io.files.has(paths.hostStartLockFile)).toBe(true)
+    await release()
   })
 })
 

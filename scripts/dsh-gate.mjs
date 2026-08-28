@@ -32,6 +32,7 @@ import {
   DSH_FORK_BRANCH,
   SUPERVISOR_PROFILE,
   SUPERVISOR_PLUGIN_NAME,
+  acquireHostStartLease,
 } from './dsh-gate-lib.mjs'
 
 const VERSION = '0.1.0'
@@ -51,6 +52,7 @@ const io = {
   },
   readFile: async (path) => readFile(path, 'utf8'),
   writeFile: async (path, content) => writeFile(path, content, 'utf8'),
+  writeFileExclusive: async (path, content) => writeFile(path, content, { encoding: 'utf8', flag: 'wx', mode: 0o600 }),
   rename: async (from, to) => rename(from, to),
   mkdir: async (path) => mkdir(path, { recursive: true }),
   realpath: async (path) => realpath(path),
@@ -383,79 +385,84 @@ async function runHost({ paths, options, hostAction }) {
     return true
   }
 
-  const record = await readHostPidFile(paths, io)
-  const state = record === undefined ? 'none' : await probePid(record.pid, io)
-  if (state === 'alive' || state === 'unknown') {
-    // A recorded pid is present. If it is verifiably ours and the URL
-    // responds, it is already running. If ps is unavailable but the URL
-    // responds, treat the recorded pid as ours (the pidfile is the only
-    // writer of that file) and report already-running.
-    try {
-      const value = await describeHost({ hostUrl, io })
-      const pidNote = state === 'unknown' ? `pid ${record.pid} (unverifiable via ps) ` : `pid ${record.pid} `
-      log(`Host already running ${pidNote}— ${hostUrl} hostInstanceId ${value.hostInstanceId}`)
-      return true
-    } catch {
-      if (state === 'alive') {
-        fail(`pidfile says pid ${record.pid} is alive but ${hostUrl} does not respond; stop it with 'pnpm host:stop' before starting again`)
-        return false
-      }
-      log(`pid ${record.pid} is unverifiable and ${hostUrl} does not respond — treating the pidfile as stale`)
-    }
-  }
-  if (record !== undefined) {
-    log(`clearing stale host pidfile (pid ${record.pid} not running)`)
-    await io.rm(paths.hostPidFile, { force: true })
-  }
-
-  // Refuse to shadow a Host this checkout does not manage: the port is
-  // already served (the spawned instance would die with EADDRINUSE).
-  try {
-    const foreign = await describeHost({ hostUrl, io, timeoutMs: 2000 })
-    fail(`a Host is already serving ${hostUrl} (hostInstanceId ${foreign.hostInstanceId}, cwd ${foreign.cwd}) but no dsh-gate pidfile owns it`)
-    fail(`stop that Host yourself or start on another port, for example: node scripts/dsh-gate.mjs host start --host http://127.0.0.1:18080`)
-    return false
-  } catch {
-    // port free — proceed
-  }
-
   await io.mkdir(paths.hostDir)
-  await io.mkdir(paths.logsDir)
-  const logFd = await openAppend(paths.hostLogFile)
-  const child = io.spawn(argv[0], argv.slice(1), {
-    cwd: paths.root,
-    env: { ...process.env, DSH_HOME: paths.dshHome },
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-  })
-  const pid = await new Promise((resolvePromise, rejectPromise) => {
-    child.once('error', rejectPromise)
-    child.once('spawn', () => {
-      child.unref()
-      resolvePromise(child.pid)
-    })
-  })
-  const startedAt = new Date().toISOString()
-  await io.writeJson(paths.hostPidFile, { pid, argv, startedAt, url: hostUrl, dshHome: paths.dshHome })
-  log(`Host launched pid ${pid} — log: ${paths.hostLogFile}`)
-  log(`waiting for ${hostUrl}/api/host.describe …`)
-  const deadline = Date.now() + 30_000
-  let value
-  while (Date.now() < deadline) {
-    try {
-      value = await describeHost({ hostUrl, io, timeoutMs: 3000 })
-      break
-    } catch {
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 1000))
+  const releaseStartLease = await acquireHostStartLease(paths, io)
+  try {
+    const record = await readHostPidFile(paths, io)
+    const state = record === undefined ? 'none' : await probePid(record.pid, io)
+    if (state === 'alive' || state === 'unknown') {
+      // A recorded pid is present. If it is verifiably ours and the URL
+      // responds, it is already running. If ps is unavailable but the URL
+      // responds, treat the recorded pid as ours (the pidfile is the only
+      // writer of that file) and report already-running.
+      try {
+        const value = await describeHost({ hostUrl, io })
+        const pidNote = state === 'unknown' ? `pid ${record.pid} (unverifiable via ps) ` : `pid ${record.pid} `
+        log(`Host already running ${pidNote}— ${hostUrl} hostInstanceId ${value.hostInstanceId}`)
+        return true
+      } catch {
+        if (state === 'alive') {
+          fail(`pidfile says pid ${record.pid} is alive but ${hostUrl} does not respond; stop it with 'pnpm host:stop' before starting again`)
+          return false
+        }
+        log(`pid ${record.pid} is unverifiable and ${hostUrl} does not respond — treating the pidfile as stale`)
+      }
     }
+    if (record !== undefined) {
+      log(`clearing stale host pidfile (pid ${record.pid} not running)`)
+      await io.rm(paths.hostPidFile, { force: true })
+    }
+
+    // Refuse to shadow a Host this checkout does not manage: the port is
+    // already served (the spawned instance would die with EADDRINUSE).
+    try {
+      const foreign = await describeHost({ hostUrl, io, timeoutMs: 2000 })
+      fail(`a Host is already serving ${hostUrl} (hostInstanceId ${foreign.hostInstanceId}, cwd ${foreign.cwd}) but no dsh-gate pidfile owns it`)
+      fail(`stop that Host yourself or start on another port, for example: node scripts/dsh-gate.mjs host start --host http://127.0.0.1:18080`)
+      return false
+    } catch {
+      // port free — proceed
+    }
+
+    await io.mkdir(paths.logsDir)
+    const logFd = await openAppend(paths.hostLogFile)
+    const child = io.spawn(argv[0], argv.slice(1), {
+      cwd: paths.root,
+      env: { ...process.env, DSH_HOME: paths.dshHome },
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    })
+    const pid = await new Promise((resolvePromise, rejectPromise) => {
+      child.once('error', rejectPromise)
+      child.once('spawn', () => {
+        child.unref()
+        resolvePromise(child.pid)
+      })
+    })
+    const startedAt = new Date().toISOString()
+    await io.writeJson(paths.hostPidFile, { pid, argv, startedAt, url: hostUrl, dshHome: paths.dshHome })
+    log(`Host launched pid ${pid} — log: ${paths.hostLogFile}`)
+    log(`waiting for ${hostUrl}/api/host.describe …`)
+    const deadline = Date.now() + 30_000
+    let value
+    while (Date.now() < deadline) {
+      try {
+        value = await describeHost({ hostUrl, io, timeoutMs: 3000 })
+        break
+      } catch {
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 1000))
+      }
+    }
+    if (value === undefined) {
+      fail(`Host pid ${pid} did not become reachable at ${hostUrl} within 30s; see ${paths.hostLogFile}`)
+      return false
+    }
+    log(`Host ready — protocolVersion ${value.protocolVersion}, hostInstanceId ${value.hostInstanceId}, version ${value.version}`)
+    log(`Web UI: ${hostUrl} (the Host is independent of MCP; 'pnpm host:stop' stops it, MCP never does)`)
+    return true
+  } finally {
+    await releaseStartLease()
   }
-  if (value === undefined) {
-    fail(`Host pid ${pid} did not become reachable at ${hostUrl} within 30s; see ${paths.hostLogFile}`)
-    return false
-  }
-  log(`Host ready — protocolVersion ${value.protocolVersion}, hostInstanceId ${value.hostInstanceId}, version ${value.version}`)
-  log(`Web UI: ${hostUrl} (the Host is independent of MCP; 'pnpm host:stop' stops it, MCP never does)`)
-  return true
 }
 
 async function openAppend(path) {
