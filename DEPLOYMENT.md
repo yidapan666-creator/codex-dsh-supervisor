@@ -89,8 +89,10 @@ pnpm skill:install -- --target /absolute/path/to/personal/skills
 ```
 
 The command refuses to overwrite an existing install unless `--force` is
-supplied; forced updates preserve the previous directory as a timestamped
-sibling backup.
+supplied. Forced updates preserve the previous directory under the adjacent
+non-discoverable `skill-backups/codex-dsh-supervisor/` directory; older sibling
+backups are migrated there automatically so Codex discovers only one active
+skill.
 
 Runs, in order, the following phases (each idempotent; re-running is a no-op
 when everything is already current — pass `--force` to rebuild):

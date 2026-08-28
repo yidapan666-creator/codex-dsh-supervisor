@@ -28,7 +28,7 @@ Install the included Codex supervisor skill into the personal skill directory sh
 pnpm skill:install -- --target /absolute/path/to/personal/skills
 ```
 
-The installer deliberately requires an explicit absolute target instead of guessing a global directory. Re-running with `--force` preserves the previous installation as a timestamped sibling backup before replacing it.
+The installer deliberately requires an explicit absolute target instead of guessing a global directory. Re-running with `--force` preserves the previous installation under the adjacent non-discoverable `skill-backups/codex-dsh-supervisor/` directory and migrates legacy sibling backups, so Codex sees only one active skill.
 
 Then copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path — the only machine-specific value. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
 

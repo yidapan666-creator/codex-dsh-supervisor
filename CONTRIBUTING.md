@@ -17,9 +17,9 @@ node scripts/dsh-gate.mjs bootstrap --dsh-repo /path/to/verified/deepseek-harnes
 
 The bootstrap/doctor/Host workflow is documented in `DEPLOYMENT.md`; its focused tests live in `scripts/tests/`.
 
-## Continuous integration (not enabled yet)
+## Continuous integration
 
-No CI workflow is committed. A standard Node runner can now make a clean checkout green with `pnpm bootstrap && pnpm verify` — bootstrap needs network access to the fork and the npm registry, and it must not be pointed at a pre-seeded state. Add a workflow when a maintainer confirms CI can reach those endpoints.
+The GitHub Actions workflow runs on pull requests and pushes to `main` with Node 24 and pnpm 11.19.0. It executes `pnpm bootstrap` from a clean checkout, then `pnpm verify`; bootstrap needs network access to the pinned public DSH fork commit and the npm registry and never uses pre-seeded state.
 
 ## Handoff and long reports
 

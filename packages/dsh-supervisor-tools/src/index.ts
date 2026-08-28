@@ -165,6 +165,29 @@ export type SupervisorProgressArgs = ProgressIdentityArgs & {
   } | undefined
 }
 
+/**
+ * DSH rc.8's public tool-schema DSL validates structure but does not support
+ * JSON Schema length/count keywords. Enforce the model-facing size bounds at
+ * the Host execution boundary so every caller, including programmatic ones,
+ * receives the same protection.
+ */
+export function progressPayloadError(args: SupervisorProgressArgs): string | undefined {
+  const checks: Array<[boolean, string]> = [
+    [args.milestone.length > 512, 'milestone exceeds 512 characters'],
+    [args.nextAction.length > 512, 'nextAction exceeds 512 characters'],
+    [(args.currentHypothesis?.length ?? 0) > 1_024, 'currentHypothesis exceeds 1024 characters'],
+    [(args.risk?.length ?? 0) > 512, 'risk exceeds 512 characters'],
+    [(args.decision?.request.length ?? 0) > 512, 'decision.request exceeds 512 characters'],
+    [(args.decision?.options?.length ?? 0) > 5, 'decision.options exceeds 5 entries'],
+    [args.decision?.options?.some(value => value.length > 256) === true,
+      'a decision option exceeds 256 characters'],
+    [(args.decision?.recommendation?.length ?? 0) > 512,
+      'decision.recommendation exceeds 512 characters'],
+  ]
+  const failure = checks.find(([exceeded]) => exceeded)?.[1]
+  return failure === undefined ? undefined : `supervisor_progress ${failure}`
+}
+
 type TaskIdentity = {
   schemaVersion: 1 | 2
   sessionId: string
@@ -1080,10 +1103,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       sessionId: { type: 'string', description: 'SchemaVersion 2 durable DSH session id.' },
       runId: { type: 'string', description: 'SchemaVersion 2 supervised run id.' },
       phase: { type: 'string', required: true, enum: ['investigating', 'implementing', 'verifying', 'recovering'] },
-      milestone: { type: 'string', required: true, maxLength: 512 },
-      nextAction: { type: 'string', required: true, maxLength: 512 },
-      currentHypothesis: { type: 'string', maxLength: 1024 },
-      risk: { type: 'string', maxLength: 512 },
+      milestone: { type: 'string', required: true },
+      nextAction: { type: 'string', required: true },
+      currentHypothesis: { type: 'string' },
+      risk: { type: 'string' },
       needsSupervisor: { type: 'boolean', required: true },
       decision: {
         type: 'object', additionalProperties: false,
@@ -1095,9 +1118,9 @@ export function apply(ctx: Context, config: Config = {}): void {
           impact: { type: 'string', required: true, enum: ['low', 'medium', 'high'] },
           blocking: { type: 'boolean', required: true },
           requiresHuman: { type: 'boolean' },
-          request: { type: 'string', required: true, maxLength: 512 },
-          options: { type: 'array', maxItems: 5, items: { type: 'string', maxLength: 256 } },
-          recommendation: { type: 'string', maxLength: 512 },
+          request: { type: 'string', required: true },
+          options: { type: 'array', items: { type: 'string' } },
+          recommendation: { type: 'string' },
         },
       },
     },
@@ -1115,6 +1138,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     execute(args, exec) {
       if (exec.agent === undefined) throw new Error('supervisor_progress requires an agent-owned session')
       const events = exec.agent.session.events
+      const payloadError = progressPayloadError(args)
+      if (payloadError !== undefined) throw new Error(payloadError)
       const identityError = progressIdentityError(events, args)
       if (identityError !== undefined) throw new Error(identityError)
       const decision = supervisorProgressDecision(events, args)
@@ -1187,32 +1212,32 @@ export function apply(ctx: Context, config: Config = {}): void {
       runId: { type: 'string', description: 'SchemaVersion 2 supervised run id.' },
       completionToken: { type: 'string', required: true },
       status: { type: 'string', required: true, enum: [...HANDOFF_STATUSES] },
-      stage: { type: 'string', required: true, maxLength: HANDOFF_STAGE_LIMIT },
-      summary: { type: 'string', required: true, maxLength: HANDOFF_SUMMARY_LIMIT },
+      stage: { type: 'string', required: true },
+      summary: { type: 'string', required: true },
       files: {
-        type: 'array', required: true, maxItems: HANDOFF_FILES_LIMIT,
-        items: { type: 'string', maxLength: HANDOFF_PATH_LIMIT },
+        type: 'array', required: true,
+        items: { type: 'string' },
       },
       verification: {
-        type: 'array', required: true, maxItems: HANDOFF_VERIFICATION_LIMIT,
+        type: 'array', required: true,
         items: {
           type: 'object', additionalProperties: false,
           properties: {
-            command: { type: 'string', required: true, maxLength: HANDOFF_VERIFICATION_COMMAND_LIMIT },
+            command: { type: 'string', required: true },
             outcome: { type: 'string', required: true, enum: ['passed', 'failed', 'not_run'] },
-            summary: { type: 'string', required: true, maxLength: HANDOFF_VERIFICATION_SUMMARY_LIMIT },
+            summary: { type: 'string', required: true },
           },
         },
       },
-      blocker: { type: 'string', maxLength: HANDOFF_BLOCKER_LIMIT },
-      failureSignature: { type: 'string', maxLength: HANDOFF_FAILURE_SIGNATURE_LIMIT },
+      blocker: { type: 'string' },
+      failureSignature: { type: 'string' },
       attemptedHypotheses: {
-        type: 'array', maxItems: HANDOFF_HYPOTHESES_LIMIT,
-        items: { type: 'string', maxLength: HANDOFF_HYPOTHESIS_LIMIT },
+        type: 'array',
+        items: { type: 'string' },
       },
       artifacts: {
-        type: 'array', required: true, maxItems: HANDOFF_ARTIFACTS_LIMIT,
-        items: { type: 'string', maxLength: HANDOFF_ARTIFACT_PATH_LIMIT },
+        type: 'array', required: true,
+        items: { type: 'string' },
       },
     },
     output: {

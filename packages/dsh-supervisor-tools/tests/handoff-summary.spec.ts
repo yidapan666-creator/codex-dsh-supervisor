@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   HANDOFF_FILES_LIMIT, HANDOFF_PATH_LIMIT, HANDOFF_SUMMARY_LIMIT, SUPERVISOR_PROGRESS_MIN_INTERVAL_MS,
-  handoffIdentityError, handoffPayloadError, handoffSummaryError, progressIdentityError, supervisorProgressDecision,
+  handoffIdentityError, handoffPayloadError, handoffSummaryError, progressIdentityError, progressPayloadError,
+  supervisorProgressDecision,
   type HandoffPayloadArgs,
 } from '../src/index.js'
 
@@ -116,6 +117,19 @@ describe('bounded supervisor progress', () => {
     expect(progressIdentityError([packet(v2)], {
       ...progress, runId: '33333333-3333-4333-8333-333333333333',
     })).toMatch(/runId does not match/i)
+  })
+
+  it('enforces progress field and collection bounds at the Host execution boundary', () => {
+    expect(progressPayloadError(progress)).toBeUndefined()
+    expect(progressPayloadError({ ...progress, milestone: 'x'.repeat(513) }))
+      .toBe('supervisor_progress milestone exceeds 512 characters')
+    expect(progressPayloadError({
+      ...progress,
+      decision: {
+        category: 'information', impact: 'low', blocking: false, request: 'choose',
+        options: Array.from({ length: 6 }, (_, index) => `option-${index}`),
+      },
+    })).toBe('supervisor_progress decision.options exceeds 5 entries')
   })
 
   it('deduplicates an identical prior progress record', () => {
