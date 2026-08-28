@@ -25,7 +25,7 @@ Use the `dsh_*` MCP tools to supervise one DSH root session.
 
 ## Reconnect and continuation
 
-If Codex or MCP disconnects, do not replay the task: the independently owned Host and session continue. When `sessionId + runId` are still known, call `dsh_recover` directly and continue `dsh_wait` from the returned `asOfSeq`. When identity was lost, call read-only `dsh_runs`, select the matching durable run, then call `dsh_recover`. If dispatch itself was ambiguous, retry `dsh_task` with the original `requestId`; never mint a second id for the same dispatch attempt.
+If Codex or MCP disconnects, do not replay the task: the independently owned Host and session continue. `dsh_recover` always requires the exact `sessionId + runId`; when both are known, call it directly and continue `dsh_wait` from the returned `asOfSeq`. When identity was lost, call read-only `dsh_runs`, select the matching durable run, then call `dsh_recover`. A stale recovery is a protocol failure and never means `REATTACHED`. If dispatch itself was ambiguous, retry `dsh_task` with the original `requestId`; never mint a second id for the same dispatch attempt.
 
 If recovery returns `CONTINUATION_REQUIRED`, the Host restarted and durably closed the in-flight turn as interrupted. Queue a new bounded `dsh_task` with `parentRunId` set to the interrupted run, a fresh `requestId`, and only the compact evidence needed to continue. Never infer success from the interrupted `turn/end`, and never automatically repeat the full old prompt.
 

@@ -97,8 +97,8 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(() => manager.runs()))
 
   server.registerTool('dsh_recover', {
-    description: 'Reattach to one existing durable run after MCP/Codex reconnect without replaying its objective. If a Host crash interrupted the in-flight turn, returns CONTINUATION_REQUIRED; start a new bounded dsh_task with parentRunId instead of guessing success.',
-    inputSchema: z.object({ sessionId: z.string(), taskId: z.string().optional(), runId: z.string().uuid().optional() }),
+    description: 'Reattach to one existing durable run by exact sessionId + runId after MCP/Codex reconnect without replaying its objective. A stale run fails without claiming REATTACHED. If a Host crash interrupted the in-flight turn, returns CONTINUATION_REQUIRED; start a new bounded dsh_task with parentRunId instead of guessing success.',
+    inputSchema: z.object({ sessionId: z.string(), taskId: z.string().optional(), runId: z.string().uuid() }),
     outputSchema: observationSchema,
   }, guarded(input => manager.recover(input)))
 

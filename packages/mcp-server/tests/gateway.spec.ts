@@ -415,6 +415,23 @@ describe('Web-visible task identity', () => {
     })
   })
 
+  it('does not claim REATTACHED when recover addresses a stale run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    await manager.task({ sessionId: 's1', objective: 'current run', writerMode: 'read_only' })
+
+    const observed = await manager.recover({
+      sessionId: 's1', runId: '44444444-4444-4444-8444-444444444444',
+    })
+    expect(observed).toMatchObject({
+      status: 'FAILED',
+      stage: 'stale-run',
+      failure: { kind: 'PROTOCOL_ERROR', stale: true },
+    })
+    expect(observed.recovery).toBeUndefined()
+  })
+
   it('keeps the policy pinned by the run after a manager restart', async () => {
     const api = new FakeApi()
     api.addRow('s1', { cwd: '/work/tree' })

@@ -928,7 +928,7 @@ export class GatewayManager {
   }
 
   /** Reattach to one durable run without replaying or duplicating its task prompt. */
-  async recover(input: SessionAddress & { runId?: string | undefined }): Promise<Observation> {
+  async recover(input: SessionAddress & { runId: string }): Promise<Observation> {
     const sessionId = sessionIdOf(input)
     const connection = await this.locate(sessionId)
     let snapshot = await connection.refreshSession(sessionId)
@@ -937,6 +937,7 @@ export class GatewayManager {
     snapshot = validated.snapshot
     observation = validated.observation
     const recovered: Observation = observation.recovery?.kind === 'CONTINUATION_REQUIRED'
+      || observation.failure?.kind === 'PROTOCOL_ERROR'
       ? observation
       : {
           ...observation,
