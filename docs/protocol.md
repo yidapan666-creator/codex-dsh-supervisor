@@ -2,6 +2,13 @@
 
 `dsh-gate` is a stateless MCP-facing supervisor over an independently owned DSH Host. The Host owns agents, sessions, persistence, and its process lifetime. MCP owns only network connections and in-memory observations; exiting MCP calls `ConnectionController.stop()` and never signals or kills the Host.
 
+Creating a session requires an absolute target-project `cwd`. MCP resolves it
+to a real path, verifies that it exists and is a directory, and passes that
+canonical path to the Host. A reconnect uses the session's durable cwd; if the
+caller supplies a different cwd, the request fails instead of silently moving
+the session. This keeps the DSH Web workspace and artifact boundary attached to
+the project the user selected.
+
 ## Completion boundary
 
 The worker receives a durable task packet containing the durable `sessionId`, a unique per-execution `runId`, and a random completion token. Legacy schema-version-1 packets remain readable, but new runs emit schema version 2. `COMPLETED` requires all of these facts in one turn:

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { lstat, realpath } from 'node:fs/promises'
+import { lstat, realpath, stat } from 'node:fs/promises'
 import { readFileSync, readdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import {
@@ -75,6 +75,23 @@ export async function resolveWriterDomain(cwd: string): Promise<string> {
   return resolved
 }
 
+/** Resolve and validate the project directory used to create a DSH session. */
+export async function resolveSessionCwd(cwd: string): Promise<string> {
+  if (!isAbsolute(cwd)) throw new Error('cwd must be an absolute path for a new DSH session')
+  let resolved: string
+  try {
+    resolved = await realpath(cwd)
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(`cwd does not exist or cannot be resolved: ${cwd}`)
+    throw error
+  }
+  if (!(await stat(resolved)).isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`)
+  return resolved
+}
+
 export interface GatewayDependencies {
   /** Overridable for tests; defaults to {@link resolveWriterDomain}. */
   resolveWriterDomain?: (cwd: string) => Promise<string>
@@ -82,6 +99,8 @@ export interface GatewayDependencies {
   createConnection?: (baseUrl: string) => HostConnection
   /** Overridable for tests; defaults to detached Host launch. */
   launchHost?: (config: HostLaunchConfig) => Promise<void>
+  /** Overridable for tests; defaults to realpath plus directory validation. */
+  resolveSessionCwd?: (cwd: string) => Promise<string>
 }
 
 export function attachChildObservations<T extends { id: string }>(
@@ -193,6 +212,7 @@ export class GatewayManager {
   private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
   private readonly launchHost: (config: HostLaunchConfig) => Promise<void>
+  private readonly resolveCwd: (cwd: string) => Promise<string>
   private readonly decisionPolicy: DecisionPolicy
   private readonly shadowDecisionPolicy: DecisionPolicy | undefined
   private readonly decisionPolicies = new Map<string, DecisionPolicy>()
@@ -207,6 +227,7 @@ export class GatewayManager {
     this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
     this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
     this.launchHost = deps.launchHost ?? launchDetachedHost
+    this.resolveCwd = deps.resolveSessionCwd ?? resolveSessionCwd
     this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
     this.shadowDecisionPolicy = config.shadowDecisionPolicy
     for (const policy of [...config.decisionPolicyCatalog ?? [], this.decisionPolicy,
@@ -316,6 +337,11 @@ export class GatewayManager {
     sessionId?: string | undefined
     agentPreset?: string | undefined
   }): Promise<Record<string, unknown>> {
+    const creating = input.sessionId === undefined
+    if (creating && input.cwd === undefined) {
+      throw new Error('cwd is required when creating a new DSH session; pass the target project absolute path')
+    }
+    const requestedCwd = input.cwd === undefined ? undefined : await this.resolveCwd(input.cwd)
     const reconnectByDiscovery = input.sessionId !== undefined && input.hostBaseUrl === undefined
     const connection = reconnectByDiscovery
       ? await this.locate(input.sessionId as string)
@@ -334,8 +360,9 @@ export class GatewayManager {
     }
     let sessionId = input.sessionId
     if (sessionId === undefined) {
+      if (requestedCwd === undefined) throw new Error('validated cwd is unavailable for new DSH session')
       const created = unwrap(await connection.api.sessions.create({
-        ...input.cwd === undefined ? {} : { cwd: input.cwd },
+        cwd: requestedCwd,
         ...input.agentPreset === undefined ? {} : { agentPreset: input.agentPreset },
       }))
       sessionId = created.sessionId
@@ -344,6 +371,15 @@ export class GatewayManager {
     }
     this.sessionHosts.set(sessionId, connection.baseUrl)
     const snapshot = await connection.refreshSession(sessionId)
+    if (requestedCwd !== undefined) {
+      if (snapshot.cwd === undefined) {
+        throw new Error(`session ${sessionId} has no authoritative cwd after requesting ${requestedCwd}`)
+      }
+      const authoritativeCwd = await this.resolveCwd(snapshot.cwd)
+      if (authoritativeCwd !== requestedCwd) {
+        throw new Error(`session ${sessionId} cwd ${authoritativeCwd} does not match requested cwd ${requestedCwd}`)
+      }
+    }
     return {
       schemaVersion: 1,
       hostBaseUrl: connection.baseUrl,
@@ -353,7 +389,7 @@ export class GatewayManager {
       sessionId,
       // Compatibility alias for v1 callers. New control calls use sessionId + runId.
       taskId: sessionId,
-      cwd: snapshot.cwd,
+      cwd: requestedCwd ?? snapshot.cwd,
       reconnected: input.sessionId !== undefined,
       hostOwnership: 'INDEPENDENT',
       disconnectBehavior: 'HOST_AND_SESSION_CONTINUE',

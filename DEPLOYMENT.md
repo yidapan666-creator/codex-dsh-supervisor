@@ -243,7 +243,12 @@ ownership from the DSH root to MCP/Codex.
    `<workspace-root>` with this checkout's absolute path. That placeholder is
    the only machine-specific value.
 3. `pnpm host:start` (or rely on `DSH_HOST_LAUNCH`).
-4. Use the MCP tools; `dsh_start_or_connect` connects to the live Host.
+4. Use the MCP tools; create with `dsh_start_or_connect` and the target
+   project's absolute `cwd`. The gateway resolves and validates that directory
+   before creating the session, so the DSH Web UI is rooted at the intended
+   workspace. Reconnect with the existing `sessionId`; omit `cwd` or provide
+   the same path only. A different reconnect path is rejected rather than
+   silently moving or recreating the session.
 
 ## Clean failure recovery
 

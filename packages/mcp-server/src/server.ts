@@ -53,6 +53,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'Terminal observations also report whether the model-free run journal was recorded; journal warnings never change the task outcome. '
       + 'Treat decisionShadow as observer-only comparison data; only decision controls the current run. '
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
+      + 'When creating a session, pass the target project absolute cwd; reconnect preserves the durable session cwd and must not redirect it. '
       + 'Always give dsh_task a fresh requestId and reuse that same requestId after an ambiguous client disconnect; Host-side atomic admission returns the durable receipt and does not duplicate the task. '
       + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree with request preflight, atomic reservations, and output caps; provider usage settles the estimate, so it is a cutoff rather than an exact billing cap. The external dsh-usage-monitor reading is optional observability and never budget authority. '
       + 'After MCP/Codex reconnect, use dsh_runs to rediscover identity and dsh_recover to reattach before waiting. Do not replay the objective. '
@@ -63,7 +64,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   })
 
   server.registerTool('dsh_start_or_connect', {
-    description: 'Connect to an independently owned DSH Host and create or reconnect a session. MCP shutdown never stops the Host.',
+    description: 'Connect to an independently owned DSH Host and create or reconnect a session. Creating requires the target project absolute cwd; reconnecting preserves the session cwd and rejects a different requested cwd. MCP shutdown never stops the Host.',
     inputSchema: z.object({
       hostBaseUrl: z.string().url().optional(), cwd: z.string().optional(), sessionId: z.string().optional(), agentPreset: z.string().optional(),
     }),

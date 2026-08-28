@@ -1,11 +1,11 @@
-import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveWriterDomain, writerLeaseHeld,
+  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveSessionCwd, resolveWriterDomain, writerLeaseHeld,
 } from '../src/gateway.js'
 import { parseTaskPacket } from '../src/fold.js'
 import { HostConnection } from '../src/host.js'
@@ -119,6 +119,67 @@ describe('writer domain resolution', () => {
     await mkdir(sub)
     await expect(resolveWriterDomain(root)).resolves.toBe(await realpath(root))
     await expect(resolveWriterDomain(sub)).resolves.toBe(await realpath(sub))
+  })
+})
+
+describe('session cwd validation', () => {
+  it('requires an absolute existing directory and resolves symlinks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-gate-session-cwd-'))
+    const project = join(root, 'project')
+    const alias = join(root, 'alias')
+    const file = join(root, 'file.txt')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    await writeFile(file, 'not a directory')
+
+    await expect(resolveSessionCwd('relative/project')).rejects.toThrow(/absolute path/)
+    await expect(resolveSessionCwd(join(root, 'missing'))).rejects.toThrow(/does not exist/)
+    await expect(resolveSessionCwd(file)).rejects.toThrow(/not a directory/)
+    await expect(resolveSessionCwd(alias)).resolves.toBe(await realpath(project))
+  })
+
+  it('requires cwd for creation and sends its canonical path to the Host', async () => {
+    let createdCwd: string | undefined
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      api: {
+        sessions: {
+          create: async (input: { cwd: string }) => {
+            createdCwd = input.cwd
+            return { result: { ok: true, value: { sessionId: 's-new' } } }
+          },
+        },
+      },
+      refreshSession: async () => ({ cwd: '/canonical/project' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd === '/alias/project' ? '/canonical/project' : cwd,
+    })
+
+    await expect(manager.startOrConnect({})).rejects.toThrow(/cwd is required/)
+    await expect(manager.startOrConnect({ cwd: '/alias/project' })).resolves.toMatchObject({
+      sessionId: 's-new', cwd: '/canonical/project',
+    })
+    expect(createdCwd).toBe('/canonical/project')
+  })
+
+  it('rejects a reconnect request that names a different cwd', async () => {
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      sessionExists: async () => true,
+      refreshSession: async () => ({ cwd: '/existing/project' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({
+      hostBaseUrl: 'http://host', sessionId: 's-existing', cwd: '/other/project',
+    })).rejects.toThrow(/does not match requested cwd/)
   })
 })
 
@@ -537,6 +598,7 @@ describe('Host launch coalescing', () => {
       runJournal: false,
     }, {
       createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
       launchHost: async () => {
         launchCalls++
         launchRequested = true
