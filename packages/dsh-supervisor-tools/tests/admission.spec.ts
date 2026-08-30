@@ -41,18 +41,18 @@ function request(runId = firstRunId, requestDigest = digest): TaskAdmissionReque
   }
 }
 
-function harness(options: { running?: boolean; seed?: ReturnType<typeof inboxEvent>[] } = {}): {
+function harness(options: { cold?: boolean; running?: boolean; seed?: ReturnType<typeof inboxEvent>[] } = {}): {
   coordinator: TaskAdmissionCoordinator
   events: ReturnType<typeof inboxEvent>[]
   pending: Array<{ id: string; content: unknown[] }>
-  calls: { prompt: number; flush: number; rearm: number; selectModel: number }
+  calls: { models: number; prompt: number; flush: number; rearm: number; selectModel: number }
   runtime: TaskAdmissionRuntime
 } {
   const events = [...(options.seed ?? [])]
   const pending = events.flatMap(event => event.type === 'agent/inbox/spliced'
     ? ((event.data as { inserted?: Array<{ id: string; content: unknown[] }> }).inserted ?? [])
     : [])
-  const calls = { prompt: 0, flush: 0, rearm: 0, selectModel: 0 }
+  const calls = { models: 0, prompt: 0, flush: 0, rearm: 0, selectModel: 0 }
   const agent: {
     status: 'idle' | 'running'
     session: { header: { id: string }; events: typeof events; append(type: string, data: unknown): ReturnType<typeof inboxEvent> }
@@ -65,7 +65,7 @@ function harness(options: { running?: boolean; seed?: ReturnType<typeof inboxEve
   } = {
     status: options.running === true ? 'running' as const : 'idle' as const,
     session: {
-      header: { id: 's1' },
+      header: { id: 's1', cwd: '/worktree/recovered' },
       events,
       append(type, data) {
         const appended = { type, seq: (events.at(-1)?.seq ?? -1) + 1, time: Date.now(), data }
@@ -94,12 +94,18 @@ function harness(options: { running?: boolean; seed?: ReturnType<typeof inboxEve
       events.push(inboxEvent((events.at(-1)?.seq ?? -1) + 1, admitted))
     },
   }
+  const attached = options.cold === true ? [] : [agent]
   const runtime: TaskAdmissionRuntime = {
-    agents: { list: () => [agent] },
+    agents: { list: () => attached },
     sessions: { flush: async () => { calls.flush++; return true } },
     sessionPersistence: persistenceFrom(() => [agent.session]),
     apiProxy: {
       sessions: {
+        models: async () => {
+          calls.models++
+          if (!attached.includes(agent)) attached.push(agent)
+          return { result: { ok: true as const, value: {} } }
+        },
         selectModel: async () => {
           calls.selectModel++
           return { result: { ok: true as const, value: {} } }
@@ -453,6 +459,37 @@ describe('Host task admission', () => {
     const receipt = await test.coordinator.admit(continuationRequest(capsule))
     expect(receipt).toMatchObject({ runId: '99999999-9999-4999-8999-999999999999', reconciled: false })
     expect(test.calls.prompt).toBe(1)
+  })
+
+  it('resumes a cold persisted Root before exact writer continuation admission', async () => {
+    const test = harness({ cold: true, seed: [inboxEvent(0)] })
+    test.pending.splice(0)
+    test.events.push(
+      { type: 'agent/inbox/spliced', seq: 1, time: Date.now(), data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] } },
+      { type: 'turn/start', seq: 2, time: Date.now(), data: { turn: 1 } },
+      { type: 'turn/end', seq: 3, time: Date.now(), data: { turn: 1, reason: { kind: 'interrupted' } } },
+    )
+    const capsule = await new HostRecoveryCoordinator(test.runtime).capsule('s1', firstRunId)
+    const continuation = continuationRequest(capsule)
+    continuation.prompt = continuation.prompt.replace('"writerMode":"read_only"', '"writerMode":"writer"')
+    const coordinator = new TaskAdmissionCoordinator(test.runtime, async cwd => cwd)
+
+    const receipt = await coordinator.admit(continuation)
+
+    expect(receipt).toMatchObject({ runId: '99999999-9999-4999-8999-999999999999', reconciled: false })
+    expect(test.calls).toMatchObject({ models: 1, prompt: 1, selectModel: 1 })
+  })
+
+  it('fails closed when the native cold-session resolver cannot resume the Root', async () => {
+    const test = harness({ cold: true })
+    test.runtime.apiProxy.sessions.models = async () => ({
+      result: { ok: false as const, error: { code: 'internal', message: 'resume storage offline' } },
+    })
+
+    await expect(test.coordinator.admit(request()))
+      .rejects.toMatchObject<TaskAdmissionError>({ code: 'DURABILITY_UNAVAILABLE' })
+    expect(test.calls.prompt).toBe(0)
+    expect(test.calls.selectModel).toBe(0)
   })
 
   it('blocks a writer owned by a cold persisted Root in the same worktree', async () => {

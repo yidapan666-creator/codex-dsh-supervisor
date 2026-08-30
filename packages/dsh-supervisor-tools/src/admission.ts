@@ -121,6 +121,14 @@ export interface TaskAdmissionRuntime {
   }
   apiProxy: {
     sessions: {
+      /** Native Host resolver: reading models resumes a cold ordinary session without a model call. */
+      models?(request: {
+        rpcId: string
+        payload: { sessionId: string }
+      }): Promise<{
+        result: { ok: true; value: unknown }
+          | { ok: false; error: { code: string; message: string } }
+      }>
       prompt(request: {
         rpcId: string
         payload: {
@@ -494,15 +502,50 @@ export class TaskAdmissionCoordinator {
   async admit(input: unknown): Promise<TaskAdmissionReceipt> {
     const request = validateRequest(input)
     return this.exclusive(`session:${request.sessionId}`, async () => {
+      const agent = await this.ensureAttached(request.sessionId, request.requestId)
       if (request.writerMode === 'read_only') return this.admitExclusive(request)
-      const agent = this.runtime.agents.list().find(candidate => candidate.session.header.id === request.sessionId)
-      const cwd = agent?.session.header.cwd
+      const cwd = agent.session.header.cwd
       if (cwd === undefined) {
         throw new TaskAdmissionError('BAD_REQUEST', `writer session ${request.sessionId} has no authoritative cwd`)
       }
       const domain = await this.resolveWriterDomain(cwd)
       return this.exclusive(`writer:${domain}`, () => this.admitExclusive(request, domain))
     })
+  }
+
+  /** Reuse DSH's native cold-session resolver before admission needs live cwd/policy state. */
+  private async ensureAttached(sessionId: string, requestId: string): Promise<AdmissionAgent> {
+    const current = this.runtime.agents.list()
+      .find(candidate => candidate.session.header.id === sessionId)
+    if (current !== undefined) return current
+    const models = this.runtime.apiProxy.sessions.models
+    if (models === undefined) {
+      throw new TaskAdmissionError(
+        'SESSION_NOT_ATTACHED',
+        `session ${sessionId} is not attached and the Host exposes no native cold-session resolver`,
+      )
+    }
+    let resumed: Awaited<ReturnType<NonNullable<typeof models>>>
+    try {
+      resumed = await models({ rpcId: `${requestId}:resume`, payload: { sessionId } })
+    } catch (error) {
+      throw new TaskAdmissionError(
+        'DURABILITY_UNAVAILABLE',
+        `could not resume durable session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    if (!resumed.result.ok) {
+      throw new TaskAdmissionError(
+        resumed.result.error.code === 'session-not-found' ? 'SESSION_NOT_ATTACHED' : 'DURABILITY_UNAVAILABLE',
+        `${resumed.result.error.code}: ${resumed.result.error.message}`,
+      )
+    }
+    const attached = this.runtime.agents.list()
+      .find(candidate => candidate.session.header.id === sessionId)
+    if (attached === undefined) {
+      throw new TaskAdmissionError('INTERNAL', `native resume did not attach session ${sessionId}`)
+    }
+    return attached
   }
 
   private async exclusive<T>(key: string, operation: () => Promise<T>): Promise<T> {

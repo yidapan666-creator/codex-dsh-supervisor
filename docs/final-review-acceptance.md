@@ -172,6 +172,54 @@ Known P2 exclusions:
 Accepted by/date:
 ```
 
+### Executed P1 acceptance record — 2026-08-30
+
+- Candidate: the cold-session continuation follow-up based on `e3edd09`; its
+  commit is the Git revision containing this acceptance record.
+- Host: `6cba2056-6ace-4cec-ba6b-d1afc3950d2d`, version `0.1.1-rc.2`,
+  protocol version 1, `http://127.0.0.1:18080`.
+- Automated gate: PASS — build, typecheck, `git diff --check`, bootstrap,
+  offline doctor 7/7, live doctor 8/8, 16 test files and 248/248 tests.
+- Durable Root identity: PASS — session
+  `session-53cd2fff-2324-40d5-af4f-2d2e9dc4cde2` completed two distinct
+  runs while retaining the same Host/cwd/session identity.
+- Hard read-only: PASS — both file-tool and bash writes were runtime-denied,
+  approval remained unavailable, the probe file was absent, and Git remained
+  unchanged.
+- Writer authority: PASS — concurrent same-real-worktree Root B was rejected
+  before provider execution while Root A held the lease; B was admitted only
+  after A's valid terminal boundary.
+- Crash continuation: PASS after finding and fixing one live-only defect. The
+  first real Host restart proved the complete-tree capsule but exposed that
+  admission tried to read live-agent cwd before a cold persisted Root had been
+  resumed. Admission now reuses DSH's native cold-session resolver inside its
+  per-session critical section. A second real restart admitted the exact
+  1,417-byte, model-free, complete-tree capsule, rejected a missing capsule,
+  reconciled the interrupted `sleep` without replay, found no lingering
+  process, and completed with a valid handoff. The regression suite covers
+  successful cold resume and fail-closed resolver failure.
+- Completion invariant: PASS — an intentional turn end with zero handoff calls
+  returned `FAILED / MISSING_HANDOFF`; valid matching handoffs plus turn end
+  returned `COMPLETED`.
+- Five-minute observation: PASS — one default 300,000 ms wait returned exactly
+  one `WAITING / TIMEOUT` aggregate with worker still `RUNNING`, one bash call,
+  and the token delta. The next wait used its `asOfSeq`, reported only the new
+  `supervisor_handoff`, did not recount bash, and completed.
+- Child ownership: PASS — one direct child was shown as
+  `manager=DSH_ROOT`, `childCompletionDelivery=HOST_TO_PARENT_AUTOMATIC`, and
+  `codexRole=OBSERVER`. Codex sent no steer; Root received and integrated the
+  child result, then published a newer terminal handoff.
+- Artifact confinement: PASS in the deterministic suite — traversal, direct
+  and intermediate symlink escape, hardlink aliasing, size/count limits, and
+  admitted in-cwd handoff artifacts are covered.
+- Operational note: a Codex/MCP process already running before the new schema
+  build cannot parse complete-tree continuation packets. The live test proved
+  that the independent Host/run survive that stale client; a newly started
+  client reattached successfully. Restart Codex/MCP after installing this
+  candidate before release acceptance.
+- Known exclusion: the provider-aware budget redesign remains P2; the current
+  raw token ceiling is not presented as calibrated work or billing cost.
+
 ## P1 — Recovery continuation is not durably safe across the full run tree (resolved locally)
 
 The review originally found two coupled gaps in the recovery contract:
