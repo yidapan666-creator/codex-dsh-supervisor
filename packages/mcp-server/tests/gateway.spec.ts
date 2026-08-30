@@ -162,18 +162,20 @@ describe('session cwd validation', () => {
 
   it('requires cwd for creation and sends its canonical path to the Host', async () => {
     let createdCwd: string | undefined
+    let createdPreset: string | undefined
     const connection = {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
       api: {
         sessions: {
-          create: async (input: { cwd: string }) => {
+          create: async (input: { cwd: string; agentPreset: string }) => {
             createdCwd = input.cwd
+            createdPreset = input.agentPreset
             return { result: { ok: true, value: { sessionId: 's-new' } } }
           },
         },
       },
-      refreshSession: async () => ({ cwd: '/canonical/project' }),
+      refreshSession: async () => ({ cwd: '/canonical/project', agentPreset: 'standard' }),
     } as unknown as HostConnection
     const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
       createConnection: () => connection,
@@ -182,9 +184,48 @@ describe('session cwd validation', () => {
 
     await expect(manager.startOrConnect({})).rejects.toThrow(/cwd is required/)
     await expect(manager.startOrConnect({ cwd: '/alias/project' })).resolves.toMatchObject({
-      sessionId: 's-new', cwd: '/canonical/project',
+      sessionId: 's-new', cwd: '/canonical/project', agentPreset: 'standard',
     })
     expect(createdCwd).toBe('/canonical/project')
+    expect(createdPreset).toBe('standard')
+  })
+
+  it('creates PTC sessions by the native code preset id and returns the effective mode', async () => {
+    let createdPreset: string | undefined
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      api: { sessions: { create: async (input: { agentPreset: string }) => {
+        createdPreset = input.agentPreset
+        return { result: { ok: true, value: { sessionId: 's-ptc' } } }
+      } } },
+      refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({ cwd: '/work', agentPreset: 'code' })).resolves.toMatchObject({
+      sessionId: 's-ptc', agentPreset: 'code', agentPresetDisplayName: 'PTC mode',
+    })
+    expect(createdPreset).toBe('code')
+  })
+
+  it('rejects presets that cannot preserve the strict supervision boundary', async () => {
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({ cwd: '/work', agentPreset: 'minimal' }))
+      .rejects.toThrow(/cannot guarantee the supervised read-only boundary/)
+    await expect(manager.startOrConnect({ cwd: '/work', agentPreset: 'cordis' }))
+      .rejects.toThrow(/modify the DSH runtime/)
   })
 
   it('rejects a reconnect request that names a different cwd', async () => {
@@ -192,7 +233,7 @@ describe('session cwd validation', () => {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
       sessionExists: async () => true,
-      refreshSession: async () => ({ cwd: '/existing/project' }),
+      refreshSession: async () => ({ cwd: '/existing/project', agentPreset: 'standard' }),
     } as unknown as HostConnection
     const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
       createConnection: () => connection,
@@ -202,6 +243,23 @@ describe('session cwd validation', () => {
     await expect(manager.startOrConnect({
       hostBaseUrl: 'http://host', sessionId: 's-existing', cwd: '/other/project',
     })).rejects.toThrow(/does not match requested cwd/)
+  })
+
+  it('rejects reconnecting an existing session under a different requested preset', async () => {
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      sessionExists: async () => true,
+      refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({
+      hostBaseUrl: 'http://host', sessionId: 's-existing', agentPreset: 'standard',
+    })).rejects.toThrow(/cannot switch presets/)
   })
 })
 
@@ -987,7 +1045,7 @@ describe('Host launch coalescing', () => {
           create: async () => ({ result: { ok: true, value: { sessionId: `s-${++nextSession}` } } }),
         },
       },
-      refreshSession: async () => ({ cwd: '/work/tree' }),
+      refreshSession: async () => ({ cwd: '/work/tree', agentPreset: 'standard' }),
     } as unknown as HostConnection
     const manager = new GatewayManager({
       hostUrls: ['http://host'],

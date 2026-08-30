@@ -114,6 +114,7 @@ export type TokenBudgetStateTransport = (request: TokenBudgetStateRequest) => Pr
 
 interface CachedSessionMetadata {
   cwd?: string
+  agentPreset?: string
   telemetry?: TaskRuntimeState['telemetry']
 }
 
@@ -626,6 +627,7 @@ export class HostConnection {
     }
     this.metadata.set(sessionId, {
       ...row.cwd === undefined ? {} : { cwd: row.cwd },
+      ...row.agentPreset === undefined ? {} : { agentPreset: row.agentPreset },
       ...telemetry === undefined ? {} : { telemetry },
     })
     return this.cachedSession(sessionId) ?? {
@@ -637,6 +639,7 @@ export class HostConnection {
       ...hostError === undefined ? {} : { hostError },
       ...telemetry === undefined ? {} : { telemetry },
       ...row.cwd === undefined ? {} : { cwd: row.cwd },
+      ...row.agentPreset === undefined ? {} : { agentPreset: row.agentPreset },
     }
   }
 
@@ -657,6 +660,7 @@ export class HostConnection {
       ...hostError === undefined ? {} : { hostError },
       ...metadata.telemetry === undefined ? {} : { telemetry: metadata.telemetry },
       ...metadata.cwd === undefined ? {} : { cwd: metadata.cwd },
+      ...metadata.agentPreset === undefined ? {} : { agentPreset: metadata.agentPreset },
     }
   }
 

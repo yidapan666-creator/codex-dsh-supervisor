@@ -30,6 +30,7 @@ function admissionPacket(prompt: string): Record<string, unknown> | undefined {
 export interface FakeRow {
   sessionId: string
   cwd?: string
+  agentPreset?: string
   running: boolean
   events: DshEvent[]
 }
@@ -55,10 +56,11 @@ export class FakeApi {
   private readonly hostFrames: RpcRequest<HostFrame>[] = []
   private nextSeq = 1
 
-  addRow(sessionId: string, options: { cwd?: string; running?: boolean; events?: DshEvent[] } = {}): void {
+  addRow(sessionId: string, options: { cwd?: string; agentPreset?: string; running?: boolean; events?: DshEvent[] } = {}): void {
     this.rows.set(sessionId, {
       sessionId,
       ...options.cwd === undefined ? {} : { cwd: options.cwd },
+      agentPreset: options.agentPreset ?? 'standard',
       running: options.running ?? false,
       events: [...(options.events ?? [])],
     })
@@ -123,6 +125,7 @@ export class FakeApi {
       running: row.running,
       blank: false,
       ...row.cwd === undefined ? {} : { cwd: row.cwd },
+      ...row.agentPreset === undefined ? {} : { agentPreset: row.agentPreset },
     }))
   }
 

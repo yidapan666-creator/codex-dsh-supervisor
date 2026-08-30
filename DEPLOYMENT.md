@@ -326,9 +326,13 @@ ownership from the DSH root to MCP/Codex.
 4. Use the MCP tools; create with `dsh_start_or_connect` and the target
    project's absolute `cwd`. The gateway resolves and validates that directory
    before creating the session, so the DSH Web UI is rooted at the intended
-   workspace. Reconnect with the existing `sessionId`; omit `cwd` or provide
-   the same path only. A different reconnect path is rejected rather than
-   silently moving or recreating the session.
+   workspace. Omit `agentPreset` for Standard mode or pass `code` for PTC mode;
+   both preserve the strict supervision fold. Minimal and Creator sessions are
+   rejected because their capability boundaries do not match supervised
+   project work. Reconnect with the existing `sessionId`; omit `cwd` and
+   `agentPreset`, or provide the same values only. A conflicting reconnect is
+   rejected rather than silently moving, recomposing, or recreating the
+   session.
 
 ## Clean failure recovery
 

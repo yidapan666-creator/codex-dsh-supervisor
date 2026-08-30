@@ -494,6 +494,8 @@ export interface TaskRuntimeState {
   hostInstanceId: string
   /** Authoritative session cwd, used only to make project-activity paths relative and contained. */
   cwd?: string
+  /** Durable DSH agent preset that defines this session's tools, prompt, and capabilities. */
+  agentPreset?: string
   events: readonly DshEvent[]
   workerState: WorkerState
   pendingApproval?: PendingApproval

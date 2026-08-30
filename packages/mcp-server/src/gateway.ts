@@ -257,6 +257,22 @@ export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
 /** Periodic authoritative reconciliation while mux events drive cached observations. */
 export const WAIT_RECONCILE_INTERVAL_MS = 30_000
 
+/** Presets whose durable event surface preserves every dsh-gate supervision invariant. */
+export const SUPERVISED_AGENT_PRESETS = ['standard', 'code'] as const
+export type SupervisedAgentPreset = typeof SUPERVISED_AGENT_PRESETS[number]
+
+function supervisedAgentPreset(value: string | undefined): SupervisedAgentPreset {
+  if (value === 'standard' || value === 'code') return value
+  const detail = value === undefined
+    ? 'the Host did not report a durable preset'
+    : value === 'minimal'
+      ? 'Minimal uses a reduced tool/skill stack and cannot guarantee the supervised read-only boundary'
+      : value === 'cordis'
+        ? 'Creator can modify the DSH runtime and preset compositions outside project-scoped task authority'
+        : `preset ${JSON.stringify(value)} has not been qualified against the strict supervision protocol`
+  throw new Error(`${detail}; use agentPreset "standard" or "code" (PTC mode) for dsh-gate sessions`)
+}
+
 /** Diagnostic fold matching Host ownership: an interrupted writer stays owned until exact continuation. */
 export function writerLeaseHeld(events: readonly import('./contracts.js').DshEvent[]): boolean {
   const boundary = taskBoundarySeq(events)
@@ -404,6 +420,8 @@ export class GatewayManager {
     if (creating && input.cwd === undefined) {
       throw new Error('cwd is required when creating a new DSH session; pass the target project absolute path')
     }
+    const requestedPreset = input.agentPreset ?? 'standard'
+    supervisedAgentPreset(requestedPreset)
     const requestedCwd = input.cwd === undefined ? undefined : await this.resolveCwd(input.cwd)
     const reconnectByDiscovery = input.sessionId !== undefined && input.hostBaseUrl === undefined
     const connection = reconnectByDiscovery
@@ -426,7 +444,7 @@ export class GatewayManager {
       if (requestedCwd === undefined) throw new Error('validated cwd is unavailable for new DSH session')
       const created = unwrap(await connection.api.sessions.create({
         cwd: requestedCwd,
-        ...input.agentPreset === undefined ? {} : { agentPreset: input.agentPreset },
+        agentPreset: requestedPreset,
       }))
       sessionId = created.sessionId
     } else if (!reconnectByDiscovery && !await connection.sessionExists(sessionId)) {
@@ -434,6 +452,10 @@ export class GatewayManager {
     }
     this.sessionHosts.set(sessionId, connection.baseUrl)
     const snapshot = await connection.refreshSession(sessionId)
+    const effectivePreset = supervisedAgentPreset(snapshot.agentPreset)
+    if (input.sessionId !== undefined && input.agentPreset !== undefined && effectivePreset !== input.agentPreset) {
+      throw new Error(`session ${sessionId} uses agentPreset ${JSON.stringify(effectivePreset)}, not requested ${JSON.stringify(input.agentPreset)}; a non-blank DSH session cannot switch presets`)
+    }
     if (requestedCwd !== undefined) {
       if (snapshot.cwd === undefined) {
         throw new Error(`session ${sessionId} has no authoritative cwd after requesting ${requestedCwd}`)
@@ -453,6 +475,8 @@ export class GatewayManager {
       // Compatibility alias for v1 callers. New control calls use sessionId + runId.
       taskId: sessionId,
       cwd: requestedCwd ?? snapshot.cwd,
+      agentPreset: effectivePreset,
+      agentPresetDisplayName: effectivePreset === 'code' ? 'PTC mode' : 'Standard mode',
       reconnected: input.sessionId !== undefined,
       hostOwnership: 'INDEPENDENT',
       disconnectBehavior: 'HOST_AND_SESSION_CONTINUE',
@@ -535,6 +559,7 @@ export class GatewayManager {
     const connection = await this.locate(sessionId)
     const snapshot = await connection.refreshSession(sessionId)
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
+    const agentPreset = supervisedAgentPreset(snapshot.agentPreset)
     const writerMode = input.writerMode ?? 'writer'
     if (writerMode === 'writer' && this.knownUrls.length !== 1) {
       throw new Error('writer admission requires exactly one configured DSH Host; use read_only or isolate each writer in an independent worktree and single-Host deployment')
@@ -669,6 +694,7 @@ export class GatewayManager {
         runId: receipt.runId,
         objective: input.objective,
         writerMode,
+        agentPreset,
         accepted: true,
         reconciled: receipt.reconciled,
         asOfSeq: Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1),

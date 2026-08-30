@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   deriveObservation, parseTaskPacket, progressHeartbeat, progressObservation, projectActivityIn,
-  recoveryCapsuleForRunTree, timeoutObservation,
+  recoveryCapsuleForRunTree, timeoutObservation, uncertainEffectsIn,
 } from '../src/fold.js'
 import {
   HANDOFF_ARTIFACTS_LIMIT, HANDOFF_FILES_LIMIT, HANDOFF_HYPOTHESES_LIMIT, HANDOFF_PATH_LIMIT,
@@ -17,6 +17,15 @@ const start = event('user/message', 0, { content: [{ type: 'text', text: `${TASK
 const state = (events: DshEvent[], extra: Partial<TaskRuntimeState> = {}): TaskRuntimeState => ({
   hostInstanceId: 'host-1', events, workerState: 'IDLE', ...extra,
 })
+const codeCall = (seq: number, subCallId: string, name: string, args: object): DshEvent =>
+  event('tool/code-dispatch-start', seq, {
+    rootCallId: 'run-code-1', parentCallId: 'run-code-1', subCallId, name, arguments: args,
+  })
+const codeResult = (seq: number, subCallId: string, name: string, args: object, value: unknown, isError = false): DshEvent =>
+  event('tool/code-dispatch', seq, {
+    rootCallId: 'run-code-1', parentCallId: 'run-code-1', subCallId, name, arguments: args, isError,
+    content: [{ type: 'text', text: JSON.stringify(value) }],
+  })
 
 function handoffEvents(includeTurnEnd = true): DshEvent[] {
   const args = {
@@ -98,6 +107,51 @@ describe('authoritative completion fold', () => {
     expect(observed).toMatchObject({
       status: 'COMPLETED', sessionId: 's1', runId: packetV2.runId,
       stage: 'verified', summary: 'canonical result',
+    })
+  })
+
+  it('accepts a valid PTC nested handoff and keeps its durable sub-tool activity visible', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship through PTC',
+      writerMode: 'writer',
+    }
+    const startV2 = event('user/message', 0, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+    })
+    const handoff = {
+      sessionId: packetV2.sessionId,
+      runId: packetV2.runId,
+      completionToken: packetV2.completionToken,
+      status: 'completed', stage: 'done', summary: 'PTC verified', files: ['src/a.ts'], verification: [], artifacts: [],
+    }
+    const observed = deriveObservation(state([
+      startV2,
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'run-code-1', name: 'run_code',
+        arguments: JSON.stringify({ code: 'await tools.supervisor_handoff(...)', description: 'finish' }),
+      }),
+      codeCall(3, 'run-code-1:code:1', 'supervisor_handoff', handoff),
+      codeResult(4, 'run-code-1:code:1', 'supervisor_handoff', handoff, {
+        accepted: true, handoff, artifacts: [],
+      }),
+      event('tool/result', 5, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'run-code-1' }, content: [{ type: 'tool-result', isError: false, content: [] }] },
+      }),
+      event('turn/end', 6, { turn: 1, reason: { kind: 'completed' } }),
+    ]))
+
+    expect(observed).toMatchObject({
+      status: 'COMPLETED', stage: 'done', summary: 'PTC verified',
+      projectActivity: {
+        toolCalls: 2,
+        toolCallsByName: { run_code: 1, supervisor_handoff: 1 },
+      },
     })
   })
 
@@ -526,6 +580,44 @@ describe('project activity summarization', () => {
     const activity = projectActivityIn(events, 1, 6)
     expect(activity.edits).toEqual({ total: 2, files: ['src/main.ts', 'src/new.ts'] })
     expect(activity.toolCalls).toBe(3)
+  })
+
+  it('classifies PTC SDK sub-dispatch edits and verification by their real tool names', () => {
+    const editArgs = { file_path: '/repo/src/ptc.ts', old_string: 'a', new_string: 'b' }
+    const verifyArgs = { command: 'pnpm verify' }
+    const events = [
+      codeCall(1, 'run-code-1:code:1', 'edit', editArgs),
+      codeResult(2, 'run-code-1:code:1', 'edit', editArgs, { ok: true }),
+      codeCall(3, 'run-code-1:code:2', 'bash', verifyArgs),
+      codeResult(4, 'run-code-1:code:2', 'bash', verifyArgs, { ok: true }),
+    ]
+
+    expect(projectActivityIn(events, 1, 4, '/repo')).toMatchObject({
+      coverage: 'partial',
+      edits: { total: 1, files: ['src/ptc.ts'] },
+      verification: {
+        total: 1, commands: ['pnpm verify'], evidence: [{ command: 'pnpm verify', outcome: 'passed' }],
+      },
+      toolCalls: 2,
+      toolCallsByName: { edit: 1, bash: 1 },
+    })
+  })
+
+  it('tracks an unsettled PTC effect and clears it only after the durable nested result', () => {
+    const args = { file_path: '/repo/src/ptc.ts', old_string: 'a', new_string: 'b' }
+    const started = codeCall(1, 'run-code-1:code:1', 'edit', args)
+
+    expect(uncertainEffectsIn([started], 1, 1)).toMatchObject({
+      total: 1,
+      entries: [{
+        callId: 'run-code-1:code:1', toolName: 'edit', category: 'FILESYSTEM_MUTATION',
+        reason: 'NO_DURABLE_TOOL_RESULT', replayGuidance: 'RECONCILE_BEFORE_RETRY',
+      }],
+    })
+    expect(uncertainEffectsIn([
+      started,
+      codeResult(2, 'run-code-1:code:1', 'edit', args, { ok: true }),
+    ], 1, 2)).toMatchObject({ total: 0, entries: [] })
   })
 
   it('fails closed on result blocks marked isError even without a top-level error', () => {

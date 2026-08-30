@@ -178,6 +178,72 @@ export function taskPacketRunId(packet: TaskPacket, boundarySeq: number): string
   return packet.schemaVersion === 2 ? packet.runId : `legacy-${String(boundarySeq)}`
 }
 
+interface FoldToolCall {
+  event: DshEvent
+  callId: string
+  name: string
+  argumentsText: string
+  turn?: number
+  step?: number
+}
+
+type RuntimeToolOutcome = 'passed' | 'failed' | 'pending'
+
+/** Normalize native calls and Code/PTC SDK sub-dispatches onto one durable fold surface. */
+function foldToolCall(event: DshEvent): FoldToolCall | undefined {
+  if (event.type === 'tool/call') {
+    const data = event.data as { callId?: unknown; name?: unknown; arguments?: unknown; turn?: unknown; step?: unknown }
+    if (typeof data.callId !== 'string' || typeof data.name !== 'string' || typeof data.arguments !== 'string') return undefined
+    return {
+      event, callId: data.callId, name: data.name, argumentsText: data.arguments,
+      ...typeof data.turn === 'number' ? { turn: data.turn } : {},
+      ...typeof data.step === 'number' ? { step: data.step } : {},
+    }
+  }
+  if (event.type !== 'tool/code-dispatch-start') return undefined
+  const data = event.data as { subCallId?: unknown; name?: unknown; arguments?: unknown }
+  if (typeof data.subCallId !== 'string' || typeof data.name !== 'string') return undefined
+  try {
+    const argumentsText = JSON.stringify(data.arguments)
+    return typeof argumentsText === 'string'
+      ? { event, callId: data.subCallId, name: data.name, argumentsText }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function foldToolResult(event: DshEvent): { callId: string; failed: boolean; outcome: RuntimeToolOutcome } | undefined {
+  if (event.type === 'tool/result') {
+    const data = event.data as {
+      message?: { source?: { callId?: unknown }; content?: Array<{ type?: unknown; isError?: unknown }> }
+      error?: unknown
+    }
+    const callId = data.message?.source?.callId
+    if (typeof callId !== 'string') return undefined
+    const resultBlock = data.message?.content?.find(block => block.type === 'tool-result')
+    const failed = data.error !== undefined || resultBlock?.isError === true
+    return {
+      callId,
+      failed,
+      outcome: failed ? 'failed' : resultBlock?.isError === false ? 'passed' : 'pending',
+    }
+  }
+  if (event.type !== 'tool/code-dispatch') return undefined
+  const data = event.data as { subCallId?: unknown; isError?: unknown }
+  return typeof data.subCallId === 'string' && typeof data.isError === 'boolean'
+    ? { callId: data.subCallId, failed: data.isError, outcome: data.isError ? 'failed' : 'passed' }
+    : undefined
+}
+
+function foldToolCalls(events: readonly DshEvent[], fromSeq = Number.NEGATIVE_INFINITY, toSeq = Number.POSITIVE_INFINITY): FoldToolCall[] {
+  return events.flatMap((event) => {
+    if (event.seq < fromSeq || event.seq > toSeq) return []
+    const call = foldToolCall(event)
+    return call === undefined ? [] : [call]
+  })
+}
+
 // Project-activity summarization: the compact, bounded view of what a worker
 // changed and verified. It counts distinct file paths from *successful* mutating
 // tool calls (a failed edit did not change the project) and distinct targeted
@@ -211,6 +277,7 @@ const MAX_TOOL_NAME_LABEL = 64
 const MAX_ACTIVITY_TOOL_NAMES = 32
 const CLASSIFIED_NON_MUTATING_TOOLS = new Set([
   'read', 'view', 'grep', 'glob', 'find', 'ls',
+  'run_code',
   'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure',
 ])
 
@@ -264,24 +331,14 @@ function verificationCommandLabel(name: string, argsText: string): string | unde
   return cleanLabel(action === undefined ? first : `${first} ${action}`, MAX_COMMAND_LABEL)
 }
 
-type RuntimeToolOutcome = 'passed' | 'failed' | 'pending'
-
 /** First correlated runtime outcome for each call id, indexed once per scope. */
 function callOutcomes(events: readonly DshEvent[], fromSeq: number, toSeq: number): Map<string, RuntimeToolOutcome> {
   const outcomeById = new Map<string, RuntimeToolOutcome>()
   for (const event of events) {
     if (event.seq < fromSeq || event.seq > toSeq) continue
-    if (event.type !== 'tool/result') continue
-    const data = event.data as {
-      message?: { source?: { callId?: unknown }; content?: Array<{ type?: unknown; isError?: unknown }> }
-      error?: unknown
-    }
-    const callId = data.message?.source?.callId
-    if (typeof callId !== 'string' || outcomeById.has(callId)) continue
-    const resultBlock = data.message?.content?.find(block => block.type === 'tool-result')
-    outcomeById.set(callId, data.error !== undefined || resultBlock?.isError === true
-      ? 'failed'
-      : resultBlock?.isError === false ? 'passed' : 'pending')
+    const result = foldToolResult(event)
+    if (result === undefined || outcomeById.has(result.callId)) continue
+    outcomeById.set(result.callId, result.outcome)
   }
   return outcomeById
 }
@@ -298,24 +355,22 @@ export function uncertainEffectsIn(
 ): UncertainEffectLedger {
   const durableResults = new Map<string, number>()
   for (const event of events) {
-    if (event.seq < fromSeq || event.seq > toSeq || event.type !== 'tool/result') continue
-    const callId = (event.data as { message?: { source?: { callId?: unknown } } }).message?.source?.callId
-    if (typeof callId === 'string') durableResults.set(callId, Math.max(durableResults.get(callId) ?? -1, event.seq))
+    if (event.seq < fromSeq || event.seq > toSeq) continue
+    const result = foldToolResult(event)
+    if (result !== undefined) durableResults.set(result.callId, Math.max(durableResults.get(result.callId) ?? -1, event.seq))
   }
   const allEntries: UncertainEffectLedger['entries'] = []
   let total = 0
-  for (const event of events) {
-    if (event.seq < fromSeq || event.seq > toSeq || event.type !== 'tool/call') continue
-    const data = event.data as { callId?: unknown; name?: unknown; step?: unknown }
-    const rawCallId = typeof data.callId === 'string' ? data.callId : `event-${String(event.seq)}`
-    if (typeof data.callId === 'string' && (durableResults.get(data.callId) ?? -1) > event.seq) continue
-    const toolName = cleanLabel(typeof data.name === 'string' ? data.name : 'unknown', MAX_TOOL_NAME_LABEL) ?? 'unknown'
+  for (const call of foldToolCalls(events, fromSeq, toSeq)) {
+    const rawCallId = call.callId
+    if ((durableResults.get(call.callId) ?? -1) > call.event.seq) continue
+    const toolName = cleanLabel(call.name, MAX_TOOL_NAME_LABEL) ?? 'unknown'
     if (CLASSIFIED_NON_MUTATING_TOOLS.has(toolName)) continue
     total += 1
     if (allEntries.length >= UNCERTAIN_EFFECTS_LIMIT) continue
-    const callId = cleanLabel(rawCallId, 128) ?? `event-${String(event.seq)}`
-    const step = typeof data.step === 'number' && Number.isInteger(data.step) && data.step >= 0
-      ? data.step
+    const callId = cleanLabel(rawCallId, 128) ?? `event-${String(call.event.seq)}`
+    const step = typeof call.step === 'number' && Number.isInteger(call.step) && call.step >= 0
+      ? call.step
       : undefined
     allEntries.push({
       callId,
@@ -325,7 +380,7 @@ export function uncertainEffectsIn(
         : toolName === 'bash'
           ? 'COMMAND_OR_EXTERNAL_EFFECT'
           : 'UNKNOWN_TOOL_EFFECT',
-      callSeq: event.seq,
+      callSeq: call.event.seq,
       ...step === undefined ? {} : { step },
       reason: 'NO_DURABLE_TOOL_RESULT',
       replayGuidance: 'RECONCILE_BEFORE_RETRY',
@@ -363,12 +418,11 @@ export function projectActivityIn(
     if (event.seq < fromSeq || event.seq > toSeq) continue
     if (event.type === 'step/end') {
       steps += 1
-      continue
     }
-    if (event.type !== 'tool/call') continue
+  }
+  for (const call of foldToolCalls(events, fromSeq, toSeq)) {
     toolCalls += 1
-    const data = event.data as { name?: unknown; arguments?: unknown; callId?: unknown }
-    const rawName = typeof data.name === 'string' ? data.name : 'unknown'
+    const rawName = call.name
     const name = cleanLabel(rawName, MAX_TOOL_NAME_LABEL) ?? 'unknown'
     if (name in toolCallsByName || Object.keys(toolCallsByName).length < MAX_ACTIVITY_TOOL_NAMES) {
       toolCallsByName[name] = (toolCallsByName[name] ?? 0) + 1
@@ -376,16 +430,12 @@ export function projectActivityIn(
       coverage = 'partial'
     }
     if (!(name in MUTATING_TOOLS) && !CLASSIFIED_NON_MUTATING_TOOLS.has(name)) coverage = 'partial'
-    if (typeof data.arguments !== 'string') {
-      coverage = 'partial'
-      continue
-    }
-    const outcome = typeof data.callId === 'string' ? outcomes.get(data.callId) : undefined
+    const outcome = outcomes.get(call.callId)
     if (outcome === 'passed') {
-      const path = mutatingFilePath(name, data.arguments, workspaceCwd)
+      const path = mutatingFilePath(name, call.argumentsText, workspaceCwd)
       if (path !== undefined) editFiles.add(path)
     }
-    const command = verificationCommandLabel(name, data.arguments)
+    const command = verificationCommandLabel(name, call.argumentsText)
     if (command !== undefined) {
       verificationCommands.add(command)
       verificationEvidence.set(command, outcome ?? 'pending')
@@ -484,7 +534,10 @@ function activityFor(
   event: DshEvent,
   toolNames: ReadonlyMap<string, string>,
 ): ProgressHeartbeat['lastActivity'] {
-  const data = event.data as { step?: unknown; name?: unknown; callId?: unknown; message?: { source?: { callId?: unknown } } }
+  const data = event.data as {
+    step?: unknown; name?: unknown; callId?: unknown; subCallId?: unknown
+    message?: { source?: { callId?: unknown } }
+  }
   const step = typeof data.step === 'number' && Number.isInteger(data.step) && data.step >= 0 ? data.step : undefined
   const common = { seq: event.seq, time: event.time, ...step === undefined ? {} : { step } }
   switch (event.type) {
@@ -494,13 +547,15 @@ function activityFor(
     case 'step/end': return { ...common, kind: 'step' }
     case 'assistant/chunk': return { ...common, kind: 'model_stream' }
     case 'assistant/message': return { ...common, kind: 'model_message' }
-    case 'tool/call': return {
+    case 'tool/call':
+    case 'tool/code-dispatch-start': return {
       ...common,
       kind: 'tool_call',
       ...typeof data.name === 'string' ? { toolName: data.name.slice(0, MAX_TOOL_NAME_LABEL) } : {},
     }
-    case 'tool/result': {
-      const callId = data.message?.source?.callId
+    case 'tool/result':
+    case 'tool/code-dispatch': {
+      const callId = event.type === 'tool/result' ? data.message?.source?.callId : data.subCallId
       const toolName = typeof callId === 'string' ? toolNames.get(callId) : undefined
       return { ...common, kind: 'tool_result', ...toolName === undefined ? {} : { toolName: toolName.slice(0, MAX_TOOL_NAME_LABEL) } }
     }
@@ -515,17 +570,12 @@ export function progressHeartbeat(state: TaskRuntimeState, requestedFromAsOfSeq:
   const scoped = state.events.filter(event => event.seq >= (boundary?.seq ?? -1) && event.seq <= asOfSeq)
   const delta = scoped.filter(event => event.seq > fromAsOfSeq)
   const toolNames = new Map<string, string>()
-  for (const event of scoped) {
-    if (event.type !== 'tool/call') continue
-    const data = event.data as { callId?: unknown; name?: unknown }
-    if (typeof data.callId === 'string' && typeof data.name === 'string') toolNames.set(data.callId, data.name)
-  }
-  const toolCalls = scoped.filter(event => event.type === 'tool/call')
-  const deltaToolCalls = delta.filter(event => event.type === 'tool/call')
+  const toolCalls = foldToolCalls(scoped)
+  for (const call of toolCalls) toolNames.set(call.callId, call.name)
+  const deltaToolCalls = toolCalls.filter(call => call.event.seq > fromAsOfSeq)
   const deltaByName: Record<string, number> = {}
-  for (const event of deltaToolCalls) {
-    const name = (event.data as { name?: unknown }).name
-    const key = typeof name === 'string' ? name.slice(0, MAX_TOOL_NAME_LABEL) : 'unknown'
+  for (const call of deltaToolCalls) {
+    const key = call.name.slice(0, MAX_TOOL_NAME_LABEL)
     if (key in deltaByName || Object.keys(deltaByName).length < MAX_ACTIVITY_TOOL_NAMES) {
       deltaByName[key] = (deltaByName[key] ?? 0) + 1
     }
@@ -610,9 +660,9 @@ function base(state: TaskRuntimeState, packet: TaskPacket | undefined): Omit<Obs
 
 function toolResultFor(events: readonly DshEvent[], callId: string, beforeSeq: number): DshEvent | undefined {
   return events.findLast((event) => {
-    if (event.type !== 'tool/result' || event.seq >= beforeSeq) return false
-    const data = event.data as { message?: { source?: { callId?: unknown }; content?: unknown }; error?: unknown }
-    return data.error === undefined && data.message?.source?.callId === callId
+    if (event.seq >= beforeSeq) return false
+    const result = foldToolResult(event)
+    return result?.callId === callId && !result.failed
   })
 }
 
@@ -626,15 +676,10 @@ function acceptedSupervisorProgressRecords(
   packet: TaskPacket,
 ): Array<{ progress: SupervisorProgress; seq: number }> {
   const boundarySeq = taskBoundarySeq(events) ?? -1
-  const calls = events.filter((event) => {
-    if (event.type !== 'tool/call' || event.seq < boundarySeq) return false
-    return (event.data as { name?: unknown }).name === 'supervisor_progress'
-  })
+  const calls = foldToolCalls(events, boundarySeq).filter(call => call.name === 'supervisor_progress')
   const records: Array<{ progress: SupervisorProgress; seq: number }> = []
   for (const call of calls) {
-    const data = call.data as { callId?: unknown }
-    if (typeof data.callId !== 'string') continue
-    const result = toolResultFor(events, data.callId, Number.POSITIVE_INFINITY)
+    const result = toolResultFor(events, call.callId, Number.POSITIVE_INFINITY)
     if (result === undefined) continue
     const output = parsedResult(result) as { accepted?: unknown; progress?: unknown } | undefined
     if (output?.accepted !== true || typeof output.progress !== 'object' || output.progress === null) continue
@@ -662,6 +707,15 @@ function acceptedSupervisorProgressRecords(
 
 function latestSupervisorProgress(events: readonly DshEvent[], packet: TaskPacket): { progress: SupervisorProgress; seq: number } | undefined {
   return acceptedSupervisorProgressRecords(events, packet).at(-1)
+}
+
+function toolCallsInTurn(events: readonly DshEvent[], turnEnd: DshEvent, name: string): FoldToolCall[] {
+  const turn = (turnEnd.data as { turn?: unknown }).turn
+  const start = events.findLast((event) => event.type === 'turn/start' && event.seq < turnEnd.seq
+    && (event.data as { turn?: unknown }).turn === turn)
+  const fromSeq = start?.seq ?? Number.NEGATIVE_INFINITY
+  return foldToolCalls(events, fromSeq, turnEnd.seq - 1).filter(call =>
+    call.name === name && (call.turn === undefined || call.turn === turn))
 }
 
 export interface RecoveryCapsuleScope {
@@ -893,17 +947,11 @@ function handoffObservation(
   packet: TaskPacket,
   turnEnd: DshEvent,
 ): Observation | undefined {
-  const calls = state.events.filter((event) => {
-    if (event.type !== 'tool/call' || event.seq >= turnEnd.seq) return false
-    const data = event.data as { turn?: unknown; name?: unknown }
-    const end = turnEnd.data as { turn?: unknown }
-    return data.turn === end.turn && data.name === 'supervisor_handoff'
-  }).reverse()
+  const calls = toolCallsInTurn(state.events, turnEnd, 'supervisor_handoff').reverse()
   for (const call of calls) {
-    const data = call.data as { callId: string; arguments: string }
     let args: Record<string, unknown>
-    try { args = JSON.parse(data.arguments) as Record<string, unknown> } catch { continue }
-    const result = toolResultFor(state.events, data.callId, turnEnd.seq)
+    try { args = JSON.parse(call.argumentsText) as Record<string, unknown> } catch { continue }
+    const result = toolResultFor(state.events, call.callId, turnEnd.seq)
     if (result === undefined) continue
     const output = parsedResult(result) as { accepted?: unknown; handoff?: unknown; artifacts?: unknown } | undefined
     if (output?.accepted !== true || !Array.isArray(output.artifacts)) continue
@@ -971,15 +1019,9 @@ function exhaustedFailureObservation(
   packet: TaskPacket,
   turnEnd: DshEvent,
 ): Observation | undefined {
-  const end = turnEnd.data as { turn?: unknown }
-  const calls = state.events.filter((event) => {
-    if (event.type !== 'tool/call' || event.seq >= turnEnd.seq) return false
-    const data = event.data as { turn?: unknown; name?: unknown }
-    return data.turn === end.turn && data.name === 'supervisor_report_failure'
-  }).reverse()
+  const calls = toolCallsInTurn(state.events, turnEnd, 'supervisor_report_failure').reverse()
   for (const call of calls) {
-    const data = call.data as { callId: string; arguments: string }
-    const result = toolResultFor(state.events, data.callId, turnEnd.seq)
+    const result = toolResultFor(state.events, call.callId, turnEnd.seq)
     const output = result === undefined ? undefined : parsedResult(result) as {
       exhausted?: unknown; failureSignature?: unknown; count?: unknown; budget?: unknown
     } | undefined

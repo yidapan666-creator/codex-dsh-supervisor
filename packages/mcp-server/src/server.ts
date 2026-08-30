@@ -75,10 +75,12 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   })
 
   server.registerTool('dsh_start_or_connect', {
-    description: 'Connect to an independently owned DSH Host and create or reconnect a session. Creating requires the target project absolute cwd; reconnecting preserves the session cwd and rejects a different requested cwd. MCP shutdown never stops the Host.',
+    description: 'Connect to an independently owned DSH Host and create or reconnect a session. Creating requires the target project absolute cwd and fixes one supervision-compatible DSH agent preset for the durable session: standard (default) or code (PTC). Reconnecting preserves both cwd and preset and rejects a conflicting requested value. Minimal cannot guarantee the strict read-only boundary; Creator has Host-runtime authoring authority, so neither is admitted for supervised project work. MCP shutdown never stops the Host.',
     inputSchema: z.object({
       hostBaseUrl: z.string().url().max(2_048).optional(), cwd: z.string().max(4_096).optional(),
-      sessionId: z.string().max(512).optional(), agentPreset: z.string().max(256).optional(),
+      sessionId: z.string().max(512).optional(),
+      agentPreset: z.string().max(256).optional()
+        .describe('Durable DSH session preset. Supported: standard or code (the UI\'s PTC mode); omitted defaults to standard.'),
     }),
   }, guarded(input => manager.startOrConnect(input)))
 
