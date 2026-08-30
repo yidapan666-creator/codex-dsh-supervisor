@@ -20,6 +20,8 @@ progress, and preserves the existing completion and Host-lifetime invariants.
 - One active writer is allowed per real Git working tree. Parallel writers use
   existing independent worktrees; dsh-gate does not create a workspace lock
   manager.
+- Read-only Roots are pinned by durable DSH sandbox and no-approval policy
+  events. The worker and its children cannot elevate into a write.
 - Artifact paths are relative to the authoritative session cwd and remain
   subject to realpath, file-handle, type, link, count, and byte-limit admission.
 - Reported-failure budgets count exact worker-reported signatures. Semantic
@@ -51,6 +53,7 @@ interface TaskPacketV2 {
   objective: string
   writerMode: 'writer' | 'read_only'
   parentRunId?: string
+  recoveryCapsule?: RecoveryCapsuleV1
   baseline?: {
     head?: string
     statusSummary: string
@@ -110,7 +113,10 @@ declared verification do not require another human confirmation.
 The Host enforces `authority.maxDirectChildren` before configured child-start
 tools run, using durable direct-child creation times plus atomic reservations
 for concurrent starts. Within the limit the worker does not ask again; beyond
-the limit the call is denied without transferring child control to Codex.
+the limit the call is denied without transferring child control to Codex. The
+bundled `subagent` and `subagent_fork` tools are both guarded, and DSH's native
+absolute `maxDepth: 1` allows Root-to-child delegation while rejecting
+grandchildren.
 
 ### DSH to Codex during ordinary work
 
@@ -175,6 +181,22 @@ typed reason, compact context, and a suggested legal next action. A checkpoint
 ends its turn. Continuing it queues a new run with `parentRunId` rather than
 using a free-form stale-prone nudge.
 
+A Host-restart interruption additionally yields a model-free recovery capsule
+capped at 16 KiB. The capsule folds only durable evidence across the complete
+affiliated run tree: last accepted Root `supervisor_progress`, bounded task
+baseline, project activity, token/budget snapshot, per-session recovery
+boundaries, and unresolved side-effect metadata. An unresolved effect is a
+potentially mutating/command/unknown tool call without a durable correlated
+result; its entry names the owning session. Its arguments and output are never
+copied. A continuation must supply both the exact capsule and matching
+`parentRunId`. The Host recovery route folds attached and cold persisted
+sessions. The Host admission critical section proves that parent is the current
+interrupted run for the same session, recomputes the run-tree capsule, and
+compares it exactly. Missing, fabricated, stale, cross-session, or
+child-incomplete evidence fails before admission, and
+the worker reconciles every uncertain effect before deciding whether retry is
+safe.
+
 ### Terminal transfer
 
 The worker tool validates the latest packet's session id, run id, and completion
@@ -210,14 +232,19 @@ remain human decisions.
 Writer ownership follows an explicit run lease rather than semantic status.
 Admission is held while a writer run is queued or its turn is active and is
 released at the corresponding turn end, including blocked, checkpoint, and
-escalation handoffs. A continuation reacquires admission as a new run.
+escalation handoffs, once affiliated children and pending work are quiet. An
+`interrupted` end retains ownership until an exact continuation is admitted for
+the same Root.
 
-The Host supervisor plugin owns per-session task admission. It serializes
-callers from multiple MCP processes, durably flushes the DSH inbox insertion,
-and returns the stored request receipt. This closes same-session `requestId`
-replay without changing DSH core. Writer exclusion across different sessions,
-MCP processes, or Hosts remains a separate limitation; no filesystem lock
-service is added.
+The Host supervisor plugin owns task and writer admission. One Host-local
+critical section serializes callers from multiple MCP processes, inspects live
+and cold persisted sessions, durably flushes the DSH inbox insertion, and
+returns the stored request receipt. This closes same-session `requestId` replay
+and same-Host writer races without changing DSH core. Separate Hosts still lack
+shared admission authority, so writer dispatch requires exactly one configured
+Host; no filesystem lock service is added. Read-only admission uses DSH's native
+`read-only + never-approve` policy pair. Writer admission applies
+`workspace-write` without broadening the current approval policy.
 
 ## Wait and reconnect
 
@@ -261,7 +288,9 @@ service is added.
 - ordinary event churn does not cause one HTTP history refresh per event;
 - material boundaries receive authoritative refresh before return;
 - multi-Host reconnect locates the existing session;
-- writer lease releases on every corresponding turn end;
+- normal writer leases release after turn end and run-tree quietness;
+- interrupted writer leases require exact same-Root continuation;
+- read-only execution is enforced by DSH sandbox and approval-policy folds;
 - no workspace lock manager is introduced.
 
 ### Final acceptance

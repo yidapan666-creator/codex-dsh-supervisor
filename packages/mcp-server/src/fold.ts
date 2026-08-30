@@ -9,10 +9,12 @@ import {
   HANDOFF_FAILURE_SIGNATURE_LIMIT, HANDOFF_FILES_LIMIT, HANDOFF_HYPOTHESES_LIMIT,
   HANDOFF_HYPOTHESIS_LIMIT, HANDOFF_PATH_LIMIT, HANDOFF_STAGE_LIMIT, HANDOFF_SUMMARY_LIMIT,
   HANDOFF_VERIFICATION_COMMAND_LIMIT, HANDOFF_VERIFICATION_LIMIT, HANDOFF_VERIFICATION_SUMMARY_LIMIT,
-  TASK_PACKET_END, TASK_PACKET_START,
+  RECOVERY_CAPSULE_MAX_BYTES, TASK_PACKET_END, TASK_PACKET_START, UNCERTAIN_EFFECTS_LIMIT,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
   taskPacketSchema, supervisorProgressSchema,
-  type ProjectActivity, type SupervisorProgress, type TaskPacket, type TaskRuntimeState,
+  recoveryCapsuleSchema,
+  type ProjectActivity, type RecoveryCapsule, type SupervisorProgress, type TaskPacket, type TaskRuntimeState,
+  type UncertainEffectLedger,
 } from './contracts.js'
 
 type HandoffTruncatedField = NonNullable<Observation['handoffTruncated']>['fields'][number]
@@ -205,6 +207,8 @@ const MAX_PATH_LABEL = 200
 const MAX_ACTIVITY_FILES = 10
 const MAX_ACTIVITY_COMMANDS = 5
 const MAX_COMMAND_LABEL = 60
+const MAX_TOOL_NAME_LABEL = 64
+const MAX_ACTIVITY_TOOL_NAMES = 32
 const CLASSIFIED_NON_MUTATING_TOOLS = new Set([
   'read', 'view', 'grep', 'glob', 'find', 'ls',
   'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure',
@@ -283,6 +287,59 @@ function callOutcomes(events: readonly DshEvent[], fromSeq: number, toSeq: numbe
 }
 
 /**
+ * Calls that may have crossed an effect boundary but have no durable correlated
+ * tool/result. Arguments and outputs are deliberately excluded: the ledger is
+ * evidence for reconciliation, not a replay recipe.
+ */
+export function uncertainEffectsIn(
+  events: readonly DshEvent[],
+  fromSeq: number,
+  toSeq: number,
+): UncertainEffectLedger {
+  const durableResults = new Map<string, number>()
+  for (const event of events) {
+    if (event.seq < fromSeq || event.seq > toSeq || event.type !== 'tool/result') continue
+    const callId = (event.data as { message?: { source?: { callId?: unknown } } }).message?.source?.callId
+    if (typeof callId === 'string') durableResults.set(callId, Math.max(durableResults.get(callId) ?? -1, event.seq))
+  }
+  const allEntries: UncertainEffectLedger['entries'] = []
+  let total = 0
+  for (const event of events) {
+    if (event.seq < fromSeq || event.seq > toSeq || event.type !== 'tool/call') continue
+    const data = event.data as { callId?: unknown; name?: unknown; step?: unknown }
+    const rawCallId = typeof data.callId === 'string' ? data.callId : `event-${String(event.seq)}`
+    if (typeof data.callId === 'string' && (durableResults.get(data.callId) ?? -1) > event.seq) continue
+    const toolName = cleanLabel(typeof data.name === 'string' ? data.name : 'unknown', MAX_TOOL_NAME_LABEL) ?? 'unknown'
+    if (CLASSIFIED_NON_MUTATING_TOOLS.has(toolName)) continue
+    total += 1
+    if (allEntries.length >= UNCERTAIN_EFFECTS_LIMIT) continue
+    const callId = cleanLabel(rawCallId, 128) ?? `event-${String(event.seq)}`
+    const step = typeof data.step === 'number' && Number.isInteger(data.step) && data.step >= 0
+      ? data.step
+      : undefined
+    allEntries.push({
+      callId,
+      toolName,
+      category: toolName in MUTATING_TOOLS
+        ? 'FILESYSTEM_MUTATION'
+        : toolName === 'bash'
+          ? 'COMMAND_OR_EXTERNAL_EFFECT'
+          : 'UNKNOWN_TOOL_EFFECT',
+      callSeq: event.seq,
+      ...step === undefined ? {} : { step },
+      reason: 'NO_DURABLE_TOOL_RESULT',
+      replayGuidance: 'RECONCILE_BEFORE_RETRY',
+    })
+  }
+  return {
+    source: 'DURABLE_EVENT_FOLD',
+    total,
+    entries: allEntries,
+    truncated: total > allEntries.length,
+  }
+}
+
+/**
  * Compact project-activity summary over events in [fromSeq, toSeq]: distinct
  * project files touched by successful edit/write calls, distinct targeted
  * verification commands, completed steps, tool-call totals, and token usage.
@@ -311,8 +368,13 @@ export function projectActivityIn(
     if (event.type !== 'tool/call') continue
     toolCalls += 1
     const data = event.data as { name?: unknown; arguments?: unknown; callId?: unknown }
-    const name = typeof data.name === 'string' ? data.name : 'unknown'
-    toolCallsByName[name] = (toolCallsByName[name] ?? 0) + 1
+    const rawName = typeof data.name === 'string' ? data.name : 'unknown'
+    const name = cleanLabel(rawName, MAX_TOOL_NAME_LABEL) ?? 'unknown'
+    if (name in toolCallsByName || Object.keys(toolCallsByName).length < MAX_ACTIVITY_TOOL_NAMES) {
+      toolCallsByName[name] = (toolCallsByName[name] ?? 0) + 1
+    } else {
+      coverage = 'partial'
+    }
     if (!(name in MUTATING_TOOLS) && !CLASSIFIED_NON_MUTATING_TOOLS.has(name)) coverage = 'partial'
     if (typeof data.arguments !== 'string') {
       coverage = 'partial'
@@ -435,12 +497,12 @@ function activityFor(
     case 'tool/call': return {
       ...common,
       kind: 'tool_call',
-      ...typeof data.name === 'string' ? { toolName: data.name } : {},
+      ...typeof data.name === 'string' ? { toolName: data.name.slice(0, MAX_TOOL_NAME_LABEL) } : {},
     }
     case 'tool/result': {
       const callId = data.message?.source?.callId
       const toolName = typeof callId === 'string' ? toolNames.get(callId) : undefined
-      return { ...common, kind: 'tool_result', ...toolName === undefined ? {} : { toolName } }
+      return { ...common, kind: 'tool_result', ...toolName === undefined ? {} : { toolName: toolName.slice(0, MAX_TOOL_NAME_LABEL) } }
     }
     default: return undefined
   }
@@ -463,8 +525,10 @@ export function progressHeartbeat(state: TaskRuntimeState, requestedFromAsOfSeq:
   const deltaByName: Record<string, number> = {}
   for (const event of deltaToolCalls) {
     const name = (event.data as { name?: unknown }).name
-    const key = typeof name === 'string' ? name : 'unknown'
-    deltaByName[key] = (deltaByName[key] ?? 0) + 1
+    const key = typeof name === 'string' ? name.slice(0, MAX_TOOL_NAME_LABEL) : 'unknown'
+    if (key in deltaByName || Object.keys(deltaByName).length < MAX_ACTIVITY_TOOL_NAMES) {
+      deltaByName[key] = (deltaByName[key] ?? 0) + 1
+    }
   }
   let lastActivity: ProgressHeartbeat['lastActivity']
   for (let index = delta.length - 1; index >= 0; index--) {
@@ -598,6 +662,190 @@ function acceptedSupervisorProgressRecords(
 
 function latestSupervisorProgress(events: readonly DshEvent[], packet: TaskPacket): { progress: SupervisorProgress; seq: number } | undefined {
   return acceptedSupervisorProgressRecords(events, packet).at(-1)
+}
+
+export interface RecoveryCapsuleScope {
+  sessionId: string
+  events: readonly DshEvent[]
+  activationSeq: number
+  terminalSeq: number
+  cwd?: string | undefined
+}
+
+function mergedRecoveryEvidence(scopes: readonly RecoveryCapsuleScope[]): {
+  activity: ProjectActivity
+  uncertainEffects: UncertainEffectLedger
+} {
+  const activities = scopes.map(scope => projectActivityIn(
+    scope.events, scope.activationSeq, scope.terminalSeq, scope.cwd,
+  ))
+  const editFiles = new Set<string>()
+  const verification = new Map<string, 'passed' | 'failed' | 'pending'>()
+  const toolCallsByName: Record<string, number> = {}
+  const tokenUsage = {
+    uncachedInputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+  }
+  let coverage: 'complete' | 'partial' = 'complete'
+  let editsTotal = 0
+  let verificationTotal = 0
+  let steps = 0
+  let toolCalls = 0
+  for (const activity of activities) {
+    if (activity.coverage === 'partial') coverage = 'partial'
+    editsTotal += activity.edits.total
+    for (const path of activity.edits.files) editFiles.add(path)
+    verificationTotal += activity.verification.total
+    for (const entry of activity.verification.evidence) {
+      const previous = verification.get(entry.command)
+      const rank = { passed: 0, pending: 1, failed: 2 } as const
+      if (previous === undefined || rank[entry.outcome] > rank[previous]) verification.set(entry.command, entry.outcome)
+    }
+    steps += activity.steps
+    toolCalls += activity.toolCalls
+    for (const [name, count] of Object.entries(activity.toolCallsByName)) {
+      toolCallsByName[name] = (toolCallsByName[name] ?? 0) + count
+    }
+    tokenUsage.uncachedInputTokens += activity.tokenUsage.uncachedInputTokens
+    tokenUsage.outputTokens += activity.tokenUsage.outputTokens
+    tokenUsage.cacheReadTokens += activity.tokenUsage.cacheReadTokens
+    tokenUsage.cacheWriteTokens += activity.tokenUsage.cacheWriteTokens
+  }
+  const boundedToolNames = Object.entries(toolCallsByName).sort(([left], [right]) => left.localeCompare(right)).slice(0, 12)
+  if (boundedToolNames.length < Object.keys(toolCallsByName).length) coverage = 'partial'
+
+  const ledgers = scopes.map(scope => ({
+    sessionId: scope.sessionId,
+    ledger: uncertainEffectsIn(scope.events, scope.activationSeq, scope.terminalSeq),
+  }))
+  const totalEffects = ledgers.reduce((total, entry) => total + entry.ledger.total, 0)
+  const effectEntries = ledgers.flatMap(({ sessionId, ledger }) =>
+    ledger.entries.map(entry => ({ ...entry, sessionId }))).slice(0, UNCERTAIN_EFFECTS_LIMIT)
+  return {
+    activity: {
+      coverage,
+      edits: { total: editsTotal, files: [...editFiles].sort().slice(0, 8) },
+      verification: {
+        total: verificationTotal,
+        commands: [...verification.keys()].sort().slice(0, 4),
+        evidence: [...verification.entries()].sort(([left], [right]) => left.localeCompare(right)).slice(0, 4)
+          .map(([command, outcome]) => ({ command, outcome })),
+      },
+      steps,
+      toolCalls,
+      toolCallsByName: Object.fromEntries(boundedToolNames),
+      tokenUsage,
+    },
+    uncertainEffects: {
+      source: 'DURABLE_EVENT_FOLD',
+      total: totalEffects,
+      entries: effectEntries,
+      truncated: ledgers.some(entry => entry.ledger.truncated) || totalEffects > effectEntries.length,
+    },
+  }
+}
+
+export function recoveryCapsuleForRunTree(
+  state: TaskRuntimeState,
+  packet: Extract<TaskPacket, { schemaVersion: 2 }>,
+  turnEnd: DshEvent,
+  childScopes: readonly RecoveryCapsuleScope[] = [],
+): RecoveryCapsule {
+  const packetSeq = taskBoundarySeq(state.events) ?? -1
+  const scopes: RecoveryCapsuleScope[] = [{
+    sessionId: packet.sessionId,
+    events: state.events,
+    activationSeq: packetSeq,
+    terminalSeq: turnEnd.seq,
+    cwd: state.cwd,
+  }, ...childScopes].sort((left, right) => {
+    if (left.sessionId === packet.sessionId) return -1
+    if (right.sessionId === packet.sessionId) return 1
+    return left.sessionId.localeCompare(right.sessionId)
+  })
+  const { activity, uncertainEffects } = mergedRecoveryEvidence(scopes)
+  const progress = latestSupervisorProgress(state.events, packet)?.progress
+  const objective = packet.objective.slice(0, 1_024)
+  const baselineStatus = packet.baseline?.statusSummary.slice(0, 1_024)
+  const toolCallsByName = Object.fromEntries(Object.entries(activity.toolCallsByName).slice(0, 12))
+  const observedTokens = activity.tokenUsage.uncachedInputTokens + activity.tokenUsage.outputTokens
+    + activity.tokenUsage.cacheReadTokens + activity.tokenUsage.cacheWriteTokens
+  const body: Omit<RecoveryCapsule, 'byteLength'> = {
+    schemaVersion: 1,
+    source: 'DURABLE_EVENT_FOLD',
+    modelCallsUsed: 0,
+    maxBytes: RECOVERY_CAPSULE_MAX_BYTES,
+    parentRunId: packet.runId,
+    objective,
+    objectiveTruncated: objective.length < packet.objective.length,
+    interruption: {
+      kind: 'HOST_RESTART_INTERRUPTED',
+      boundarySeq: turnEnd.seq,
+      asOfSeq: turnEnd.seq,
+    },
+    runTree: {
+      coverage: 'complete',
+      totalSessions: scopes.length,
+      sessions: scopes.map(scope => ({
+        sessionId: scope.sessionId,
+        activationSeq: scope.activationSeq,
+        terminalSeq: scope.terminalSeq,
+      })),
+    },
+    ...progress === undefined ? {} : { lastAcceptedProgress: {
+      phase: progress.phase,
+      milestone: progress.milestone.slice(0, 512),
+      nextAction: progress.nextAction.slice(0, 512),
+      ...progress.currentHypothesis === undefined ? {} : { currentHypothesis: progress.currentHypothesis.slice(0, 512) },
+      ...progress.risk === undefined ? {} : { risk: progress.risk.slice(0, 256) },
+    } },
+    workspace: {
+      ...packet.baseline === undefined || baselineStatus === undefined ? {} : { baseline: {
+        ...packet.baseline.head === undefined ? {} : { head: packet.baseline.head.slice(0, 128) },
+        statusSummary: baselineStatus,
+        truncated: baselineStatus.length < packet.baseline.statusSummary.length
+          || (packet.baseline.head?.length ?? 0) > 128,
+      } },
+      activity: {
+        coverage: activity.coverage,
+        edits: {
+          total: activity.edits.total,
+          files: activity.edits.files.slice(0, 8).map(path => path.slice(0, 160)),
+        },
+        verification: {
+          total: activity.verification.total,
+          evidence: activity.verification.evidence.slice(0, 4),
+        },
+        steps: activity.steps,
+        toolCalls: activity.toolCalls,
+        toolCallsByName,
+        tokenUsage: activity.tokenUsage,
+      },
+    },
+    ...packet.budget === undefined ? {} : { budget: {
+      limitTokens: packet.budget.maxTokens,
+      observedTokens,
+      remainingTokens: Math.max(0, packet.budget.maxTokens - observedTokens),
+      exhausted: observedTokens >= packet.budget.maxTokens,
+    } },
+    uncertainEffects,
+    continuation: {
+      action: uncertainEffects.total === 0
+        ? 'CONTINUE_FROM_DURABLE_EVIDENCE'
+        : 'RECONCILE_UNCERTAIN_EFFECTS_THEN_CONTINUE',
+      replayPolicy: 'DO_NOT_BLINDLY_REPLAY',
+      evidenceOnly: true,
+    },
+  }
+  let byteLength = 0
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const next = Buffer.byteLength(JSON.stringify({ ...body, byteLength }), 'utf8')
+    if (next === byteLength) break
+    byteLength = next
+  }
+  return recoveryCapsuleSchema.parse({ ...body, byteLength })
 }
 
 /** Bounded, structured decision history for the durable run journal; no messages or reasoning are copied. */
@@ -743,7 +991,9 @@ function exhaustedFailureObservation(
       stage: 'recovery-budget-exhausted',
       summary: `Reported failure recovery budget exhausted (${String(output.count)}/${String(output.budget)}).`,
       projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
-      ...typeof output.failureSignature === 'string' ? { failureSignature: output.failureSignature } : {},
+      ...typeof output.failureSignature === 'string'
+        ? { failureSignature: output.failureSignature.slice(0, HANDOFF_FAILURE_SIGNATURE_LIMIT) }
+        : {},
     }
   }
   return undefined
@@ -849,7 +1099,7 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
     status: 'FAILED',
     stage: 'host',
     summary: state.hostError.slice(0, 2_048),
-    failure: { kind: 'HOST_FAILED', message: state.hostError, retryable: true },
+    failure: { kind: 'HOST_FAILED', message: state.hostError.slice(0, 2_048), retryable: true },
   }
   if (state.pendingApproval !== undefined) return {
     ...common, status: 'APPROVAL_REQUIRED', stage: 'approval', summary: 'Worker is waiting for approval.', approval: state.pendingApproval,

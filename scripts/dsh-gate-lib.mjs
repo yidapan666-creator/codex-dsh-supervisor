@@ -87,6 +87,42 @@ export function resolvePaths(options = {}) {
     dshConnectionLib: join(dshRepo, DSH_CONNECTION_PACKAGE, 'lib', `${NETWORK_CLIENT_SUBPATH}.js`),
     webDistIndex: join(dshRepo, 'apps', 'web', 'dist', 'index.html'),
     profileManifest: join(dshHome, 'profiles', SUPERVISOR_PROFILE, 'package.json'),
+    workerSkillSource: join(root, 'skills', 'dsh-supervised-worker', 'SKILL.md'),
+    workerSkillDestination: join(dshHome, 'skills', 'dsh-supervised-worker', 'SKILL.md'),
+  }
+}
+
+function localHostAddress(hostUrl = DEFAULT_HOST_URL) {
+  const parsed = new URL(hostUrl)
+  if (parsed.protocol !== 'http:') throw new Error(`Host launch URL must use http: ${hostUrl}`)
+  if (parsed.username !== '' || parsed.password !== '') throw new Error('Host launch URL must not contain credentials')
+  if (parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') {
+    throw new Error(`Host launch URL must be an origin without path, query, or fragment: ${hostUrl}`)
+  }
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) {
+    throw new Error(`Host launch must bind loopback, not ${parsed.hostname}`)
+  }
+  const port = parsed.port === '' ? '8080' : parsed.port
+  const hostname = parsed.hostname === '[::1]' ? '::1' : parsed.hostname
+  const keyHost = hostname === '::1' ? 'ipv6-loopback' : hostname.replace(/[^a-zA-Z0-9.-]/g, '_')
+  return {
+    hostname,
+    port,
+    canonicalUrl: `http://${hostname === '::1' ? '[::1]' : hostname}:${port}`,
+    stateKey: `http-${keyHost}-${port}`,
+  }
+}
+
+/** Isolate lifecycle ownership by Host origin so one port can never erase another port's state. */
+export function resolveHostStatePaths(paths, hostUrl = DEFAULT_HOST_URL) {
+  const address = localHostAddress(hostUrl)
+  return {
+    ...paths,
+    hostPidFile: join(paths.hostDir, `${address.stateKey}.pid`),
+    hostStartLockFile: join(paths.hostDir, `${address.stateKey}.start.lock`),
+    hostLogFile: join(paths.logsDir, `${address.stateKey}.log`),
+    legacyHostPidFile: paths.hostPidFile,
+    canonicalHostUrl: address.canonicalUrl,
   }
 }
 
@@ -368,6 +404,9 @@ export async function resolvePnpm(io) {
  */
 export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, checkout }) {
   const phases = []
+  // A dirty development tree has no immutable content id. Rebuild workspace
+  // phases every time instead of treating HEAD alone as a valid cache key.
+  const gateTreeStable = typeof gateSha === 'string' && !gateSha.endsWith('-dirty')
 
   phases.push({
     name: 'checkout',
@@ -408,6 +447,7 @@ export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, c
   })
 
   const gateInstallCurrent = !force
+    && gateTreeStable
     && installJson?.steps?.gateInstall?.done === true
     && installJson.steps.gateInstall.gateSha === gateSha
     && await io.exists(join(paths.root, 'node_modules'))
@@ -431,6 +471,7 @@ export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, c
   })
 
   const gateBuildCurrent = !force
+    && gateTreeStable
     && installJson?.steps?.gateBuild?.done === true
     && installJson.steps.gateBuild.gateSha === gateSha
     && await io.exists(paths.mcpServerDistCli)
@@ -455,6 +496,19 @@ export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, c
     env: { DSH_HOME: paths.dshHome },
     action: profileCurrent ? 'skip' : 'run',
     skipReason: profileCurrent ? 'supervisor plugin already installed in the isolated profile (--force to redo)' : undefined,
+  })
+
+  const workerSkillCurrent = !force
+    && await Promise.all([
+      io.readFile(paths.workerSkillSource).catch(() => undefined),
+      io.readFile(paths.workerSkillDestination).catch(() => undefined),
+    ]).then(([source, installed]) => source !== undefined && source === installed)
+  phases.push({
+    name: 'worker-skill',
+    description: 'install the supervised worker contract into the isolated DSH_HOME skill catalog',
+    argv: undefined,
+    action: workerSkillCurrent ? 'skip' : 'run',
+    skipReason: workerSkillCurrent ? 'DSH worker skill already matches this checkout' : undefined,
   })
 
   phases.push({
@@ -596,8 +650,24 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
     if (!installed) {
       return { ok: false, detail: `${SUPERVISOR_PLUGIN_NAME} is not installed in the ${SUPERVISOR_PROFILE} profile` }
     }
-    const patch = await io.exists(join(paths.pluginPath, 'cordis.patch.yml'))
-    return { ok: true, detail: `${SUPERVISOR_PLUGIN_NAME} listed in ${SUPERVISOR_PROFILE} profile bundles; plugin dist and patch present` }
+    const patchPath = join(paths.pluginPath, 'cordis.patch.yml')
+    if (!(await io.exists(patchPath))) return { ok: false, detail: `missing supervisor profile patch ${patchPath}` }
+    const patch = String(await io.readFile(patchPath))
+    const nativeDepthCaps = patch.match(/maxDepth:\s*1\b/g)?.length ?? 0
+    if (nativeDepthCaps < 2 || !patch.includes('- subagent') || !patch.includes('- subagent_fork')) {
+      return { ok: false, detail: 'supervisor profile patch is missing native Root-to-child depth caps or direct-child tool coverage' }
+    }
+    return { ok: true, detail: `${SUPERVISOR_PLUGIN_NAME} listed in ${SUPERVISOR_PROFILE} profile bundles; native depth-1 caps and both direct-child tools are configured` }
+  })
+
+  add('DSH worker skill', async () => {
+    const source = await io.readFile(paths.workerSkillSource).catch(() => undefined)
+    const installed = await io.readFile(paths.workerSkillDestination).catch(() => undefined)
+    if (source === undefined) return { ok: false, detail: `missing repository worker skill ${paths.workerSkillSource}` }
+    if (installed === undefined) return { ok: false, detail: `worker skill is not installed at ${paths.workerSkillDestination}; run 'pnpm bootstrap'` }
+    return source === installed
+      ? { ok: true, detail: 'isolated DSH_HOME worker skill matches this checkout' }
+      : { ok: false, detail: 'installed DSH worker skill is stale; run \'pnpm bootstrap\'' }
   })
 
   if (live) {
@@ -630,12 +700,15 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
         if (typeof provider !== 'string' || provider === '' || typeof model !== 'string' || model === '') {
           return { ok: false, detail: `session ${readinessSession} has no current provider/model` }
         }
-        if (value.routable === false || failures.length > 0) {
+        if (value.routable !== true) {
           return { ok: false, detail: `${provider}/${model} is not routable: ${JSON.stringify(failures).slice(0, 512)}` }
         }
+        const advisory = failures.length === 0
+          ? ''
+          : `; ${String(failures.length)} unrelated provider catalog warning(s) reported`
         return {
           ok: true,
-          detail: `${provider}/${model} is routable for session ${readinessSession}; credentials are verified only by an explicit real task`,
+          detail: `${provider}/${model} is routable for session ${readinessSession}${advisory}; credentials are verified only by an explicit real task`,
         }
       })
     }
@@ -670,14 +743,25 @@ export function summarizeDoctor(results) {
 // Host lifecycle
 // ---------------------------------------------------------------------------
 
-export async function readHostPidFile(paths, io) {
-  const raw = await io.readFile(paths.hostPidFile).catch(() => undefined)
-  if (raw === undefined || raw.trim() === '') return undefined
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return undefined
+export async function readHostPidFile(paths, io, hostUrl = paths.canonicalHostUrl ?? DEFAULT_HOST_URL) {
+  const expectedUrl = localHostAddress(hostUrl).canonicalUrl
+  const candidates = [paths.hostPidFile]
+  if (paths.legacyHostPidFile !== undefined && paths.legacyHostPidFile !== paths.hostPidFile) {
+    candidates.push(paths.legacyHostPidFile)
   }
+  for (const pidFile of candidates) {
+    const raw = await io.readFile(pidFile).catch(() => undefined)
+    if (raw === undefined || raw.trim() === '') continue
+    try {
+      const record = JSON.parse(raw)
+      if (!Number.isSafeInteger(record?.pid) || record.pid <= 0 || typeof record.url !== 'string') continue
+      if (localHostAddress(record.url).canonicalUrl !== expectedUrl) continue
+      return { ...record, pidFile }
+    } catch {
+      // Invalid or foreign records are never guessed to own the requested Host.
+    }
+  }
+  return undefined
 }
 
 /**
@@ -732,6 +816,18 @@ export async function probePid(pid, io) {
   }
 }
 
+/**
+ * Decide how Host startup treats an existing PID record. Process uncertainty is
+ * never evidence of staleness: only a positive `dead` result permits deletion.
+ */
+export function hostStartPidDecision(pidState, hostReachable) {
+  if (hostReachable && (pidState === 'alive' || pidState === 'unknown')) return 'already-running'
+  if (pidState === 'alive') return 'refuse-alive-unreachable'
+  if (pidState === 'unknown') return 'refuse-unverifiable'
+  if (pidState === 'dead') return 'clear-stale'
+  throw new Error(`invalid PID state ${String(pidState)}`)
+}
+
 /** Describe a running host for status output; throws when unreachable. */
 export async function describeHost({ hostUrl, io, timeoutMs = 5000 }) {
   const value = await checkLiveHost({ url: hostUrl, io, timeoutMs })
@@ -740,8 +836,6 @@ export async function describeHost({ hostUrl, io, timeoutMs = 5000 }) {
 
 /** Build the argv used to launch the detached Host process. */
 export function hostLaunchArgv({ dshBin, hostUrl = DEFAULT_HOST_URL }) {
-  const parsed = new URL(hostUrl)
-  const port = parsed.port === '' ? '8080' : parsed.port
-  const host = parsed.hostname === '' ? '127.0.0.1' : parsed.hostname
-  return [process.execPath, dshBin, 'web', '--host', host, '--port', port, '--no-open']
+  const { hostname, port } = localHostAddress(hostUrl)
+  return [process.execPath, dshBin, 'web', '--host', hostname, '--port', port, '--no-open']
 }

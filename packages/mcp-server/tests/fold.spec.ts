@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { deriveObservation, progressHeartbeat, progressObservation, projectActivityIn, timeoutObservation } from '../src/fold.js'
+import {
+  deriveObservation, parseTaskPacket, progressHeartbeat, progressObservation, projectActivityIn,
+  recoveryCapsuleForRunTree, timeoutObservation,
+} from '../src/fold.js'
 import {
   HANDOFF_ARTIFACTS_LIMIT, HANDOFF_FILES_LIMIT, HANDOFF_HYPOTHESES_LIMIT, HANDOFF_PATH_LIMIT,
-  HANDOFF_VERIFICATION_LIMIT, observationSchema, progressHeartbeatSchema,
+  HANDOFF_VERIFICATION_LIMIT, RECOVERY_CAPSULE_MAX_BYTES, UNCERTAIN_EFFECTS_LIMIT,
+  observationSchema, progressHeartbeatSchema,
   TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type TaskRuntimeState,
 } from '../src/contracts.js'
 import { DEFAULT_DECISION_POLICY } from '@dsh-gate/decision-policy'
@@ -733,5 +737,129 @@ describe('project activity summarization', () => {
       failure: { kind: 'HOST_FAILED', retryable: true },
       recovery: { kind: 'CONTINUATION_REQUIRED', parentRunId: packetV2.runId },
     })
+  })
+
+  it('builds a bounded recovery capsule and records only unresolved side-effecting calls', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'continue safely after a Host restart',
+      writerMode: 'writer',
+      baseline: { head: 'abc123', statusSummary: 'M existing-user-file.ts' },
+      budget: { maxTokens: 10_000 },
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'implementing',
+      milestone: 'updated the parser', nextAction: 'run focused tests',
+      currentHypothesis: 'the parser now preserves the boundary', needsSupervisor: false,
+    }
+    const runtime = state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'progress-1', name: 'supervisor_progress', arguments: JSON.stringify(progress),
+      }),
+      event('tool/result', 3, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'progress-1' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+      event('tool/call', 4, {
+        turn: 1, step: 2, callId: 'resolved-write', name: 'write',
+        arguments: JSON.stringify({ file_path: '/work/already-written.ts', content: 'secret output' }),
+      }),
+      event('tool/result', 5, {
+        turn: 1, step: 2, message: { source: { callId: 'resolved-write' }, content: [] },
+      }),
+      event('tool/call', 6, {
+        turn: 1, step: 3, callId: 'safe-read', name: 'read', arguments: JSON.stringify({ path: '/work/input.ts' }),
+      }),
+      event('tool/call', 7, {
+        turn: 1, step: 4, callId: 'uncertain-edit', name: 'edit',
+        arguments: JSON.stringify({ file_path: '/work/maybe-edited.ts', replacement: 'private source text' }),
+      }),
+      event('tool/call', 8, {
+        turn: 1, step: 5, callId: 'uncertain-command', name: 'bash',
+        arguments: JSON.stringify({ command: 'curl -X POST https://example.invalid/private' }),
+      }),
+      event('assistant/message', 9, {
+        turn: 1, step: 5, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 0 },
+      }),
+      event('turn/end', 10, { turn: 1, reason: { kind: 'interrupted' } }),
+    ], { cwd: '/work' })
+    const observed = deriveObservation(runtime)
+    const parsed = parseTaskPacket(runtime.events)
+    const terminal = runtime.events.at(-1)
+    if (parsed?.schemaVersion !== 2 || terminal === undefined) throw new Error('expected v2 recovery fixture')
+    const capsule = recoveryCapsuleForRunTree(runtime, parsed, terminal)
+
+    expect(observed.recoveryCapsule).toBeUndefined()
+    expect(capsule).toMatchObject({
+      schemaVersion: 1,
+      modelCallsUsed: 0,
+      maxBytes: RECOVERY_CAPSULE_MAX_BYTES,
+      parentRunId: packetV2.runId,
+      interruption: { kind: 'HOST_RESTART_INTERRUPTED', boundarySeq: 10 },
+      lastAcceptedProgress: { milestone: 'updated the parser', nextAction: 'run focused tests' },
+      workspace: {
+        baseline: { head: 'abc123', statusSummary: 'M existing-user-file.ts' },
+      },
+      uncertainEffects: {
+        total: 2,
+        entries: [
+          { callId: 'uncertain-edit', toolName: 'edit', category: 'FILESYSTEM_MUTATION' },
+          { callId: 'uncertain-command', toolName: 'bash', category: 'COMMAND_OR_EXTERNAL_EFFECT' },
+        ],
+      },
+      continuation: {
+        action: 'RECONCILE_UNCERTAIN_EFFECTS_THEN_CONTINUE',
+        replayPolicy: 'DO_NOT_BLINDLY_REPLAY',
+      },
+    })
+    expect(capsule.byteLength).toBeLessThanOrEqual(RECOVERY_CAPSULE_MAX_BYTES)
+    expect(JSON.stringify(capsule)).not.toContain('private source text')
+    expect(JSON.stringify(capsule)).not.toContain('example.invalid')
+    expect(observationSchema.safeParse(observed).success).toBe(true)
+  })
+
+  it('caps the uncertain-effect ledger without losing the total count', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'bounded recovery evidence',
+      writerMode: 'writer',
+    }
+    const calls = Array.from({ length: UNCERTAIN_EFFECTS_LIMIT + 5 }, (_, index) => event('tool/call', index + 2, {
+      turn: 1, step: index + 1, callId: `effect-${String(index)}`, name: 'unknown_mutator',
+      arguments: JSON.stringify({ secret: 'must never enter the capsule' }),
+    }))
+    const runtime = state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      ...calls,
+      event('turn/end', calls.length + 2, { turn: 1, reason: { kind: 'interrupted' } }),
+    ])
+    const observed = deriveObservation(runtime)
+    const parsed = parseTaskPacket(runtime.events)
+    const terminal = runtime.events.at(-1)
+    if (parsed?.schemaVersion !== 2 || terminal === undefined) throw new Error('expected v2 recovery fixture')
+    const capsule = recoveryCapsuleForRunTree(runtime, parsed, terminal)
+
+    expect(observed.recoveryCapsule).toBeUndefined()
+    expect(capsule.uncertainEffects).toMatchObject({
+      total: UNCERTAIN_EFFECTS_LIMIT + 5,
+      truncated: true,
+    })
+    expect(capsule.uncertainEffects.entries).toHaveLength(UNCERTAIN_EFFECTS_LIMIT)
+    expect(capsule.byteLength).toBeLessThanOrEqual(RECOVERY_CAPSULE_MAX_BYTES)
   })
 })

@@ -18,7 +18,7 @@ The worker receives a durable task packet containing the durable `sessionId`, a 
 3. the corresponding `turn/end` after that result.
 4. every descendant session affiliated with that run has settled.
 
-A completed `turn/end` without the handoff facts is `FAILED` with `MISSING_HANDOFF`. A valid root handoff with an affiliated child still running remains `WAITING/children-running`; after convergence, a child's durable token-budget stop takes precedence over the older root handoff. Other failures use `WORKER_FAILED`, `HOST_FAILED`, or `PROTOCOL_ERROR`. Every wait, recover, and control call for a v2 run carries `sessionId + runId`; a stale run is rejected before it can observe or mutate the newer execution and never carries a contradictory `REATTACHED` marker.
+A completed `turn/end` without the handoff facts is `FAILED` with `MISSING_HANDOFF`. A valid Root handoff with an affiliated child still running remains `WAITING/children-running`; an inactive child without a durable terminal boundary remains `WAITING/child-settlement-unverified`. Once children settle, their latest terminal time is a completion watermark: the Root must integrate the reports and publish a newer valid handoff plus corresponding `turn/end`, otherwise the run remains `WAITING/root-rehandoff-required`. A child's durable token-budget stop takes precedence over an older Root handoff. Other failures use `WORKER_FAILED`, `HOST_FAILED`, or `PROTOCOL_ERROR`. Every wait, recover, and control call for a v2 run carries `sessionId + runId`; a stale run is rejected before it can observe or mutate the newer execution and never carries a contradictory `REATTACHED` marker.
 
 Schema v2 may pin a caller `requestId`, its task-payload digest, and a
 `budget.maxTokens`. Admission is a Host-owned operation: the supervisor plugin
@@ -49,15 +49,24 @@ control return timing or action. `decisionShadow` is comparison evidence.
 
 Codex must surface aggregated progress during long runs and repeat root step/tool/token figures and verification results in its terminal response. MCP output entering model context is not itself a user-visible report.
 
+Bootstrap installs the versioned `dsh-supervised-worker` skill into the isolated
+DSH Home. Each queued Root prompt contains DSH's native
+`/dsh-supervised-worker` gesture, so the skill body is injected before task
+execution. A missing or stale installed copy is a deployment failure rather
+than an implicit fallback to prose-only instructions.
+
 ## Safety boundaries
 
-- One nonterminal writer task is allowed per real working tree: the writer domain is the nearest ancestor carrying a `.git` worktree marker, so different subdirectories of one worktree share a domain and linked worktrees remain distinct; a non-Git directory falls back to its exact `realpath`. Read-only roots may coexist. Parallel writers require distinct existing Git worktrees; there is no workspace lock manager. The Host plugin serializes writer check-and-admit across every MCP client connected to that Host. A writer dispatch fails closed unless exactly one Host URL is configured, because separate Hosts have no shared atomic admission authority; read-only discovery and work remain multi-Host capable.
-- A writer lease belongs to the queued/active run. Its root `turn/end` is necessary but does not release the lease while a descendant agent is still running or the root has queued follow-up work; this prevents an early root handoff from overlapping another writer with an affiliated child. Once the tree is quiet, the lease releases regardless of whether the terminal handoff is completed, blocked, checkpoint, escalation, missing, or failed. A continuation queues a new run and reacquires admission.
+- One nonterminal writer task is allowed per real working tree: the writer domain is the nearest ancestor carrying a `.git` worktree marker, so different subdirectories of one worktree share a domain and linked worktrees remain distinct; a non-Git directory falls back to its exact `realpath`. Read-only roots may coexist, but a Root cannot accept a new run of either mode while its previous supervised run has an unfinished Root turn, pending follow-up, or active/pending descendant. Parallel writers require distinct existing Git worktrees; there is no workspace lock manager. One Host-local critical section serializes writer check-and-admit across every MCP client, and its ownership scan includes attached agents plus cold persisted sessions. A writer dispatch fails closed unless exactly one Host URL is configured, because separate Hosts have no shared atomic admission authority; read-only discovery and work remain multi-Host capable.
+- A writer lease belongs to the queued/active run. Its root `turn/end` is necessary but does not release the lease while a descendant agent is still running or the root has queued follow-up work; an `interrupted` turn also retains ownership until the same Root supplies an exact Host-validated continuation. Other terminal reasons release once the tree is quiet. This prevents both an early root handoff and a crash boundary with uncertain effects from overlapping another writer.
+- `read_only` is an execution boundary, not prompt advice. Host admission appends DSH's native `sandbox/mode=read-only` and `approval/policy=never` before queueing the packet. DSH filesystem and bash sandbox consumers resolve that durable policy for each call, one-shot elevation is rejected, and child agents inherit it. Writer admission applies `workspace-write` but never broadens an existing approval policy; changing `never` back to `ask` remains an explicit user/deployment action.
 - Artifact admission starts from the authoritative `session.list` cwd, requires path containment, rejects absolute paths, traversal, symlinks, hardlinks, and non-regular files, and hashes through a validated open file handle (so the file fstat'ed is the file hashed) with per-artifact and total byte limits; admission is sequential and never loads an artifact wholly into memory.
-- Handoff output is bounded before it can enter supervisor context: summary 2048 characters, stage 128, file list 64 × 256, verification 32 entries with 256-character commands and 512-character summaries, blocker 1024, failure signature 256, attempted hypotheses 16 × 512, and artifact paths 16 × 512. DSH rc.8's public tool-schema DSL validates the structure but does not support JSON Schema length/count keywords, so the authoritative bounds are enforced at the Host tool execution boundary with the `.dsh-handoff/<runId>/` recovery convention. The MCP fold repeats the bounds for malformed or legacy durable results and exposes the affected fields in `handoffTruncated` instead of silently returning an unbounded payload. The tool never auto-writes handoff data, and `.dsh-handoff` is gitignored.
+- Handoff output is bounded before it can enter supervisor context: summary 2048 characters, stage 128, file list 64 × 256, verification 32 entries with 256-character commands and 512-character summaries, blocker 1024, failure signature 256, attempted hypotheses 16 × 512, and artifact paths 16 × 512. Reported recovery failures separately cap signature at 256, summary at 1024, and hypothesis at 512, and only the currently addressed Root may consume that recovery budget. DSH rc.8's public tool-schema DSL validates the structure but does not support JSON Schema length/count keywords, so the authoritative bounds are enforced at the Host tool execution boundary with the `.dsh-handoff/<runId>/` recovery convention. The MCP fold repeats the bounds for malformed or legacy durable results and exposes the affected fields in `handoffTruncated` instead of silently returning an unbounded payload. Host errors, MCP failures, approvals, and question previews are also bounded; an oversized approval or question batch is marked `answerInWeb=true` so Codex does not decide from a partial/truncated interaction. The tool never auto-writes handoff data, and `.dsh-handoff` is gitignored.
 - A reported `host/agent-error` is surfaced as `FAILED/HOST_FAILED` but is not sticky: it is cleared when the Host reports the agent running again, when `session.list` shows the row running, or when the session is removed. The in-memory event cache is pruned to the latest supervised task packet boundary on every refresh, bounding retained history across supervised tasks.
 - The anti-stuck mechanism counts exact worker-reported `failureSignature` values since the latest durable task packet and concludes the turn when the configured recovery budget is exhausted (two reports by default). Semantic equivalence remains the worker's judgment.
-- When `authority.maxDirectChildren` is present, the Host gates configured direct-child creation tools before execution. It atomically combines persisted direct-child session headers created inside the current run window with in-flight start reservations, so parallel calls cannot exceed the cap. Failed starts release their reservation. The default guarded tool name is `subagent`; deployments with renamed child tools must list them in `directChildToolNames`. Codex remains observation-only and does not duplicate this counter.
+- When `authority.maxDirectChildren` is present, the Host gates configured direct-child creation tools before execution. It atomically combines persisted direct-child session headers created inside the current run window with in-flight start reservations, so parallel calls cannot exceed the cap. Failed starts release their reservation. The bundled guarded tools are `subagent` and `subagent_fork`; deployments with renamed or additional child tools must list them in `directChildToolNames`. The profile also sets DSH's native absolute `maxDepth: 1` on both tools, allowing Root-to-child delegation while forbidding grandchildren. Codex remains observation-only and does not duplicate either control.
+
+- `dsh_agents` and `dsh_interrupt_agent` are scoped to the addressed run. A child must have a post-Root-boundary accepted-work event and must not be a nested different supervised run. Historical children remain visible in DSH Web but cannot be mistaken for or interrupted as current-run work through MCP.
 
 ## Telemetry
 
@@ -96,7 +105,26 @@ Mux frames update the in-memory fold immediately. HTTP list/history reconciliati
 `dsh_recover` reattaches without replay. MCP/network loss leaves the Host turn
 running. A Host-process crash is different: DSH persistence closes the orphaned
 turn as `interrupted`, which folds to retryable `HOST_FAILED` plus
-`CONTINUATION_REQUIRED`; only a new task with `parentRunId` may continue it.
+`CONTINUATION_REQUIRED`. The same durable fold emits a maximum-16-KiB
+`recoveryCapsule` with the last accepted Root semantic progress plus bounded
+baseline, project activity, token usage, and `uncertainEffects` folded across
+the complete affiliated run tree. Its `runTree` member identifies every folded
+session and its activation/terminal boundaries; every uncertain-effect entry
+identifies its owning session. A
+ledger entry exists when a potentially side-effecting `tool/call` has no durable
+correlated `tool/result`; known read-only and supervisor-reporting tools are
+excluded, while unknown tools fail conservatively into `UNKNOWN_TOOL_EFFECT`.
+Entries contain only bounded call/tool metadata—never arguments, results,
+transcripts, source, or command text. Only a new task carrying the exact
+`parentRunId` and capsule may continue it. Supplying either without the other is
+rejected. The Host recovery route reads attached and cold persisted sessions,
+proves the parent is the current interrupted run for that session, reconstructs
+the complete affiliated tree, and returns the capsule. The same Host admission
+critical section recomputes it and requires a byte-semantically exact capsule
+match. Missing, fabricated, stale, and cross-session capsules fail before a
+provider call. Recovery fails closed without a capsule when an affiliated child
+is active, lacks a durable terminal boundary, or cannot be reconciled. The
+worker must reconcile uncertain effects before any retry.
 
 Durable terminal observations create one structured run-journal record assembled
 only from already-folded runtime facts, with `modelCallsUsed: 0`. The stable

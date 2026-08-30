@@ -6,6 +6,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { admitArtifacts } from './artifacts.js'
 import {
+  HostRecoveryCoordinator,
+  registerRecoveryCapsuleRoute,
   registerTaskAdmissionRoute,
   TaskAdmissionCoordinator,
   type TaskAdmissionRuntime,
@@ -13,6 +15,9 @@ import {
 
 export { admitArtifact, admitArtifacts, type ArtifactManifestEntry } from './artifacts.js'
 export {
+  HostRecoveryCoordinator,
+  RECOVERY_CAPSULE_PATH,
+  registerRecoveryCapsuleRoute,
   registerTaskAdmissionRoute,
   TASK_ADMISSION_PATH,
   TaskAdmissionCoordinator,
@@ -22,6 +27,16 @@ export {
   type TaskAdmissionRequest,
   type TaskAdmissionRuntime,
 } from './admission.js'
+export {
+  RECOVERY_CAPSULE_MAX_BYTES,
+  UNCERTAIN_EFFECTS_LIMIT,
+  affiliatedChildActivation,
+  buildRecoveryCapsule,
+  type RecoveryCapsule,
+  type RecoveryEvent,
+  type RecoveryScope,
+  type RecoveryTaskPacket,
+} from './recovery.js'
 
 export const name = 'dsh-gate-supervisor-tools'
 export const inject = [
@@ -40,7 +55,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   maxReportedFailuresPerSignature: z.natural().min(1).max(20).default(2),
   maxReservedOutputTokensPerRequest: z.natural().min(1).max(131_072).default(8_192),
-  directChildToolNames: z.array(z.string()).default(['subagent']),
+  directChildToolNames: z.array(z.string()).default(['subagent', 'subagent_fork']),
 })
 
 const HANDOFF_STATUSES = [
@@ -64,6 +79,8 @@ export const HANDOFF_HYPOTHESES_LIMIT = 16
 export const HANDOFF_HYPOTHESIS_LIMIT = 512
 export const HANDOFF_ARTIFACTS_LIMIT = 16
 export const HANDOFF_ARTIFACT_PATH_LIMIT = 512
+export const REPORTED_FAILURE_SUMMARY_LIMIT = 1_024
+export const REPORTED_FAILURE_HYPOTHESIS_LIMIT = 512
 /** Ordinary semantic progress records are accepted at most once per minute. */
 export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
 export const TOKEN_BUDGET_STATE_PATH = '/api/dsh-gate.budget-state'
@@ -909,12 +926,42 @@ export function reportedFailureDecision(
   return { count, exhausted: count >= budget }
 }
 
+export function reportedFailurePayloadError(args: {
+  failureSignature: string
+  summary: string
+  hypothesis: string
+}): string | undefined {
+  if (args.failureSignature.length > HANDOFF_FAILURE_SIGNATURE_LIMIT) {
+    return `supervisor_report_failure failureSignature exceeds ${HANDOFF_FAILURE_SIGNATURE_LIMIT} characters`
+  }
+  if (args.summary.length > REPORTED_FAILURE_SUMMARY_LIMIT) {
+    return `supervisor_report_failure summary exceeds ${REPORTED_FAILURE_SUMMARY_LIMIT} characters`
+  }
+  if (args.hypothesis.length > REPORTED_FAILURE_HYPOTHESIS_LIMIT) {
+    return `supervisor_report_failure hypothesis exceeds ${REPORTED_FAILURE_HYPOTHESIS_LIMIT} characters`
+  }
+  return undefined
+}
+
+/** Failure recovery authority belongs only to the currently addressed Root session. */
+export function reportedFailureIdentityError(
+  events: readonly { type: string; seq?: number; time?: number; data: unknown }[],
+  currentSessionId: string,
+): string | undefined {
+  const identity = latestTaskIdentity(events)
+  if (identity === undefined) return 'supervisor_report_failure requires a valid supervised task packet'
+  if (identity.sessionId !== currentSessionId) {
+    return `supervisor_report_failure is Root-only; task packet addresses ${identity.sessionId}, current session is ${currentSessionId}`
+  }
+  return undefined
+}
+
 /** Install Host-owned live and post-restart token-budget enforcement. */
 export function installDirectChildAuthorityGuards(
   runtime: SupervisorRuntimeContext,
   options: { directChildToolNames?: readonly string[] } = {},
 ): void {
-  const toolNames = new Set(options.directChildToolNames ?? ['subagent'])
+  const toolNames = new Set(options.directChildToolNames ?? ['subagent', 'subagent_fork'])
   const locks = new Map<string, Promise<void>>()
   const pendingByRun = new Map<string, Set<symbol>>()
   const runByExecution = new Map<symbol, string>()
@@ -1184,10 +1231,20 @@ export function apply(ctx: Context, config: Config = {}): void {
     throw new Error('dsh-gate supervisor tools: directChildToolNames must contain at least one non-empty tool name')
   }
   const runtime = ctx as unknown as SupervisorRuntimeContext
+  const recovery = new HostRecoveryCoordinator(runtime as unknown as TaskAdmissionRuntime)
+  const admission = new TaskAdmissionCoordinator(
+    runtime as unknown as TaskAdmissionRuntime,
+    undefined,
+    recovery,
+  )
   ctx.effect(() => registerTaskAdmissionRoute(
     runtime.webServer,
-    new TaskAdmissionCoordinator(runtime as unknown as TaskAdmissionRuntime),
+    admission,
   ), 'dsh-gate task admission route')
+  ctx.effect(() => registerRecoveryCapsuleRoute(
+    runtime.webServer,
+    recovery,
+  ), 'dsh-gate recovery capsule route')
   ctx.effect(() => registerTokenBudgetStateRoute(
     runtime.webServer,
     runtime,
@@ -1211,7 +1268,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'include the structured decision category, impact, blocking state, request, options, and recommendation. '
       + '`needsSupervisor` is a migration hint; the runtime policy decides whether the request interrupts immediately or '
       + 'is folded into the normal progress cadence. Never claim pre-authorization yourself. '
-      + 'When the task packet grants `authority.maxDirectChildren`, you may create children within that cap without asking again; the Host rejects starts beyond the durable run limit. '
+      + 'When the task packet grants `authority.maxDirectChildren`, you may create children within that cap without asking again; the Host rejects starts beyond the durable run limit. DSH native maxDepth permits Root-to-child delegation and forbids grandchildren. '
+      + 'If you create children, wait for their durable terminal boundaries, integrate the Host-delivered reports in Root, and only then publish the final Root handoff; its turn end must be strictly newer than the last child terminal boundary. '
       + 'A normal turn ending without that valid handoff is not success. Report repeated failures through '
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
       + 'whether two failures are semantically the same remains your responsibility.',
@@ -1306,7 +1364,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     execute(args, exec) {
-      const events = exec.agent?.session.events ?? []
+      if (exec.agent === undefined) throw new Error('supervisor_report_failure requires an agent-owned session')
+      const payloadError = reportedFailurePayloadError(args)
+      if (payloadError !== undefined) throw new Error(payloadError)
+      const events = exec.agent.session.events
+      const identityError = reportedFailureIdentityError(events, exec.agent.session.header.id)
+      if (identityError !== undefined) throw new Error(identityError)
       const { count, exhausted } = reportedFailureDecision(
         events,
         args.failureSignature,

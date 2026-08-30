@@ -12,7 +12,25 @@ import {
 } from '@deepseek-ai/dsh-client-connection/network-client'
 import { taskBoundarySeq } from './fold.js'
 import type {
-  DshEvent, PendingApproval, PendingQuestion, TaskRuntimeState, WorkerState,
+  DshEvent, PendingApproval, PendingQuestion, RecoveryCapsule, TaskRuntimeState, WorkerState,
+} from './contracts.js'
+import {
+  APPROVAL_REASON_LIMIT,
+  APPROVAL_TOOL_NAME_LIMIT,
+  FAILURE_MESSAGE_LIMIT,
+  INTERACTION_ID_LIMIT,
+  QUESTION_COUNT_LIMIT,
+  QUESTION_DETAIL_LIMIT,
+  QUESTION_HEADER_LIMIT,
+  QUESTION_ID_LIMIT,
+  QUESTION_OPTION_DESCRIPTION_LIMIT,
+  QUESTION_OPTION_LABEL_LIMIT,
+  QUESTION_OPTIONS_LIMIT,
+  QUESTION_TEXT_LIMIT,
+  recoveryCapsuleSchema,
+  telemetrySessionStatsSchema,
+  telemetrySubagentSchema,
+  telemetryTokenUsageSchema,
 } from './contracts.js'
 
 export interface HostLaunchConfig {
@@ -38,6 +56,8 @@ export interface TaskAdmissionRequest {
   requestId: string
   requestDigest: string
   runId: string
+  parentRunId?: string
+  recoveryCapsule?: RecoveryCapsule
   prompt: string
   modelSelection: {
     provider: string
@@ -57,6 +77,14 @@ export interface TaskAdmissionReceipt {
 }
 
 export type TaskAdmissionTransport = (request: TaskAdmissionRequest) => Promise<TaskAdmissionReceipt>
+
+export interface RecoveryCapsuleRequest {
+  schemaVersion: 1
+  sessionId: string
+  parentRunId: string
+}
+
+export type RecoveryCapsuleTransport = (request: RecoveryCapsuleRequest) => Promise<RecoveryCapsule>
 
 export interface TokenBudgetStateRequest {
   schemaVersion: 1
@@ -139,6 +167,49 @@ async function postTaskAdmission(baseUrl: string, request: TaskAdmissionRequest)
   return taskAdmissionReceipt(result.value, request)
 }
 
+function recoveryCapsuleReceipt(value: unknown, request: RecoveryCapsuleRequest): RecoveryCapsule {
+  const parsed = recoveryCapsuleSchema.safeParse(value)
+  if (!parsed.success
+    || parsed.data.runTree.sessions[0]?.sessionId !== request.sessionId
+    || parsed.data.parentRunId !== request.parentRunId) {
+    throw new ProtocolContractError('malformed dsh-gate recovery capsule receipt')
+  }
+  return parsed.data
+}
+
+async function postRecoveryCapsule(
+  baseUrl: string,
+  request: RecoveryCapsuleRequest,
+): Promise<RecoveryCapsule> {
+  const rpcId = `dsh-gate-recovery-${request.parentRunId}`
+  const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.recovery-capsule`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'client-request', rpcId, method: 'dsh-gate.recovery-capsule', payload: request,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (response.status === 404) {
+    throw new ProtocolContractError('DSH Host does not expose durable recovery capsules; reinstall the supervisor plugin and restart the Host')
+  }
+  if (!response.ok) throw new Error(`dsh-gate recovery carrier returned HTTP ${String(response.status)}`)
+  const envelope = await response.json() as Record<string, unknown>
+  if (envelope.type !== 'server-response' || envelope.rpcId !== rpcId
+    || typeof envelope.result !== 'object' || envelope.result === null) {
+    throw new ProtocolContractError('malformed dsh-gate recovery capsule response')
+  }
+  const result = envelope.result as Record<string, unknown>
+  if (result.ok === false) {
+    const error = typeof result.error === 'object' && result.error !== null
+      ? result.error as Record<string, unknown>
+      : {}
+    throw new Error(`${String(error.code ?? 'INTERNAL')}: ${String(error.message ?? 'recovery capsule failed')}`)
+  }
+  if (result.ok !== true) throw new ProtocolContractError('malformed dsh-gate recovery capsule result')
+  return recoveryCapsuleReceipt(result.value, request)
+}
+
 function tokenBudgetStateReceipt(value: unknown, request: TokenBudgetStateRequest): TokenBudgetStateReceipt {
   if (typeof value !== 'object' || value === null) throw new ProtocolContractError('malformed dsh-gate token budget state receipt')
   const receipt = value as Record<string, unknown>
@@ -212,6 +283,99 @@ export function needsOlderHistoryPage(
   return knownHistoryAsOf === undefined || firstSeq > knownHistoryAsOf + 1
 }
 
+function bounded(value: string, limit: number): string {
+  return value.slice(0, limit)
+}
+
+function boundedTelemetry(values: Record<string, unknown> | undefined): CachedSessionMetadata['telemetry'] | undefined {
+  if (values === undefined) return undefined
+  const tokenUsage = telemetryTokenUsageSchema.safeParse(values.tokenUsage)
+  const sessionStats = telemetrySessionStatsSchema.safeParse(values.sessionStats)
+  const rawSubagent = typeof values.subagent === 'object' && values.subagent !== null
+    && typeof (values.subagent as Record<string, unknown>).label === 'string'
+    ? { ...(values.subagent as Record<string, unknown>), label: bounded((values.subagent as { label: string }).label, 256) }
+    : values.subagent
+  const subagent = telemetrySubagentSchema.safeParse(rawSubagent)
+  return {
+    asOfSeq: -1,
+    ...tokenUsage.success ? { tokenUsage: tokenUsage.data } : {},
+    ...sessionStats.success ? { sessionStats: sessionStats.data } : {},
+    ...subagent.success ? { subagent: subagent.data } : {},
+  }
+}
+
+/** Keep worker-authored question payloads from becoming an unbounded MCP response. */
+export function boundedPendingQuestion(rpcId: string, values: readonly unknown[]): PendingQuestion {
+  let truncated = values.length > QUESTION_COUNT_LIMIT || rpcId.length > INTERACTION_ID_LIMIT
+  const questions = values.slice(0, QUESTION_COUNT_LIMIT).flatMap((raw) => {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      truncated = true
+      return []
+    }
+    const value = raw as Record<string, unknown>
+    if (typeof value.id !== 'string' || typeof value.question !== 'string') {
+      truncated = true
+      return []
+    }
+    const options = Array.isArray(value.options)
+      ? value.options.slice(0, QUESTION_OPTIONS_LIMIT).flatMap((rawOption) => {
+          if (typeof rawOption !== 'object' || rawOption === null || Array.isArray(rawOption)
+            || typeof (rawOption as Record<string, unknown>).label !== 'string') {
+            truncated = true
+            return []
+          }
+          const option = rawOption as Record<string, unknown>
+          const label = option.label as string
+          const description = typeof option.description === 'string' ? option.description : undefined
+          if ('description' in option && description === undefined) truncated = true
+          if (label.length > QUESTION_OPTION_LABEL_LIMIT
+            || (description?.length ?? 0) > QUESTION_OPTION_DESCRIPTION_LIMIT) truncated = true
+          return [{
+            label: bounded(label, QUESTION_OPTION_LABEL_LIMIT),
+            ...description === undefined ? {} : {
+              description: bounded(description, QUESTION_OPTION_DESCRIPTION_LIMIT),
+            },
+          }]
+        })
+      : undefined
+    if ('options' in value && !Array.isArray(value.options)) truncated = true
+    if (Array.isArray(value.options) && value.options.length > QUESTION_OPTIONS_LIMIT) truncated = true
+    const detail = typeof value.detail === 'string' ? value.detail : undefined
+    const header = typeof value.header === 'string' ? value.header : undefined
+    const rawIntentApprove = typeof value.intent === 'object' && value.intent !== null
+      && (value.intent as Record<string, unknown>).kind === 'plan-review'
+      && typeof (value.intent as Record<string, unknown>).approve === 'string'
+      ? (value.intent as { approve: string }).approve
+      : undefined
+    const intent = rawIntentApprove === undefined
+      ? undefined
+      : { kind: 'plan-review' as const, approve: bounded(rawIntentApprove, QUESTION_OPTION_LABEL_LIMIT) }
+    if ('detail' in value && detail === undefined) truncated = true
+    if ('header' in value && header === undefined) truncated = true
+    if ('multiSelect' in value && typeof value.multiSelect !== 'boolean') truncated = true
+    if ('intent' in value && rawIntentApprove === undefined) truncated = true
+    if ((value.id as string).length > QUESTION_ID_LIMIT
+      || (value.question as string).length > QUESTION_TEXT_LIMIT
+      || (detail?.length ?? 0) > QUESTION_DETAIL_LIMIT
+      || (header?.length ?? 0) > QUESTION_HEADER_LIMIT
+      || (rawIntentApprove?.length ?? 0) > QUESTION_OPTION_LABEL_LIMIT) truncated = true
+    return [{
+      id: bounded(value.id as string, QUESTION_ID_LIMIT),
+      question: bounded(value.question as string, QUESTION_TEXT_LIMIT),
+      ...detail === undefined ? {} : { detail: bounded(detail, QUESTION_DETAIL_LIMIT) },
+      ...header === undefined ? {} : { header: bounded(header, QUESTION_HEADER_LIMIT) },
+      ...options === undefined ? {} : { options },
+      ...typeof value.multiSelect === 'boolean' ? { multiSelect: value.multiSelect } : {},
+      ...intent === undefined ? {} : { intent },
+    }]
+  })
+  return {
+    rpcId: bounded(rpcId, INTERACTION_ID_LIMIT),
+    questions,
+    ...truncated ? { truncated: true as const, answerInWeb: true as const } : {},
+  }
+}
+
 /** Start a configured DSH Host without tying its lifetime to this MCP process. */
 export function launchDetachedHost(config: HostLaunchConfig): Promise<void> {
   const [command, ...args] = config.argv
@@ -236,6 +400,7 @@ export class HostConnection {
   private description: HostDescription | undefined
   private protocolError: string | undefined
   private readonly listeners = new Set<() => void>()
+  private readonly sessionListeners = new Map<string, Set<() => void>>()
   private readonly events = new Map<string, Map<number, DshEvent>>()
   /** Highest sequence through which history pagination has established a contiguous durable prefix. */
   private readonly historyAsOf = new Map<string, number>()
@@ -250,6 +415,7 @@ export class HostConnection {
     readonly api: IApiClient = new WebApiClient(baseUrl),
     private readonly admissionTransport: TaskAdmissionTransport = request => postTaskAdmission(baseUrl, request),
     private readonly budgetStateTransport: TokenBudgetStateTransport = request => postTokenBudgetState(baseUrl, request),
+    private readonly recoveryTransport: RecoveryCapsuleTransport = request => postRecoveryCapsule(baseUrl, request),
   ) {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
@@ -257,11 +423,11 @@ export class HostConnection {
         this.protocolError = description.protocolVersion === 1
           ? undefined
           : `unsupported DSH Host protocol version ${String(description.protocolVersion)} (expected 1)`
-        this.publish()
+        this.publishAll()
       },
       onStateChange: (state) => {
         if (state === 'reconnecting') this.description = undefined
-        this.publish()
+        this.publishAll()
       },
       onMuxEnvelope: envelope => this.onMux(envelope),
       onHostEnvelope: envelope => this.onHost(envelope),
@@ -273,13 +439,31 @@ export class HostConnection {
     this.controller.stop()
   }
 
-  private publish(): void {
+  private publishAll(): void {
     for (const listener of [...this.listeners]) listener()
+    for (const listeners of this.sessionListeners.values()) {
+      for (const listener of [...listeners]) listener()
+    }
+  }
+
+  private publishSession(sessionId: string): void {
+    for (const listener of [...this.listeners]) listener()
+    for (const listener of [...(this.sessionListeners.get(sessionId) ?? [])]) listener()
   }
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  private subscribeSession(sessionId: string, listener: () => void): () => void {
+    const listeners = this.sessionListeners.get(sessionId) ?? new Set<() => void>()
+    listeners.add(listener)
+    this.sessionListeners.set(sessionId, listeners)
+    return () => {
+      listeners.delete(listener)
+      if (listeners.size === 0) this.sessionListeners.delete(sessionId)
+    }
   }
 
   private onMux(envelope: RpcRequest<MuxFrame>): void {
@@ -289,21 +473,28 @@ export class HostConnection {
       sessionEvents.set(frame.event.seq, frame.event as DshEvent)
       this.events.set(frame.sessionId, sessionEvents)
     } else if (frame.type === 'approval/requested') {
+      const answerInWeb = envelope.rpcId.length > INTERACTION_ID_LIMIT
+        || frame.approvalId.length > INTERACTION_ID_LIMIT
+        || frame.toolName.length > APPROVAL_TOOL_NAME_LIMIT
+        || (frame.callId?.length ?? 0) > INTERACTION_ID_LIMIT
+        || (frame.reason?.length ?? 0) > APPROVAL_REASON_LIMIT
       this.approvals.set(frame.sessionId, {
-        rpcId: envelope.rpcId,
-        approvalId: frame.approvalId,
-        toolName: frame.toolName,
-        ...frame.callId === undefined ? {} : { callId: frame.callId },
-        ...frame.reason === undefined ? {} : { reason: frame.reason },
+        rpcId: bounded(envelope.rpcId, INTERACTION_ID_LIMIT),
+        approvalId: bounded(frame.approvalId, INTERACTION_ID_LIMIT),
+        toolName: bounded(frame.toolName, APPROVAL_TOOL_NAME_LIMIT),
+        ...frame.callId === undefined ? {} : { callId: bounded(frame.callId, INTERACTION_ID_LIMIT) },
+        ...frame.reason === undefined ? {} : { reason: bounded(frame.reason, APPROVAL_REASON_LIMIT) },
+        ...answerInWeb ? { truncated: true as const, answerInWeb: true as const } : {},
       })
     } else if (frame.type === 'approval/resolved') {
       this.approvals.delete(frame.sessionId)
     } else if (frame.type === 'question/requested') {
-      this.questions.set(frame.sessionId, { rpcId: envelope.rpcId, questions: frame.questions })
+      this.questions.set(frame.sessionId, boundedPendingQuestion(envelope.rpcId, frame.questions))
     } else if (frame.type === 'question/resolved') {
       this.questions.delete(frame.sessionId)
     }
-    this.publish()
+    if ('sessionId' in frame) this.publishSession(frame.sessionId)
+    else this.publishAll()
   }
 
   private onHost(envelope: RpcRequest<HostFrame>): void {
@@ -314,11 +505,12 @@ export class HostConnection {
       // signal for a previously reported agent error; an idle session keeps it.
       if (frame.running) this.hostErrors.delete(frame.sessionId)
     } else if (frame.type === 'host/agent-error') {
-      this.hostErrors.set(frame.sessionId, frame.message)
+      this.hostErrors.set(frame.sessionId, bounded(frame.message, FAILURE_MESSAGE_LIMIT))
     } else if (frame.type === 'host/session-removed') {
       this.dropSession(frame.sessionId)
     }
-    this.publish()
+    if ('sessionId' in frame) this.publishSession(frame.sessionId)
+    else this.publishAll()
   }
 
   /** Drop all in-memory state for a session the Host no longer tracks. */
@@ -363,6 +555,11 @@ export class HostConnection {
     return this.admissionTransport(request)
   }
 
+  /** Read the Host's exact durable recovery capsule for one interrupted run tree. */
+  recoveryCapsule(request: RecoveryCapsuleRequest): Promise<RecoveryCapsule> {
+    return this.recoveryTransport(request)
+  }
+
   /** Read the Host's durable run-tree token projection without invoking a model. */
   tokenBudgetState(request: TokenBudgetStateRequest): Promise<TokenBudgetStateReceipt> {
     return this.budgetStateTransport(request)
@@ -395,7 +592,7 @@ export class HostConnection {
     while (hasMore) {
       const page = unwrap(await this.api.sessions.history({
         sessionId: sessionId as SessionId,
-        maxMessages: knownHistoryAsOf === undefined ? 200 : 1,
+        maxMessages: 200,
         ...beforeSeq === undefined ? {} : { beforeSeq },
       }))
       projections ??= page.projections
@@ -422,11 +619,10 @@ export class HostConnection {
     const pendingQuestion = this.questions.get(sessionId)
     const hostError = this.hostErrors.get(sessionId)
     const telemetryValues = projections?.values as Record<string, unknown> | undefined
-    const telemetry = projections === undefined ? undefined : {
+    const boundedProjection = boundedTelemetry(telemetryValues)
+    const telemetry = projections === undefined || boundedProjection === undefined ? undefined : {
+      ...boundedProjection,
       asOfSeq: projections.asOfSeq,
-      ...telemetryValues?.tokenUsage === undefined ? {} : { tokenUsage: telemetryValues.tokenUsage },
-      ...telemetryValues?.sessionStats === undefined ? {} : { sessionStats: telemetryValues.sessionStats },
-      ...telemetryValues?.subagent === undefined ? {} : { subagent: telemetryValues.subagent },
     }
     this.metadata.set(sessionId, {
       ...row.cwd === undefined ? {} : { cwd: row.cwd },
@@ -464,10 +660,15 @@ export class HostConnection {
     }
   }
 
-  waitForChange(timeoutMs: number): Promise<boolean> {
+  waitForChange(timeoutMs: number): Promise<boolean>
+  waitForChange(sessionId: string, timeoutMs: number): Promise<boolean>
+  waitForChange(sessionIdOrTimeout: string | number, timeoutMs?: number): Promise<boolean> {
+    const sessionId = typeof sessionIdOrTimeout === 'string' ? sessionIdOrTimeout : undefined
+    const waitMs = typeof sessionIdOrTimeout === 'number' ? sessionIdOrTimeout : timeoutMs as number
     return new Promise(resolve => {
-      const timer = setTimeout(() => { dispose(); resolve(false) }, timeoutMs)
-      const dispose = this.subscribe(() => { clearTimeout(timer); dispose(); resolve(true) })
+      const timer = setTimeout(() => { dispose(); resolve(false) }, waitMs)
+      const listener = () => { clearTimeout(timer); dispose(); resolve(true) }
+      const dispose = sessionId === undefined ? this.subscribe(listener) : this.subscribeSession(sessionId, listener)
     })
   }
 
@@ -475,6 +676,9 @@ export class HostConnection {
     const pending = this.approvals.get(sessionId)
     if (pending === undefined) throw new Error(`no pending approval for ${sessionId}`)
     if (pending.rpcId !== rpcId) throw new Error(`stale approval rpcId ${rpcId}; active rpcId is ${pending.rpcId}`)
+    if (pending.answerInWeb === true) {
+      throw new Error('pending approval exceeded the bounded supervisor envelope; answer it in DSH Web')
+    }
     const receipt = await this.api.respond({
       type: 'client-response', rpcId: pending.rpcId as never,
       result: { ok: true, value: { sessionId, approvalId: pending.approvalId, outcome } },
@@ -486,6 +690,9 @@ export class HostConnection {
     const pending = this.questions.get(sessionId)
     if (pending === undefined) throw new Error(`no pending question for ${sessionId}`)
     if (pending.rpcId !== rpcId) throw new Error(`stale question rpcId ${rpcId}; active rpcId is ${pending.rpcId}`)
+    if (pending.answerInWeb === true) {
+      throw new Error('pending question exceeded the bounded supervisor envelope; answer it in DSH Web')
+    }
     const receipt = await this.api.respond({
       type: 'client-response', rpcId: pending.rpcId as never,
       result: { ok: true, value: { sessionId, answer: { answers } } },

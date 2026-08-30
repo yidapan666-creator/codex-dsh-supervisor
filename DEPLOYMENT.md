@@ -110,7 +110,10 @@ when everything is already current — pass `--force` to rebuild):
 6. **gate-build** — `pnpm build` in this repo.
 7. **plugin** — `DSH_HOME=<state>/dsh-home <checkout>/apps/cli/lib/bin.js
    plugin --profile web add <repo>/packages/dsh-supervisor-tools`.
-8. **metadata** — write `.dsh-state/install.json`.
+8. **worker-skill** — atomically install the repository's
+   `dsh-supervised-worker/SKILL.md` into the isolated `DSH_HOME/skills`
+   catalog.
+9. **metadata** — write `.dsh-state/install.json`.
 
 Bootstrap **never starts the Host** — that is a separate, explicit step
 (`pnpm host:start`, or the configured `DSH_HOST_LAUNCH`).
@@ -126,9 +129,9 @@ refresh headroom before returning its aggregated observation.
 | `.dsh-state/dsh` | managed DSH fork checkout at the pinned commit |
 | `.dsh-state/dsh-home` | isolated `DSH_HOME` (profiles, patches, state) |
 | `.dsh-state/install.json` | install metadata (pin, paths, versions) |
-| `.dsh-state/logs/host.log` | detached Host output |
-| `.dsh-state/host/host.pid` | Host process record (pid, argv, url) |
-| `.dsh-state/host/host.start.lock` | short-lived Host startup lease; absent outside startup |
+| `.dsh-state/logs/http-<host>-<port>.log` | detached Host output, isolated by Host origin |
+| `.dsh-state/host/http-<host>-<port>.pid` | Host process record (pid, argv, url), isolated by Host origin |
+| `.dsh-state/host/http-<host>-<port>.start.lock` | short-lived per-origin Host startup lease; absent outside startup |
 
 `.dsh-state/` is in `.gitignore`: none of it can enter the public repository.
 Normal workspace build products (`node_modules/`, package `dist/` directories,
@@ -149,8 +152,9 @@ DSH build outputs (CLI, network-client lib, web dist), network-client link
 target, built MCP entry, supervisor plugin/profile state, and — with
 `--live` — a live Host's `protocolVersion` (must be `1`), `hostInstanceId`,
 and a non-placeholder `version`. With `--session`, doctor also calls the
-session's read-only model-routing endpoint and requires a current routable
-provider/model with no reported routing failures. That check spends no tokens;
+session's read-only model-routing endpoint and requires the current
+provider/model to be explicitly routable. Failures from unrelated provider
+catalogs remain advisory. That check spends no tokens;
 only an explicitly dispatched real task can prove that credentials and the
 provider request path work end to end. Any failed check exits non-zero with the
 reason; live checks are optional and skipped without `--live`.
@@ -162,37 +166,50 @@ pnpm host:start      # start the DSH Web Host on http://127.0.0.1:8080
 node scripts/dsh-gate.mjs host run  # foreground mode for launchd/systemd
 pnpm host:status     # is it running? which hostInstanceId?
 pnpm host:stop       # stop only the Host this checkout started
+# For a custom port, pass the same URL to every lifecycle command:
+node scripts/dsh-gate.mjs host start --host http://127.0.0.1:18080
+node scripts/dsh-gate.mjs host status --host http://127.0.0.1:18080
+node scripts/dsh-gate.mjs host stop --host http://127.0.0.1:18080
 ```
 
 `host:start` verifies the checkout and profile first, then spawns
 `node <checkout>/apps/cli/lib/bin.js web --host 127.0.0.1 --port 8080
 --no-open` **detached** with `DSH_HOME` set to `.dsh-state/dsh-home`, cwd set
-to this repository, output appended to `.dsh-state/logs/host.log`, and waits
+to this repository, output appended to its origin-scoped log, and waits
 for `/api/host.describe` to answer. `host:stop` kills **only** the pid
-recorded in `.dsh-state/host/host.pid` — and only after verifying its command
+recorded in that origin's PID file — and only after verifying its command
 line matches the dsh-gate Host, so it never kills an unrelated process. A Host
-started outside dsh-gate is never touched.
+started outside dsh-gate is never touched. Local launch accepts only an HTTP
+loopback origin with no path, query, credentials, or fragment. Different ports
+have separate PID files, readiness leases, and logs, so inspecting or operating
+one Host cannot clear ownership for another. Legacy `host.pid` records are read
+only when their recorded URL exactly matches the requested origin.
 
 For continuous crash restart, copy the platform example from
 `config/launchd/com.dsh-gate.host.plist.example` or
 `config/systemd/dsh-gate-host.service.example`, replace every absolute-path
 placeholder, and let it execute `host run`. That mode keeps the wrapper
-attached, forwards termination signals, writes the same verified PID record,
+attached, holds the cross-process startup lease until `/api/host.describe`
+answers, forwards termination signals, writes the same verified PID record,
 and exits when the Host exits so the OS supervisor can restart it. Do not put
 API keys in a committed service definition; use the provider's DSH profile or
 the platform's secret facility. Unload or disable the launchd/systemd unit
 before `pnpm host:stop`; an enabled `KeepAlive`/`Restart` policy will otherwise
 correctly start the Host again.
 
+Run `pnpm bootstrap` before loading either service definition. Bootstrap
+pre-creates `.dsh-state/logs`, which launchd requires because it opens the
+configured stdout/stderr path before starting `host run`.
+
 Concurrent starts are safe at both layers. One MCP process coalesces its own
 overlapping launch requests, while `host:start` takes an exclusive,
-cross-process startup lease across PID/port discovery and the readiness probe.
+cross-process, per-origin startup lease across PID/port discovery and the readiness probe.
 Other MCP processes wait, then reconnect to the winner instead of spawning a
 second Host. This lease is only for Host startup; it is not a working-tree
 writer lock manager. If a `host:start` process is killed before its `finally`
 cleanup, the lease is deliberately not guessed stale. Confirm that no
 `host:start` process remains, then remove
-`.dsh-state/host/host.start.lock` manually and retry.
+the reported origin-scoped `.start.lock` manually and retry.
 
 - **Stopping MCP never stops the Host.** The MCP server holds no kill
   capability; its connection close only stops its own client.
@@ -222,8 +239,17 @@ cleanup, the lease is deliberately not guessed stale. Confirm that no
   the detached Host; with the supplied launchd/systemd examples, `host run`
   lets the OS restart it continuously. DSH reloads the durable session and
   closes the orphaned turn as `interrupted`. `dsh_recover` returns
-  `CONTINUATION_REQUIRED`; queue a new bounded task with `parentRunId` instead
-  of guessing success or replaying the full prompt.
+  `CONTINUATION_REQUIRED` plus a runtime-derived `recoveryCapsule` capped at
+  16 KiB. It folds the complete affiliated run tree and includes every folded
+  session's durable activation/terminal boundaries. Queue a new bounded task
+  with both the exact `parentRunId` and capsule instead of guessing success or
+  replaying the full prompt. Admission recomputes the capsule from refreshed
+  Host history and rejects missing, fabricated, stale, cross-session, or
+  child-incomplete evidence before a provider call. The capsule contains
+  no tool arguments, tool outputs, transcript, or file contents. Its
+  `uncertainEffects` ledger lists only calls with possible side effects and no
+  durable correlated `tool/result`, together with the owning session; reconcile
+  those effects before retrying.
 
 ### Per-task token budget
 
@@ -277,8 +303,10 @@ at once.
 ### Direct-child authority
 
 `authority.maxDirectChildren` is enforced in the DSH Host before child creation,
-including parallel start attempts. The bundled profile guards the default
-`subagent` tool. If a deployment renames that tool or mounts another direct-child
+including parallel start attempts. The bundled profile guards both `subagent`
+and `subagent_fork`, and sets DSH's native absolute `maxDepth: 1` on both so a
+Root may create direct children but those children cannot create grandchildren.
+If a deployment renames either tool or mounts another direct-child
 creation tool, add every such name to the supervisor plugin's
 `directChildToolNames` list; startup rejects an empty list rather than silently
 disabling the authority boundary. The counter uses persisted direct-child
@@ -288,6 +316,9 @@ ownership from the DSH root to MCP/Codex.
 ## Wiring Codex
 
 1. `pnpm bootstrap` (once).
+   This also installs `skills/dsh-supervised-worker/SKILL.md` into the isolated
+   `DSH_HOME/skills` catalog. Re-run bootstrap after updating that contract;
+   doctor and Host startup reject a missing or stale installed copy.
 2. Copy `config/codex-mcp.example.toml` into your Codex config, replacing
    `<workspace-root>` with this checkout's absolute path. That placeholder is
    the only machine-specific value.

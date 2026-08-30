@@ -46,4 +46,9 @@ describe('structured MCP tool failures', () => {
       failure: { kind: 'PROTOCOL_ERROR', retryable: false },
     })
   })
+
+  it('bounds failure text before returning it through MCP', () => {
+    const envelope = toolFailureEnvelope(new Error(`DSH Host failed: ${'x'.repeat(4_000)}`))
+    expect((envelope.failure as { message: string }).message).toHaveLength(2_048)
+  })
 })

@@ -9,7 +9,8 @@ import {
   type DecisionCategory, type DecisionPolicy,
 } from '@dsh-gate/decision-policy'
 import {
-  deriveObservation, parseTaskPacket, progressObservation, supervisorDecisionHistory, taskBoundarySeq, taskPacketEntries, timeoutObservation,
+  deriveObservation, parseTaskPacket, progressObservation,
+  supervisorDecisionHistory, taskBoundarySeq, taskPacketEntries, timeoutObservation,
 } from './fold.js'
 import {
   FileRunJournal, isRunRecordOutcome, runRecordId, type RunJournal, type RunRecord,
@@ -18,8 +19,9 @@ import {
   HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
 import {
-  TASK_PACKET_END, TASK_PACKET_START, taskPacketSchema,
-  type DshEvent, type Observation, type TaskRuntimeState,
+  FAILURE_MESSAGE_LIMIT, TASK_PACKET_END, TASK_PACKET_START, recoveryCapsuleSchema, taskPacketSchema,
+  telemetrySessionStatsSchema, telemetryTokenUsageSchema,
+  type DshEvent, type Observation, type RecoveryCapsule, type TaskRuntimeState,
 } from './contracts.js'
 import { UsageMonitorClient } from './usage-monitor.js'
 
@@ -111,7 +113,7 @@ export async function resolveSessionCwd(cwd: string): Promise<string> {
 }
 
 export interface GatewayDependencies {
-  /** Overridable for tests; defaults to {@link resolveWriterDomain}. */
+  /** @deprecated Writer admission is Host-owned; retained for source compatibility and ignored. */
   resolveWriterDomain?: (cwd: string) => Promise<string>
   /** Overridable for tests; defaults to a real {@link HostConnection}. */
   createConnection?: (baseUrl: string) => HostConnection
@@ -130,6 +132,8 @@ export function attachChildObservations<T extends { id: string }>(
     const row = rows.get(entry.id)
     if (row === undefined) return { ...entry }
     const values = row.projections?.values as Record<string, unknown> | undefined
+    const sessionStats = telemetrySessionStatsSchema.safeParse(values?.sessionStats)
+    const tokenUsage = telemetryTokenUsageSchema.safeParse(values?.tokenUsage)
     return {
       ...entry,
       observation: {
@@ -137,13 +141,19 @@ export function attachChildObservations<T extends { id: string }>(
         ...row.projections === undefined ? {} : {
           telemetry: {
             asOfSeq: row.projections.asOfSeq,
-            ...values?.sessionStats === undefined ? {} : { sessionStats: values.sessionStats },
-            ...values?.tokenUsage === undefined ? {} : { tokenUsage: values.tokenUsage },
+            ...sessionStats.success ? { sessionStats: sessionStats.data } : {},
+            ...tokenUsage.success ? { tokenUsage: tokenUsage.data } : {},
           },
         },
       },
     }
   })
+}
+
+function boundedChildLabel<T extends { label?: string }>(entry: T): T {
+  return entry.label === undefined || entry.label.length <= 256
+    ? entry
+    : { ...entry, label: entry.label.slice(0, 256) }
 }
 
 interface RunTreeBudgetStop {
@@ -156,6 +166,8 @@ interface RunTreeBudgetStop {
 
 interface RunTreeConvergence {
   activeSessionIds: string[]
+  unsettledSessionIds: string[]
+  latestChildTerminalTime?: number
   budgetStop?: RunTreeBudgetStop
 }
 
@@ -192,6 +204,27 @@ function hookBudgetStop(events: readonly DshEvent[], afterSeq: number, runId: st
   }
 }
 
+/** A direct child belongs to this run only after a post-boundary activation that does not start another run. */
+function affiliatedChildActivation(
+  events: readonly DshEvent[],
+  childSessionId: string,
+  rootBoundaryTime: number,
+  runId: string,
+): DshEvent | undefined {
+  const nested = taskPacketEntries(events).findLast(({ packet, seq }) => {
+    const boundary = events.find(event => event.seq === seq)
+    return packet.schemaVersion === 2 && packet.sessionId === childSessionId
+      && boundary !== undefined && boundary.time >= rootBoundaryTime
+  })
+  if (nested !== undefined && nested.packet.schemaVersion === 2 && nested.packet.runId !== runId) return undefined
+  return events.find((event) => {
+    if (event.type !== 'user/message' || event.time < rootBoundaryTime) return false
+    const packet = parseTaskPacket([event])
+    return packet === undefined || (packet.schemaVersion === 2 && packet.sessionId === childSessionId
+      && packet.runId === runId)
+  })
+}
+
 export interface GatewayConfig {
   hostUrls: string[]
   launch?: HostLaunchConfig
@@ -224,19 +257,20 @@ export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
 /** Periodic authoritative reconciliation while mux events drive cached observations. */
 export const WAIT_RECONCILE_INTERVAL_MS = 30_000
 
-/** A writer packet owns its in-process worktree lease until its corresponding turn ends. */
+/** Diagnostic fold matching Host ownership: an interrupted writer stays owned until exact continuation. */
 export function writerLeaseHeld(events: readonly import('./contracts.js').DshEvent[]): boolean {
   const boundary = taskBoundarySeq(events)
   const packet = parseTaskPacket(events)
   if (boundary === undefined || packet?.writerMode !== 'writer') return false
-  return !events.some(event => event.type === 'turn/end' && event.seq > boundary)
+  const terminal = events.findLast(event => event.type === 'turn/end' && event.seq > boundary)
+  if (terminal === undefined) return true
+  return (terminal.data as { reason?: { kind?: unknown } }).reason?.kind === 'interrupted'
 }
 
 export class GatewayManager {
   private readonly connections = new Map<string, HostConnection>()
   private readonly sessionHosts = new Map<string, string>()
   private readonly knownUrls: string[]
-  private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
   private readonly launchHost: (config: HostLaunchConfig) => Promise<void>
   private readonly resolveCwd: (cwd: string) => Promise<string>
@@ -246,12 +280,9 @@ export class GatewayManager {
   private readonly runJournal: RunJournal | undefined
   private readonly usageMonitor: UsageMonitorClient | undefined
   private launchPromise: Promise<void> | undefined
-  /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
-  private admissionTail: Promise<void> = Promise.resolve()
 
   constructor(private readonly config: GatewayConfig, deps: GatewayDependencies = {}) {
     this.knownUrls = [...new Set(config.hostUrls.map(normalizedUrl))]
-    this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
     this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
     this.launchHost = deps.launchHost ?? launchDetachedHost
     this.resolveCwd = deps.resolveSessionCwd ?? resolveSessionCwd
@@ -477,44 +508,6 @@ export class GatewayManager {
     throw new Error(`session ${taskId} was not found on any reachable configured DSH Host`)
   }
 
-  private async assertWriterAvailable(connection: HostConnection, cwd: string): Promise<void> {
-    const target = await this.resolveDomain(cwd)
-    for (const row of await connection.listSessions()) {
-      if (row.cwd === undefined) continue
-      let candidate: string
-      try {
-        candidate = await this.resolveDomain(row.cwd)
-      } catch (error) {
-        const code = error instanceof Error && 'code' in error
-          ? (error as NodeJS.ErrnoException).code
-          : undefined
-        // A deleted/stale cwd cannot be the current writer domain. Any other
-        // resolution failure is ambiguous, so writer admission fails closed.
-        if (code === 'ENOENT' || code === 'ENOTDIR') continue
-        throw error
-      }
-      if (candidate !== target) continue
-      const snapshot = await connection.refreshSession(row.sessionId)
-      if (writerLeaseHeld(snapshot.events)) {
-        throw new Error(`working tree already has writer session ${row.sessionId}; use read_only or an independent worktree`)
-      }
-    }
-  }
-
-  /**
-   * Defense-in-depth queue for one GatewayManager. The Host plugin owns the
-   * authoritative cross-MCP check-and-admit critical section; multi-Host writer
-   * topology is rejected before this point.
-   */
-  private async exclusiveWriterAdmission<T>(fn: () => Promise<T>): Promise<T> {
-    let release!: () => void
-    const gate = new Promise<void>(resolve => { release = resolve })
-    const previous = this.admissionTail
-    this.admissionTail = previous.then(() => gate)
-    await previous
-    try { return await fn() } finally { release() }
-  }
-
   async task(input: SessionAddress & {
     requestId?: string | undefined
     objective: string
@@ -529,6 +522,7 @@ export class GatewayManager {
     verification?: string[] | undefined
     escalationConditions?: string[] | undefined
     parentRunId?: string | undefined
+    recoveryCapsule?: RecoveryCapsule | undefined
     baseline?: { head?: string | undefined; statusSummary: string } | undefined
     authority?: {
       maxDirectChildren?: number | undefined
@@ -541,12 +535,23 @@ export class GatewayManager {
     const connection = await this.locate(sessionId)
     const snapshot = await connection.refreshSession(sessionId)
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
-    const sessionCwd = snapshot.cwd
     const writerMode = input.writerMode ?? 'writer'
     if (writerMode === 'writer' && this.knownUrls.length !== 1) {
       throw new Error('writer admission requires exactly one configured DSH Host; use read_only or isolate each writer in an independent worktree and single-Host deployment')
     }
     const requestId = input.requestId ?? randomUUID()
+    const recoveryCapsule = input.recoveryCapsule === undefined
+      ? undefined
+      : recoveryCapsuleSchema.parse(input.recoveryCapsule)
+    if (input.parentRunId !== undefined && recoveryCapsule === undefined) {
+      throw new Error('parentRunId requires the exact recoveryCapsule returned by dsh_recover')
+    }
+    if (recoveryCapsule !== undefined && input.parentRunId === undefined) {
+      throw new Error('recoveryCapsule requires parentRunId')
+    }
+    if (recoveryCapsule !== undefined && recoveryCapsule.parentRunId !== input.parentRunId) {
+      throw new Error(`recoveryCapsule parentRunId ${recoveryCapsule.parentRunId} does not match continuation parentRunId ${String(input.parentRunId)}`)
+    }
     const budget = input.tokenBudget ?? (this.config.defaultTaskTokenBudget === undefined
       ? undefined
       : { maxTokens: this.config.defaultTaskTokenBudget })
@@ -564,6 +569,7 @@ export class GatewayManager {
       verification: input.verification,
       escalationConditions: input.escalationConditions,
       parentRunId: input.parentRunId,
+      recoveryCapsule,
       baseline: input.baseline,
       authority: input.authority,
       budget,
@@ -580,11 +586,21 @@ export class GatewayManager {
     }
     const alreadyVisible = existingRequest(snapshot)
 
-    const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
+    let provider = input.provider ?? this.config.defaultProvider
+    let model = input.model ?? this.config.defaultModel
+    if (!alreadyVisible && (provider === undefined || model === undefined)) {
+      const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
+      provider ??= models.current.provider
+      model ??= models.current.model
+    }
+    // On an idempotent retry the Host reconciles the durable request before it
+    // considers model selection, so discovery must not depend on a live model catalog.
+    provider ??= 'dsh-gate-reconcile-existing'
+    model ??= 'dsh-gate-reconcile-existing'
     const modelSelection = {
-      provider: input.provider ?? this.config.defaultProvider ?? models.current.provider,
-      model: input.model ?? this.config.defaultModel ?? models.current.model,
+      provider,
+      model,
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
     }
 
@@ -611,6 +627,7 @@ export class GatewayManager {
       // consumes sessionId + runId directly.
       taskId: sessionId,
       ...input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId },
+      ...recoveryCapsule === undefined ? {} : { recoveryCapsule },
       ...input.baseline === undefined ? {} : { baseline: input.baseline },
       ...input.context === undefined ? {} : { context: input.context },
       ...input.allowedScope === undefined ? {} : { allowedScope: input.allowedScope },
@@ -623,11 +640,12 @@ export class GatewayManager {
     // Put the human objective first so DSH Web gives the session a meaningful
     // title instead of "<dsh-supervised-task>…". The durable packet remains in
     // the same message and parseTaskPacket deliberately accepts it anywhere.
-    const prompt = `${input.objective}\n\n`
+    const prompt = `${input.objective}\n\n/dsh-supervised-worker\n\n`
       + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
-      + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching sessionId, '
+      + 'The DSH supervised-worker skill above is mandatory. Only a successful supervisor_handoff with the matching sessionId, '
       + 'runId, and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
       + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature. '
+      + (recoveryCapsule === undefined ? '' : 'This continuation carries a runtime-generated recoveryCapsule. Reconcile every uncertain effect before retrying it; never blindly replay an unresolved tool call. ')
       + 'The DSH Host enforces any task token budget even when the external supervisor is disconnected.'
     const admit = async (): Promise<Record<string, unknown>> => {
       const receipt = await connection.admitTask({
@@ -636,6 +654,8 @@ export class GatewayManager {
         requestId,
         requestDigest,
         runId,
+        ...input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId },
+        ...recoveryCapsule === undefined ? {} : { recoveryCapsule },
         prompt,
         modelSelection,
       })
@@ -653,17 +673,11 @@ export class GatewayManager {
         reconciled: receipt.reconciled,
         asOfSeq: Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1),
         ...budget === undefined ? {} : { tokenBudget: budget },
+        ...recoveryCapsule === undefined ? {} : { recoveryCapsuleAccepted: true },
         disconnectBehavior: 'HOST_CONTINUES',
       }
     }
-    return this.exclusiveWriterAdmission(async () => {
-      const latest = await connection.refreshSession(sessionId)
-      const visibleNow = existingRequest(latest)
-      if (writerMode === 'writer' && !alreadyVisible && !visibleNow) {
-        await this.assertWriterAvailable(connection, sessionCwd)
-      }
-      return admit()
-    })
+    return admit()
   }
 
   private async childHistorySince(
@@ -700,11 +714,15 @@ export class GatewayManager {
   ): Promise<RunTreeConvergence> {
     const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
       packet.schemaVersion === 2 && packet.sessionId === rootSessionId && packet.runId === runId)
-    if (packetEntry === undefined || packetEntry.packet.schemaVersion !== 2) return { activeSessionIds: [] }
+    if (packetEntry === undefined || packetEntry.packet.schemaVersion !== 2) {
+      return { activeSessionIds: [], unsettledSessionIds: [] }
+    }
     const rootPacket = packetEntry.packet
     const rootBoundary = snapshot.events.find(event => event.seq === packetEntry.seq)
-    if (rootBoundary === undefined) return { activeSessionIds: [] }
+    if (rootBoundary === undefined) return { activeSessionIds: [], unsettledSessionIds: [] }
     const activeSessionIds: string[] = []
+    const unsettledSessionIds: string[] = []
+    let latestChildTerminalTime: number | undefined
     let budgetStop: RunTreeBudgetStop | undefined
     const visited = new Set<string>()
 
@@ -713,24 +731,34 @@ export class GatewayManager {
       visited.add(parentSessionId)
       const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
       for (const entry of catalog.entries) {
-        if (entry.kind !== 'child') continue
-        const events = await this.childHistorySince(connection, parentSessionId, entry, rootBoundary.time)
-        const nested = taskPacketEntries(events).findLast(({ packet, seq }) => {
-          const boundary = events.find(event => event.seq === seq)
-          return packet.schemaVersion === 2 && packet.sessionId === entry.id
-            && boundary !== undefined && boundary.time >= rootBoundary.time
-        })
-        if (nested !== undefined && nested.packet.schemaVersion === 2 && nested.packet.runId !== rootPacket.runId) {
+        if (entry.kind === 'diagnostic') {
+          const childSnapshot = await connection.refreshSession(entry.id)
+          const activation = affiliatedChildActivation(
+            childSnapshot.events, entry.id, rootBoundary.time, rootPacket.runId,
+          )
+          if (activation === undefined) continue
+          // A catalog diagnostic means DSH could not establish the durable
+          // child identity/mode. Even an inactive row is not a proven clean
+          // settlement, so completion must fail closed.
+          unsettledSessionIds.push(entry.id)
+          budgetStop ??= hookBudgetStop(childSnapshot.events, activation.seq, rootPacket.runId)
+          await visit(entry.id)
           continue
         }
-        const activation = events.find((event) => {
-          if (event.type !== 'user/message' || event.time < rootBoundary.time) return false
-          const packet = parseTaskPacket([event])
-          return packet === undefined || (packet.schemaVersion === 2 && packet.sessionId === entry.id
-            && packet.runId === rootPacket.runId)
-        })
+        const events = await this.childHistorySince(connection, parentSessionId, entry, rootBoundary.time)
+        const activation = affiliatedChildActivation(events, entry.id, rootBoundary.time, rootPacket.runId)
         if (activation === undefined) continue
-        if (entry.activity === 'running') activeSessionIds.push(entry.id)
+        if (entry.activity === 'running') {
+          activeSessionIds.push(entry.id)
+        } else {
+          const latestTurnStart = events.findLast(event => event.type === 'turn/start' && event.seq > activation.seq)
+          const terminal = events.findLast(event => event.type === 'turn/end' && event.seq > activation.seq)
+          if (terminal === undefined || (latestTurnStart !== undefined && latestTurnStart.seq > terminal.seq)) {
+            unsettledSessionIds.push(entry.id)
+          } else {
+            latestChildTerminalTime = Math.max(latestChildTerminalTime ?? terminal.time, terminal.time)
+          }
+        }
         budgetStop ??= hookBudgetStop(events, activation.seq, rootPacket.runId)
         if (entry.hasChildren) await visit(entry.id)
       }
@@ -739,7 +767,45 @@ export class GatewayManager {
     await visit(rootSessionId)
     return {
       activeSessionIds: activeSessionIds.slice(0, 64),
+      unsettledSessionIds: unsettledSessionIds.slice(0, 64),
+      ...latestChildTerminalTime === undefined ? {} : { latestChildTerminalTime },
       ...budgetStop === undefined ? {} : { budgetStop },
+    }
+  }
+
+  private async exactRecoveryCapsule(
+    connection: HostConnection,
+    _snapshot: TaskRuntimeState,
+    sessionId: string,
+    parentRunId: string,
+  ): Promise<RecoveryCapsule> {
+    return connection.recoveryCapsule({ schemaVersion: 1, sessionId, parentRunId })
+  }
+
+  private async validateRecoveryContinuation(
+    connection: HostConnection,
+    snapshot: TaskRuntimeState,
+    observation: Observation,
+  ): Promise<Observation> {
+    if (observation.recovery?.kind !== 'CONTINUATION_REQUIRED') return observation
+    try {
+      return {
+        ...observation,
+        recoveryCapsule: await this.exactRecoveryCapsule(
+          connection, snapshot, observation.sessionId, observation.runId,
+        ),
+      }
+    } catch (error) {
+      const { recovery: _recovery, recoveryCapsule: _capsule, ...withoutRecovery } = observation
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, FAILURE_MESSAGE_LIMIT)
+      return {
+        ...withoutRecovery,
+        status: 'FAILED',
+        stage: 'recovery-run-tree-reconciliation',
+        summary: 'The interrupted Root was recovered, but its affiliated run-tree evidence could not be reconciled exactly.',
+        failure: { kind: 'HOST_FAILED', message, retryable: true },
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.policiesFor(snapshot).active),
+      }
     }
   }
 
@@ -748,14 +814,27 @@ export class GatewayManager {
     snapshot: TaskRuntimeState,
     observation: Observation,
   ): Promise<{ snapshot: TaskRuntimeState; observation: Observation }> {
+    const initialPacket = parseTaskPacket(snapshot.events)
+    if (observation.status !== 'COMPLETED' || initialPacket?.schemaVersion !== 2) return { snapshot, observation }
+
+    // Completion is a material decision. Refresh the Root before inspecting
+    // its run tree so an already-delivered child settlement or reopened Root
+    // turn cannot race an older cached handoff into COMPLETED.
+    const refreshed = await connection.refreshSession(initialPacket.sessionId)
+    const refreshedObservation = this.observationForRun(refreshed, initialPacket.sessionId, initialPacket.runId)
+    if (refreshedObservation.status !== 'COMPLETED') {
+      return { snapshot: refreshed, observation: refreshedObservation }
+    }
+    snapshot = refreshed
+    observation = refreshedObservation
     const packet = parseTaskPacket(snapshot.events)
-    if (observation.status !== 'COMPLETED' || packet?.schemaVersion !== 2) return { snapshot, observation }
+    if (packet?.schemaVersion !== 2) return { snapshot, observation }
     let tree: RunTreeConvergence
     try {
       tree = await this.inspectRunTree(connection, snapshot, packet.sessionId, packet.runId)
     } catch (error) {
       const policies = this.policiesFor(snapshot)
-      const message = error instanceof Error ? error.message : String(error)
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, FAILURE_MESSAGE_LIMIT)
       return {
         snapshot,
         observation: {
@@ -810,12 +889,33 @@ export class GatewayManager {
         },
       }
     }
-
-    // Child settlement may synchronously deliver a report back to root. Refresh
-    // once after proving the tree quiet so that a newly opened root turn wins
-    // over its older handoff instead of racing a false COMPLETED response.
-    const refreshed = await connection.refreshSession(packet.sessionId)
-    return { snapshot: refreshed, observation: this.observationForRun(refreshed, packet.sessionId, packet.runId) }
+    if (tree.unsettledSessionIds.length > 0) {
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'WAITING',
+          stage: 'child-settlement-unverified',
+          summary: `${String(tree.unsettledSessionIds.length)} affiliated child session(s) are inactive without a durable terminal boundary.`,
+          decision: evaluateDecision({ signal: 'WAIT' }, policies.active),
+        },
+      }
+    }
+    const rootTerminal = snapshot.events.find(event => event.seq === observation.boundarySeq && event.type === 'turn/end')
+    if (tree.latestChildTerminalTime !== undefined
+      && (rootTerminal === undefined || rootTerminal.time <= tree.latestChildTerminalTime)) {
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'WAITING',
+          stage: 'root-rehandoff-required',
+          summary: 'Affiliated children settled after the accepted Root handoff; waiting for Root to integrate them and publish a new handoff plus turn end.',
+          decision: evaluateDecision({ signal: 'WAIT' }, policies.active),
+        },
+      }
+    }
+    return { snapshot, observation }
   }
 
   private observationForRun(
@@ -974,15 +1074,24 @@ export class GatewayManager {
             // Child seeds contain the root packet too; only the packet's addressed
             // session is a recoverable root run entry.
             if (packet?.schemaVersion !== 2 || packet.sessionId !== row.sessionId) continue
-            const observation = this.observationForRun(snapshot, packet.sessionId, packet.runId)
+            let observation = this.observationForRun(snapshot, packet.sessionId, packet.runId)
+            const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+            observation = validated.observation
+            observation = await this.validateRecoveryContinuation(connection, validated.snapshot, observation)
             this.sessionHosts.set(packet.sessionId, connection.baseUrl)
-            const budget = observation.budget === undefined
-              ? undefined
-              : await connection.tokenBudgetState({
+            let budget
+            let budgetWarning: string | undefined
+            if (observation.budget !== undefined) {
+              try {
+                budget = await connection.tokenBudgetState({
                   schemaVersion: 1,
                   sessionId: observation.sessionId,
                   runId: observation.runId,
                 })
+              } catch (error) {
+                budgetWarning = `run-tree budget state unavailable: ${error instanceof Error ? error.message : String(error)}`.slice(0, 512)
+              }
+            }
             entries.push({
               hostBaseUrl: connection.baseUrl,
               hostInstanceId: observation.hostInstanceId,
@@ -994,6 +1103,7 @@ export class GatewayManager {
               workerState: observation.workerState,
               stage: observation.stage,
               asOfSeq: observation.asOfSeq,
+              ...budgetWarning === undefined ? {} : { budgetWarning },
               ...packet.budget === undefined ? {} : {
                 tokenBudget: packet.budget,
                 budget: budget === undefined ? observation.budget : {
@@ -1049,6 +1159,7 @@ export class GatewayManager {
     const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
     snapshot = validated.snapshot
     observation = validated.observation
+    observation = await this.validateRecoveryContinuation(connection, snapshot, observation)
     const recovered: Observation = observation.recovery?.kind === 'CONTINUATION_REQUIRED'
       || observation.failure?.kind === 'PROTOCOL_ERROR'
       ? observation
@@ -1073,6 +1184,7 @@ export class GatewayManager {
     const deadline = Date.now() + timeoutMs
     let progressFromAsOfSeq = input.afterAsOfSeq
     let nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+    let cadenceExpired = timeoutMs === 0
     let snapshot = await connection.refreshSession(sessionId)
     let authoritative = true
     while (true) {
@@ -1080,6 +1192,7 @@ export class GatewayManager {
       const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
       snapshot = validated.snapshot
       observation = validated.observation
+      observation = await this.validateRecoveryContinuation(connection, snapshot, observation)
       if (input.afterAsOfSeq !== undefined && input.afterAsOfSeq > observation.asOfSeq) {
         throw new Error(`afterAsOfSeq ${String(input.afterAsOfSeq)} is ahead of observed asOfSeq ${String(observation.asOfSeq)}`)
       }
@@ -1097,7 +1210,7 @@ export class GatewayManager {
         }
         return this.withRunJournal(observed, snapshot, connection)
       }
-      const remaining = deadline - Date.now()
+      const remaining = cadenceExpired ? 0 : deadline - Date.now()
       if (remaining <= 0) {
         // The cadence observation is also an externally visible boundary; make
         // its final event/tool/token totals authoritative.
@@ -1108,6 +1221,7 @@ export class GatewayManager {
           const finalValidated = await this.validateRunTreeCompletion(connection, snapshot, finalObservation)
           snapshot = finalValidated.snapshot
           finalObservation = finalValidated.observation
+          finalObservation = await this.validateRecoveryContinuation(connection, snapshot, finalObservation)
           const finalObserved = progressObservation(finalObservation, snapshot, progressFromAsOfSeq)
           const result = finalObservation.decision?.timing !== 'immediate'
             ? timeoutObservation(finalObserved, timeoutMs)
@@ -1117,7 +1231,8 @@ export class GatewayManager {
         return this.withRunJournal(timeoutObservation(observed, timeoutMs), snapshot, connection)
       }
       const untilReconcile = Math.max(0, nextReconcileAt - Date.now())
-      const changed = await connection.waitForChange(Math.min(remaining, untilReconcile))
+      const waitsToCadenceBoundary = remaining <= untilReconcile
+      const changed = await connection.waitForChange(sessionId, Math.min(remaining, untilReconcile))
       if (changed) {
         snapshot = connection.cachedSession(sessionId) ?? snapshot
         authoritative = false
@@ -1125,6 +1240,11 @@ export class GatewayManager {
         snapshot = await connection.refreshSession(sessionId)
         authoritative = true
         nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+        // The selected timer represented the cadence boundary. Treat its
+        // normal expiry as authoritative even if Date.now() rounding reports
+        // a residual millisecond; otherwise a loaded process can issue a
+        // redundant third history refresh for the same boundary.
+        if (waitsToCadenceBoundary) cadenceExpired = true
       }
     }
   }
@@ -1181,8 +1301,20 @@ export class GatewayManager {
   async agents(input: SessionAddress & { runId?: string | undefined }): Promise<Record<string, unknown>> {
     const parentSessionId = sessionIdOf(input)
     const connection = await this.locate(parentSessionId)
-    this.assertCurrentRun(await connection.refreshSession(parentSessionId), input.runId)
+    const snapshot = await connection.refreshSession(parentSessionId)
+    const observation = this.assertCurrentRun(snapshot, input.runId)
+    const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
+      packet.schemaVersion === 2 && packet.sessionId === parentSessionId && packet.runId === observation.runId)
+    const boundary = packetEntry === undefined ? undefined : snapshot.events.find(event => event.seq === packetEntry.seq)
+    if (packetEntry === undefined || boundary === undefined) throw new Error('current run has no durable Root boundary')
     const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
+    const entries: typeof catalog.entries = []
+    for (const entry of catalog.entries) {
+      const events = entry.kind === 'child'
+        ? await this.childHistorySince(connection, parentSessionId, entry, boundary.time)
+        : (await connection.refreshSession(entry.id)).events
+      if (affiliatedChildActivation(events, entry.id, boundary.time, observation.runId) !== undefined) entries.push(entry)
+    }
     return {
       schemaVersion: 1,
       parentSessionId,
@@ -1194,14 +1326,33 @@ export class GatewayManager {
         codexRole: 'OBSERVER',
       },
       ...catalog,
-      entries: attachChildObservations(catalog.entries, await connection.listSessions()),
+      entries: attachChildObservations(
+        entries.map(entry => entry.kind === 'child' ? boundedChildLabel(entry) : entry),
+        await connection.listSessions(),
+      ),
+      excludedNonAffiliatedEntries: catalog.entries.length - entries.length,
     }
   }
 
   async interruptAgent(input: SessionAddress & { runId?: string | undefined; childSessionId: string }): Promise<Record<string, unknown>> {
     const parentSessionId = sessionIdOf(input)
     const connection = await this.locate(parentSessionId)
-    this.assertCurrentRun(await connection.refreshSession(parentSessionId), input.runId)
+    const snapshot = await connection.refreshSession(parentSessionId)
+    const observation = this.assertCurrentRun(snapshot, input.runId)
+    const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
+      packet.schemaVersion === 2 && packet.sessionId === parentSessionId && packet.runId === observation.runId)
+    const boundary = packetEntry === undefined ? undefined : snapshot.events.find(event => event.seq === packetEntry.seq)
+    if (packetEntry === undefined || boundary === undefined) throw new Error('current run has no durable Root boundary')
+    const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
+    const child = catalog.entries.find(entry => entry.id === input.childSessionId)
+    if (child === undefined || child.kind !== 'child') {
+      throw new Error(`direct child ${input.childSessionId} was not found under Root ${parentSessionId}`)
+    }
+    if (child.mode !== 'continuable') throw new Error(`direct child ${input.childSessionId} is not continuable`)
+    const events = await this.childHistorySince(connection, parentSessionId, child, boundary.time)
+    if (affiliatedChildActivation(events, child.id, boundary.time, observation.runId) === undefined) {
+      throw new Error(`direct child ${input.childSessionId} is not affiliated with current run ${observation.runId}`)
+    }
     unwrap(await connection.api.subagents.interrupt({
       parentSessionId: parentSessionId as SessionId,
       childSessionId: input.childSessionId as SessionId,

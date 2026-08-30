@@ -5,13 +5,27 @@
 import type {
   HostDescription, HostFrame, IApiClient, MuxFrame, RpcRequest, SessionSummary,
 } from '@deepseek-ai/dsh-client-connection/network-client'
-import type { DshEvent } from '../src/contracts.js'
-import { parseTaskPacket } from '../src/fold.js'
+import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent, type RecoveryCapsule } from '../src/contracts.js'
+import {
+  parseTaskPacket, recoveryCapsuleForRunTree, taskBoundarySeq, taskPacketEntries,
+  type RecoveryCapsuleScope,
+} from '../src/fold.js'
 import type {
-  TaskAdmissionReceipt, TaskAdmissionRequest, TokenBudgetStateReceipt, TokenBudgetStateRequest,
+  RecoveryCapsuleRequest, TaskAdmissionReceipt, TaskAdmissionRequest,
+  TokenBudgetStateReceipt, TokenBudgetStateRequest,
 } from '../src/host.js'
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+function admissionPacket(prompt: string): Record<string, unknown> | undefined {
+  const end = prompt.lastIndexOf(TASK_PACKET_END)
+  const start = prompt.lastIndexOf(TASK_PACKET_START, end)
+  if (start < 0 || end < 0) return undefined
+  try {
+    const value = JSON.parse(prompt.slice(start + TASK_PACKET_START.length, end).trim()) as unknown
+    return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+  } catch { return undefined }
+}
 
 export interface FakeRow {
   sessionId: string
@@ -22,12 +36,17 @@ export interface FakeRow {
 
 export class FakeApi {
   readonly rows = new Map<string, FakeRow>()
-  readonly childCatalog = new Map<string, Array<{
-    kind: 'child'; id: string; mode: 'one-shot' | 'continuable'; activity: 'running' | 'inactive'; hasChildren: boolean; label?: string
-  }>>()
+  readonly childCatalog = new Map<string, Array<
+    | { kind: 'child'; id: string; mode: 'one-shot' | 'continuable'; activity: 'running' | 'inactive'; hasChildren: boolean; label?: string }
+    | { kind: 'diagnostic'; id: string; reason: 'corrupt' | 'unsupported' | 'unavailable' }
+  >>()
   historyCalls = 0
   listCalls = 0
   promptCalls = 0
+  interruptCalls = 0
+  failModels = false
+  resolveWriterDomain: (cwd: string) => Promise<string> = async cwd => cwd
+  readonly historyPayloads: Array<{ sessionId: string; beforeSeq?: number; maxMessages?: number }> = []
   readonly modelSelections: Array<{ sessionId: string; provider: string; model: string; reasoningEffort?: string }> = []
   failAfterAdmissionOnce = false
   private admissionTail: Promise<void> = Promise.resolve()
@@ -64,12 +83,23 @@ export class FakeApi {
     this.childCatalog.set(parentSessionId, entries)
   }
 
+  addDiagnostic(
+    parentSessionId: string,
+    childSessionId: string,
+    options: { reason?: 'corrupt' | 'unsupported' | 'unavailable'; events?: DshEvent[] } = {},
+  ): void {
+    this.addRow(childSessionId, { running: false, events: options.events })
+    const entries = this.childCatalog.get(parentSessionId) ?? []
+    entries.push({ kind: 'diagnostic', id: childSessionId, reason: options.reason ?? 'corrupt' })
+    this.childCatalog.set(parentSessionId, entries)
+  }
+
   setRunning(sessionId: string, running: boolean): void {
     const row = this.rows.get(sessionId)
     if (row !== undefined) row.running = running
     for (const entries of this.childCatalog.values()) {
       const child = entries.find(entry => entry.id === sessionId)
-      if (child !== undefined) child.activity = running ? 'running' : 'inactive'
+      if (child?.kind === 'child') child.activity = running ? 'running' : 'inactive'
     }
   }
 
@@ -119,16 +149,23 @@ export class FakeApi {
         this.listCalls++
         return this.ok({ items: this.listItems() })
       },
-      history: async (payload: { sessionId: string }) => {
+      history: async (payload: { sessionId: string; beforeSeq?: number; maxMessages?: number }) => {
         this.historyCalls++
+        this.historyPayloads.push(payload)
         const row = this.rows.get(payload.sessionId)
-        const events = row?.events ?? []
-        return this.ok({ events: events.map(event => ({ event })), hasMore: false })
+        const eligible = (row?.events ?? []).filter(event => payload.beforeSeq === undefined || event.seq < payload.beforeSeq)
+        const limit = payload.maxMessages ?? eligible.length
+        const start = Math.max(0, eligible.length - limit)
+        const events = eligible.slice(start)
+        return this.ok({ events: events.map(event => ({ event })), hasMore: start > 0 })
       },
-      models: async () => this.ok({
-        current: { provider: 'test-provider', model: 'test-model' },
-        routable: true, groups: [], failures: [],
-      }),
+      models: async () => {
+        if (this.failModels) throw new Error('model catalog unavailable')
+        return this.ok({
+          current: { provider: 'test-provider', model: 'test-model' },
+          routable: true, groups: [], failures: [],
+        })
+      },
       selectModel: async (payload: { sessionId: string; provider: string; model: string; reasoningEffort?: string }) => {
         this.modelSelections.push(payload)
         return this.ok({ selected: true })
@@ -172,7 +209,10 @@ export class FakeApi {
         const events = this.rows.get(payload.childSessionId)?.events ?? []
         return this.ok({ events: events.map(event => ({ event })), hasMore: false })
       },
-      interrupt: async () => this.ok({ accepted: true as const }),
+      interrupt: async () => {
+        this.interruptCalls++
+        return this.ok({ accepted: true as const })
+      },
     },
     respond: async () => ({ accepted: true }),
   } as unknown as IApiClient
@@ -192,6 +232,43 @@ export class FakeApi {
         }
         return { ...existing, reconciled: true }
       }
+      const row = this.rows.get(request.sessionId)
+      const currentPacket = parseTaskPacket(row?.events ?? [])
+      const currentBoundary = taskBoundarySeq(row?.events ?? []) ?? -1
+      const currentTerminal = row?.events.findLast(event => event.type === 'turn/end' && event.seq > currentBoundary)
+      const interrupted = currentPacket?.schemaVersion === 2
+        && (currentTerminal?.data as { reason?: { kind?: unknown } } | undefined)?.reason?.kind === 'interrupted'
+      if (request.parentRunId !== undefined && request.recoveryCapsule !== undefined) {
+        const expected = await this.recoveryCapsule({
+          schemaVersion: 1, sessionId: request.sessionId, parentRunId: request.parentRunId,
+        })
+        if (JSON.stringify(expected) !== JSON.stringify(request.recoveryCapsule)) {
+          throw new Error(`BAD_REQUEST: recoveryCapsule does not match Host durable evidence for parent run ${request.parentRunId}`)
+        }
+      } else if (interrupted) {
+        throw new Error(`BAD_REQUEST: session ${request.sessionId} requires an exact continuation of interrupted run ${currentPacket.runId}`)
+      }
+      const incoming = admissionPacket(request.prompt)
+      if (incoming?.writerMode === 'writer') {
+        if (row?.cwd === undefined) throw new Error(`BAD_REQUEST: writer session ${request.sessionId} has no authoritative cwd`)
+        const targetDomain = await this.resolveWriterDomain(row.cwd)
+        for (const candidate of this.rows.values()) {
+          if (candidate.cwd === undefined) continue
+          const candidatePacket = parseTaskPacket(candidate.events)
+          const candidateIsWriter = candidatePacket?.writerMode === 'writer'
+            || candidate.events.some(event => JSON.stringify(event.data).includes('"writerMode":"writer"'))
+          if (!candidateIsWriter) continue
+          if (candidate.sessionId === request.sessionId && request.parentRunId !== undefined
+            && request.parentRunId === (candidatePacket?.schemaVersion === 2 ? candidatePacket.runId : undefined)) continue
+          const boundary = taskBoundarySeq(candidate.events) ?? -1
+          const terminal = candidate.events.findLast(event => event.type === 'turn/end' && event.seq > boundary)
+          const terminalKind = (terminal?.data as { reason?: { kind?: unknown } } | undefined)?.reason?.kind
+          if (terminal !== undefined && terminalKind !== 'interrupted') continue
+          if (await this.resolveWriterDomain(candidate.cwd) === targetDomain) {
+            throw new Error(`WRITER_CONFLICT: working tree already has writer session ${candidate.sessionId}; use read_only or an independent worktree`)
+          }
+        }
+      }
       await this.api.sessions.selectModel({
         sessionId: request.sessionId as never,
         provider: request.modelSelection.provider,
@@ -206,7 +283,6 @@ export class FakeApi {
         content: [{ type: 'text', text: request.prompt }],
       }) as unknown as { result: { ok: true; value: unknown } | { ok: false; error: { code: string; message: string } } }
       if (!prompt.result.ok) throw new Error(`${prompt.result.error.code}: ${prompt.result.error.message}`)
-      const row = this.rows.get(request.sessionId)
       const receipt: TaskAdmissionReceipt = {
         schemaVersion: 1,
         sessionId: request.sessionId,
@@ -225,6 +301,63 @@ export class FakeApi {
     } finally {
       release()
     }
+  }
+
+  async recoveryCapsule(request: RecoveryCapsuleRequest): Promise<RecoveryCapsule> {
+    const root = this.rows.get(request.sessionId)
+    const packet = parseTaskPacket(root?.events ?? [])
+    if (root === undefined || packet?.schemaVersion !== 2 || packet.runId !== request.parentRunId) {
+      throw new Error(`parent run ${request.parentRunId} is not the current durable interrupted run for session ${request.sessionId}`)
+    }
+    const activationSeq = taskBoundarySeq(root.events) ?? -1
+    const rootBoundary = root.events.find(event => event.seq === activationSeq)
+    const terminal = root.events.findLast(event => event.type === 'turn/end' && event.seq > activationSeq)
+    const reason = (terminal?.data as { reason?: { kind?: unknown } } | undefined)?.reason?.kind
+    if (root.running || terminal === undefined || reason !== 'interrupted' || rootBoundary === undefined) {
+      throw new Error(`parent run ${request.parentRunId} is not the current durable interrupted run for session ${request.sessionId}`)
+    }
+    const scopes: RecoveryCapsuleScope[] = []
+    const visit = (parentSessionId: string): void => {
+      for (const entry of this.childCatalog.get(parentSessionId) ?? []) {
+        const child = this.rows.get(entry.id)
+        if (child === undefined) throw new Error(`affiliated child ${entry.id} is unavailable`)
+        const nested = taskPacketEntries(child.events).findLast(({ packet: childPacket, seq }) => {
+          const boundary = child.events.find(event => event.seq === seq)
+          return childPacket.schemaVersion === 2 && childPacket.sessionId === entry.id
+            && boundary !== undefined && boundary.time >= rootBoundary.time
+        })
+        if (nested?.packet.schemaVersion === 2 && nested.packet.runId !== request.parentRunId) continue
+        const activation = child.events.find(event => event.type === 'user/message'
+          && event.time >= rootBoundary.time
+          && (() => {
+            const childPacket = parseTaskPacket([event])
+            return childPacket === undefined || (childPacket.schemaVersion === 2
+              && childPacket.sessionId === entry.id && childPacket.runId === request.parentRunId)
+          })())
+        if (activation === undefined) continue
+        const childTerminal = child.events.findLast(event => event.type === 'turn/end' && event.seq > activation.seq)
+        const childStart = child.events.findLast(event => event.type === 'turn/start' && event.seq > activation.seq)
+        if (entry.kind === 'diagnostic' || entry.activity === 'running' || childTerminal === undefined
+          || (childStart !== undefined && childStart.seq > childTerminal.seq)) {
+          throw new Error(`affiliated child ${entry.id} is incomplete`)
+        }
+        scopes.push({
+          sessionId: entry.id,
+          events: child.events,
+          activationSeq: activation.seq,
+          terminalSeq: childTerminal.seq,
+          cwd: root.cwd,
+        })
+        visit(entry.id)
+      }
+    }
+    visit(request.sessionId)
+    return recoveryCapsuleForRunTree({
+      hostInstanceId: 'host-1',
+      events: root.events,
+      workerState: 'IDLE',
+      ...root.cwd === undefined ? {} : { cwd: root.cwd },
+    }, packet, terminal, scopes)
   }
 
   async tokenBudgetState(request: TokenBudgetStateRequest): Promise<TokenBudgetStateReceipt> {

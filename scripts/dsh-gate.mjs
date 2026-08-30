@@ -18,6 +18,7 @@ import {
   parseCliArgs,
   planBootstrap,
   readHostPidFile,
+  resolveHostStatePaths,
   resolvePaths,
   resolvePnpm,
   runDoctor,
@@ -27,6 +28,7 @@ import {
   obtainCheckoutCommands,
   linkCommand,
   probePid,
+  hostStartPidDecision,
   describeHost,
   DSH_FORK_URL,
   DSH_FORK_BRANCH,
@@ -118,12 +120,19 @@ async function runCommand(phase, command, options = {}) {
 }
 
 function currentGateSha() {
-  const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: paths.root, encoding: 'utf8' })
-  return result.status === 0 ? result.stdout.trim() : undefined
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: paths.root, encoding: 'utf8' })
+  if (head.status !== 0) return undefined
+  const status = spawnSync('git', ['status', '--porcelain'], { cwd: paths.root, encoding: 'utf8' })
+  return status.status === 0 && status.stdout.trim() !== ''
+    ? `${head.stdout.trim()}-dirty`
+    : head.stdout.trim()
 }
 
 async function writeInstallMetadata(paths, steps, gateSha, pnpm) {
   await io.mkdir(paths.stateDir)
+  // launchd opens StandardOutPath before it starts this wrapper. Create the
+  // directory during bootstrap so the service can launch at all.
+  await io.mkdir(paths.logsDir)
   const metadata = {
     schemaVersion: 1,
     stateDir: paths.stateDir,
@@ -254,6 +263,20 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
         if (ok) steps.plugin = { done: true, sha: DSH_PINNED_COMMIT, profile: SUPERVISOR_PROFILE, home: paths.dshHome }
         break
       }
+      case 'worker-skill': {
+        const source = await io.readFile(paths.workerSkillSource)
+        await io.mkdir(join(paths.dshHome, 'skills', 'dsh-supervised-worker'))
+        const staged = `${paths.workerSkillDestination}.tmp-${process.pid}`
+        try {
+          await io.writeFile(staged, source)
+          await io.rename(staged, paths.workerSkillDestination)
+        } finally {
+          await io.rm(staged, { force: true })
+        }
+        steps.workerSkill = { done: true, gateSha, path: paths.workerSkillDestination }
+        ok = true
+        break
+      }
       default:
         throw new Error(`unhandled phase ${phase.name}`)
     }
@@ -282,10 +305,12 @@ async function runDoctorCommand({ paths, options }) {
 
 async function runHost({ paths, options, hostAction }) {
   const hostUrl = options.host ?? DEFAULT_HOST_URL
-  const dshBin = paths.dshBin
+  const hostPaths = resolveHostStatePaths(paths, hostUrl)
+  const dshBin = hostPaths.dshBin
+  const lifecycleCommand = action => `node scripts/dsh-gate.mjs host ${action} --host ${hostPaths.canonicalHostUrl}`
 
   if (hostAction === 'status') {
-    const record = await readHostPidFile(paths, io)
+    const record = await readHostPidFile(hostPaths, io, hostUrl)
     const state = record === undefined ? 'none' : await probePid(record.pid, io)
     if (record === undefined || state === 'dead') {
       try {
@@ -294,8 +319,8 @@ async function runHost({ paths, options, hostAction }) {
         log(`${owned}, but a Host is serving ${hostUrl}: hostInstanceId ${value.hostInstanceId}, cwd ${value.cwd} — it is not managed by dsh-gate (stop it yourself)`)
       } catch {
         log(record === undefined
-          ? `no host pidfile at ${paths.hostPidFile} — the Host is not managed by dsh-gate, and nothing is serving ${hostUrl}`
-          : `pidfile says pid ${record.pid} but no such process — stale record; run 'pnpm host:start'`)
+          ? `no host pidfile at ${hostPaths.hostPidFile} — the Host is not managed by dsh-gate, and nothing is serving ${hostUrl}`
+          : `pidfile says pid ${record.pid} but no such process — stale record; run '${lifecycleCommand('start')}'`)
       }
     } else {
       try {
@@ -312,7 +337,7 @@ async function runHost({ paths, options, hostAction }) {
   }
 
   if (hostAction === 'stop') {
-    const record = await readHostPidFile(paths, io)
+    const record = await readHostPidFile(hostPaths, io, hostUrl)
     if (record === undefined) {
       log('no host pidfile — nothing to stop (a Host started outside dsh-gate is untouched)')
       return true
@@ -320,12 +345,12 @@ async function runHost({ paths, options, hostAction }) {
     const state = await probePid(record.pid, io)
     if (state === 'dead') {
       log(`pid ${record.pid} is not running — removing stale pidfile`)
-      await io.rm(paths.hostPidFile, { force: true })
+      await io.rm(record.pidFile, { force: true })
       return true
     }
     if (state === 'unknown') {
       fail(`cannot verify pid ${record.pid} (ps is unavailable) — refusing to kill blindly`)
-      fail('stop the Host process yourself (or remove ' + paths.hostPidFile + ' after confirming it is gone)')
+      fail('stop the Host process yourself (or remove ' + record.pidFile + ' after confirming it is gone)')
       return false
     }
     const ps = await io.exec('ps', ['-p', String(record.pid), '-o', 'command='])
@@ -340,7 +365,7 @@ async function runHost({ paths, options, hostAction }) {
       await new Promise(resolvePromise => setTimeout(resolvePromise, 500))
       const after = await probePid(record.pid, io)
       if (after === 'dead') {
-        await io.rm(paths.hostPidFile, { force: true })
+        await io.rm(record.pidFile, { force: true })
         log('Host stopped')
         return true
       }
@@ -350,7 +375,7 @@ async function runHost({ paths, options, hostAction }) {
         try {
           await describeHost({ hostUrl, io, timeoutMs: 1000 })
         } catch {
-          await io.rm(paths.hostPidFile, { force: true })
+          await io.rm(record.pidFile, { force: true })
           log('Host stopped (port released)')
           return true
         }
@@ -376,18 +401,27 @@ async function runHost({ paths, options, hostAction }) {
     fail(`${SUPERVISOR_PLUGIN_NAME} is not installed in the ${SUPERVISOR_PROFILE} profile — run 'pnpm bootstrap' first`)
     return false
   }
+  const [workerSkillSource, workerSkillInstalled] = await Promise.all([
+    io.readFile(paths.workerSkillSource).catch(() => undefined),
+    io.readFile(paths.workerSkillDestination).catch(() => undefined),
+  ])
+  if (workerSkillSource === undefined || workerSkillInstalled !== workerSkillSource) {
+    fail(`DSH worker skill is missing or stale at ${paths.workerSkillDestination} — run 'pnpm bootstrap' first`)
+    return false
+  }
 
   const argv = hostLaunchArgv({ dshBin, hostUrl })
   if (options.dryRun) {
     log(`DRY RUN — host would be launched ${hostAction === 'run' ? 'in the foreground' : 'detached'} with:`)
     log(`  ${argv.join(' ')}`)
-    log(`  env DSH_HOME=${paths.dshHome}, cwd ${paths.root}, ${hostAction === 'run' ? 'attached stdio' : `detached, stdio -> ${paths.hostLogFile}`}`)
+    log(`  env DSH_HOME=${hostPaths.dshHome}, cwd ${hostPaths.root}, ${hostAction === 'run' ? 'attached stdio' : `detached, stdio -> ${hostPaths.hostLogFile}`}`)
     log(`  url ${hostUrl}`)
     return true
   }
 
-  await io.mkdir(paths.hostDir)
-  const releaseStartLease = await acquireHostStartLease(paths, io)
+  await io.mkdir(hostPaths.hostDir)
+  await io.mkdir(hostPaths.logsDir)
+  const releaseStartLease = await acquireHostStartLease(hostPaths, io)
   let startLeaseHeld = true
   const releaseLease = async () => {
     if (!startLeaseHeld) return
@@ -395,29 +429,37 @@ async function runHost({ paths, options, hostAction }) {
     await releaseStartLease()
   }
   try {
-    const record = await readHostPidFile(paths, io)
+    const record = await readHostPidFile(hostPaths, io, hostUrl)
     const state = record === undefined ? 'none' : await probePid(record.pid, io)
     if (state === 'alive' || state === 'unknown') {
       // A recorded pid is present. If it is verifiably ours and the URL
       // responds, it is already running. If ps is unavailable but the URL
       // responds, treat the recorded pid as ours (the pidfile is the only
       // writer of that file) and report already-running.
+      let value
       try {
-        const value = await describeHost({ hostUrl, io })
+        value = await describeHost({ hostUrl, io })
+      } catch {
+        // The decision below distinguishes a proven live process from a process
+        // whose state cannot be inspected. Neither condition is stale evidence.
+      }
+      const decision = hostStartPidDecision(state, value !== undefined)
+      if (decision === 'already-running') {
         const pidNote = state === 'unknown' ? `pid ${record.pid} (unverifiable via ps) ` : `pid ${record.pid} `
         log(`Host already running ${pidNote}— ${hostUrl} hostInstanceId ${value.hostInstanceId}`)
         return true
-      } catch {
-        if (state === 'alive') {
-          fail(`pidfile says pid ${record.pid} is alive but ${hostUrl} does not respond; stop it with 'pnpm host:stop' before starting again`)
-          return false
-        }
-        log(`pid ${record.pid} is unverifiable and ${hostUrl} does not respond — treating the pidfile as stale`)
       }
+      if (decision === 'refuse-alive-unreachable') {
+        fail(`pidfile says pid ${record.pid} is alive but ${hostUrl} does not respond; stop it with '${lifecycleCommand('stop')}' before starting again`)
+        return false
+      }
+      fail(`cannot verify pid ${record.pid} and ${hostUrl} does not respond — retaining ${record.pidFile} and refusing to start another Host`)
+      fail(`confirm the process state outside the restricted environment; remove the pidfile only after proving pid ${record.pid} is dead`)
+      return false
     }
-    if (record !== undefined) {
+    if (record !== undefined && hostStartPidDecision(state, false) === 'clear-stale') {
       log(`clearing stale host pidfile (pid ${record.pid} not running)`)
-      await io.rm(paths.hostPidFile, { force: true })
+      await io.rm(record.pidFile, { force: true })
     }
 
     // Refuse to shadow a Host this checkout does not manage: the port is
@@ -433,24 +475,18 @@ async function runHost({ paths, options, hostAction }) {
 
     if (hostAction === 'run') {
       const child = io.spawn(argv[0], argv.slice(1), {
-        cwd: paths.root,
-        env: { ...process.env, DSH_HOME: paths.dshHome },
+        cwd: hostPaths.root,
+        env: { ...process.env, DSH_HOME: hostPaths.dshHome },
         detached: false,
         stdio: 'inherit',
+      })
+      const exitPromise = new Promise(resolvePromise => {
+        child.once('exit', (code, signal) => resolvePromise({ code, signal }))
       })
       const pid = await new Promise((resolvePromise, rejectPromise) => {
         child.once('error', rejectPromise)
         child.once('spawn', () => resolvePromise(child.pid))
       })
-      try {
-        const startedAt = new Date().toISOString()
-        await io.writeJson(paths.hostPidFile, { pid, argv, startedAt, url: hostUrl, dshHome: paths.dshHome, supervised: true })
-        await releaseLease()
-      } catch (error) {
-        child.kill('SIGTERM')
-        throw error
-      }
-      log(`Host attached as pid ${pid}; external process supervisor owns restart policy`)
       let terminating = false
       const forward = (signal) => {
         terminating = true
@@ -460,24 +496,72 @@ async function runHost({ paths, options, hostAction }) {
       const onInt = () => forward('SIGINT')
       process.once('SIGTERM', onTerm)
       process.once('SIGINT', onInt)
-      const result = await new Promise(resolvePromise => {
-        child.once('exit', (code, signal) => resolvePromise({ code, signal }))
-      })
-      process.removeListener('SIGTERM', onTerm)
-      process.removeListener('SIGINT', onInt)
-      const current = await readHostPidFile(paths, io)
-      if (current?.pid === pid) await io.rm(paths.hostPidFile, { force: true })
+      const removeSignalHandlers = () => {
+        process.removeListener('SIGTERM', onTerm)
+        process.removeListener('SIGINT', onInt)
+      }
+      const removeOwnedPidFile = async () => {
+        const current = await readHostPidFile(hostPaths, io, hostUrl)
+        if (current?.pid === pid) await io.rm(current.pidFile, { force: true })
+      }
+      try {
+        const startedAt = new Date().toISOString()
+        await io.writeJson(hostPaths.hostPidFile, { pid, argv, startedAt, url: hostPaths.canonicalHostUrl, dshHome: hostPaths.dshHome, supervised: true })
+      } catch (error) {
+        child.kill('SIGTERM')
+        removeSignalHandlers()
+        throw error
+      }
+      log(`Host attached as pid ${pid}; waiting for ${hostUrl}/api/host.describe before releasing the startup lease …`)
+      const deadline = Date.now() + 30_000
+      let value
+      let earlyExit
+      while (Date.now() < deadline && value === undefined && earlyExit === undefined) {
+        try {
+          value = await describeHost({ hostUrl, io, timeoutMs: 3000 })
+        } catch {
+          const next = await Promise.race([
+            exitPromise.then(result => ({ type: 'exit', result })),
+            new Promise(resolvePromise => setTimeout(() => resolvePromise({ type: 'retry' }), 1000)),
+          ])
+          if (next.type === 'exit') earlyExit = next.result
+        }
+      }
+      if (value === undefined) {
+        if (earlyExit === undefined && !child.killed) child.kill('SIGTERM')
+        let result = earlyExit ?? await Promise.race([
+          exitPromise,
+          new Promise(resolvePromise => setTimeout(() => resolvePromise(undefined), 5000)),
+        ])
+        if (result === undefined) {
+          child.kill('SIGKILL')
+          result = await exitPromise
+        }
+        await removeOwnedPidFile()
+        removeSignalHandlers()
+        if (terminating) return true
+        fail(earlyExit === undefined
+          ? `attached Host pid ${pid} did not become reachable at ${hostUrl} within 30s; the process supervisor may restart it`
+          : `attached Host exited before readiness (${result.signal ?? `code ${String(result.code)}`}); the process supervisor may restart it`)
+        return false
+      }
+      log(`Host ready — protocolVersion ${value.protocolVersion}, hostInstanceId ${value.hostInstanceId}, version ${value.version}`)
+      await releaseLease()
+      log(`external process supervisor owns restart policy; Web UI: ${hostUrl}`)
+      const result = await exitPromise
+      removeSignalHandlers()
+      await removeOwnedPidFile()
       if (terminating) return true
       if (result.code === 0) return true
       fail(`attached Host exited unexpectedly (${result.signal ?? `code ${String(result.code)}`}); the process supervisor may restart it`)
       return false
     }
 
-    await io.mkdir(paths.logsDir)
-    const logFd = await openAppend(paths.hostLogFile)
+    await io.mkdir(hostPaths.logsDir)
+    const logFd = await openAppend(hostPaths.hostLogFile)
     const child = io.spawn(argv[0], argv.slice(1), {
-      cwd: paths.root,
-      env: { ...process.env, DSH_HOME: paths.dshHome },
+      cwd: hostPaths.root,
+      env: { ...process.env, DSH_HOME: hostPaths.dshHome },
       detached: true,
       stdio: ['ignore', logFd, logFd],
     })
@@ -489,8 +573,13 @@ async function runHost({ paths, options, hostAction }) {
       })
     })
     const startedAt = new Date().toISOString()
-    await io.writeJson(paths.hostPidFile, { pid, argv, startedAt, url: hostUrl, dshHome: paths.dshHome })
-    log(`Host launched pid ${pid} — log: ${paths.hostLogFile}`)
+    try {
+      await io.writeJson(hostPaths.hostPidFile, { pid, argv, startedAt, url: hostPaths.canonicalHostUrl, dshHome: hostPaths.dshHome })
+    } catch (error) {
+      child.kill('SIGTERM')
+      throw error
+    }
+    log(`Host launched pid ${pid} — log: ${hostPaths.hostLogFile}`)
     log(`waiting for ${hostUrl}/api/host.describe …`)
     const deadline = Date.now() + 30_000
     let value
@@ -503,11 +592,11 @@ async function runHost({ paths, options, hostAction }) {
       }
     }
     if (value === undefined) {
-      fail(`Host pid ${pid} did not become reachable at ${hostUrl} within 30s; see ${paths.hostLogFile}`)
+      fail(`Host pid ${pid} did not become reachable at ${hostUrl} within 30s; see ${hostPaths.hostLogFile}`)
       return false
     }
     log(`Host ready — protocolVersion ${value.protocolVersion}, hostInstanceId ${value.hostInstanceId}, version ${value.version}`)
-    log(`Web UI: ${hostUrl} (the Host is independent of MCP; 'pnpm host:stop' stops it, MCP never does)`)
+    log(`Web UI: ${hostUrl} (the Host is independent of MCP; '${lifecycleCommand('stop')}' stops it, MCP never does)`)
     return true
   } finally {
     await releaseLease()

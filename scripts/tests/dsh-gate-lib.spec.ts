@@ -13,6 +13,7 @@ import {
   formatOutputTail,
   formatPhaseFailure,
   hostIsAlive,
+  hostStartPidDecision,
   hostLaunchArgv,
   isPlaceholderVersion,
   probePid,
@@ -25,6 +26,8 @@ import {
   redactOutput,
   remoteMatchesFork,
   resolvePaths,
+  resolveHostStatePaths,
+  readHostPidFile,
   runDoctor,
   summarizeDoctor,
   validateCheckout,
@@ -152,6 +155,32 @@ describe('resolvePaths', () => {
     expect(paths.stateDir).toBe('/s')
     expect(paths.dshRepo).toBe('/d')
     expect(paths.dshHome).toBe('/h')
+  })
+})
+
+describe('resolveHostStatePaths', () => {
+  it('isolates pid, startup lease, and log state by Host port', () => {
+    const base = pathsFor()
+    const port8080 = resolveHostStatePaths(base, 'http://127.0.0.1:8080')
+    const port18080 = resolveHostStatePaths(base, 'http://127.0.0.1:18080')
+    expect(port8080.hostPidFile).not.toBe(port18080.hostPidFile)
+    expect(port8080.hostStartLockFile).not.toBe(port18080.hostStartLockFile)
+    expect(port8080.hostLogFile).not.toBe(port18080.hostLogFile)
+    expect(port18080.hostPidFile).toContain('http-127.0.0.1-18080.pid')
+  })
+
+  it('only adopts a legacy pid record for its exact Host origin', async () => {
+    const base = pathsFor()
+    const io = makeFakeIo({ files: {
+      [base.hostPidFile]: JSON.stringify({ pid: 42, url: 'http://127.0.0.1:18080' }),
+    } })
+    const port8080 = resolveHostStatePaths(base, 'http://127.0.0.1:8080')
+    const port18080 = resolveHostStatePaths(base, 'http://127.0.0.1:18080')
+    await expect(readHostPidFile(port8080, io, 'http://127.0.0.1:8080')).resolves.toBeUndefined()
+    await expect(readHostPidFile(port18080, io, 'http://127.0.0.1:18080')).resolves.toMatchObject({
+      pid: 42,
+      pidFile: base.hostPidFile,
+    })
   })
 })
 
@@ -299,6 +328,7 @@ describe('planBootstrap', () => {
       ['link', 'run'],
       ['gate-build', 'run'],
       ['plugin', 'run'],
+      ['worker-skill', 'run'],
       ['metadata', 'run'],
     ])
   })
@@ -322,6 +352,8 @@ describe('planBootstrap', () => {
       [`${paths.root}/node_modules`]: 'dir',
       [paths.mcpServerDistCli]: 'js',
       [paths.profileManifest]: { dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@dsh-gate/supervisor-tools'] } } },
+      [paths.workerSkillSource]: 'worker skill',
+      [paths.workerSkillDestination]: 'worker skill',
     }
     const io = makeFakeIo({
       files,
@@ -335,6 +367,7 @@ describe('planBootstrap', () => {
     expect(skipped).toContain('link')
     expect(skipped).toContain('gate-build')
     expect(skipped).toContain('plugin')
+    expect(skipped).toContain('worker-skill')
   })
 
   it('--force re-runs every build/install phase', async () => {
@@ -342,9 +375,26 @@ describe('planBootstrap', () => {
     const files = { [paths.installJson]: { steps: { dshInstall: { done: true, sha: PIN }, dshBuild: { done: true, sha: PIN }, gateInstall: { done: true, gateSha: 'g1' }, gateBuild: { done: true, gateSha: 'g1' }, plugin: { done: true, sha: PIN } } } }
     const io = makeFakeIo({ files, realpath: (path) => path })
     const phases = await planBootstrap({ paths, io, force: true, pnpm: { argv: ['pnpm'], via: 'path', version: '11.19.0' }, gateSha: 'g1', checkout: checkoutOk })
-    for (const name of ['dsh-install', 'dsh-build', 'gate-install', 'gate-build', 'plugin']) {
+    for (const name of ['dsh-install', 'dsh-build', 'gate-install', 'gate-build', 'plugin', 'worker-skill']) {
       expect(phases.find(p => p.name === name).action).toBe('run')
     }
+  })
+
+  it('never reuses workspace install/build markers for a dirty development tree', async () => {
+    const paths = pathsFor()
+    const files = {
+      [paths.installJson]: { steps: {
+        gateInstall: { done: true, gateSha: 'g1-dirty' }, gateBuild: { done: true, gateSha: 'g1-dirty' },
+      } },
+      [`${paths.root}/node_modules`]: 'dir',
+      [paths.mcpServerDistCli]: 'js',
+    }
+    const phases = await planBootstrap({
+      paths, io: makeFakeIo({ files }), force: false,
+      pnpm: { argv: ['pnpm'], via: 'path', version: '11.19.0' }, gateSha: 'g1-dirty', checkout: checkoutOk,
+    })
+    expect(phases.find(phase => phase.name === 'gate-install')?.action).toBe('run')
+    expect(phases.find(phase => phase.name === 'gate-build')?.action).toBe('run')
   })
 
   it('isolates the plugin phase to the project-local DSH_HOME', async () => {
@@ -376,7 +426,9 @@ describe('runDoctor', () => {
       [paths.mcpServerDistCli]: 'js',
       [paths.profileManifest]: { dependencies: { '@dsh-gate/supervisor-tools': 'link:...' }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@dsh-gate/supervisor-tools'] } } },
       [`${paths.pluginPath}/dist/index.js`]: 'js',
-      [`${paths.pluginPath}/cordis.patch.yml`]: 'yml',
+      [`${paths.pluginPath}/cordis.patch.yml`]: 'maxDepth: 1\nmaxDepth: 1\ndirectChildToolNames:\n  - subagent\n  - subagent_fork\n',
+      [paths.workerSkillSource]: 'worker skill',
+      [paths.workerSkillDestination]: 'worker skill',
     }
     const io = makeFakeIo({
       files,
@@ -408,6 +460,18 @@ describe('runDoctor', () => {
     expect(results.find(r => r.name === 'install metadata').ok).toBe(false)
   })
 
+  it('fails when the installed supervisor patch omits native delegation depth enforcement', async () => {
+    const { paths, io } = goodEnv()
+    io.readFile = async path => path === `${paths.pluginPath}/cordis.patch.yml`
+      ? 'directChildToolNames:\n  - subagent\n'
+      : ''
+    const results = await runDoctor({ paths, io })
+    expect(results.find(r => r.name === 'supervisor plugin / profile')).toMatchObject({
+      ok: false,
+      detail: expect.stringMatching(/depth caps/),
+    })
+  })
+
   it('fails on a dirty managed checkout', async () => {
     const { paths, io } = goodEnv()
     io.files.set(`${paths.dshRepo}/.git`, 'dir')
@@ -426,6 +490,27 @@ describe('runDoctor', () => {
     const { paths, io } = goodEnv({ live: true, hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.0.0' } })
     const results = await runDoctor({ paths, io, live: true })
     expect(results.find(r => r.name === 'live Host').ok).toBe(false)
+  })
+
+  it('treats unrelated provider catalog failures as advisory when the selected route is routable', async () => {
+    const { paths, io } = goodEnv()
+    io.fetch = async (url) => ({
+      ok: true,
+      json: async () => ({ type: 'server-response', rpcId: 'x', result: { ok: true, value:
+        url.endsWith('/api/host.describe')
+          ? { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.0-rc.8' }
+          : {
+              current: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+              routable: true,
+              failures: [{ provider: 'unconfigured-provider', message: 'catalog unavailable' }],
+            },
+      } }),
+    })
+    const results = await runDoctor({
+      paths, io, live: true, hostUrl: DEFAULT_HOST_URL, readinessSession: 'session-1',
+    })
+    expect(results.find(r => r.name === 'provider/model routing')).toMatchObject({ ok: true })
+    expect(results.find(r => r.name === 'provider/model routing').detail).toMatch(/1 unrelated provider catalog warning/)
   })
 
   it('reports an unreachable live Host', async () => {
@@ -507,6 +592,11 @@ describe('hostLaunchArgv', () => {
     expect(argv).toContain('--port')
     expect(argv[argv.indexOf('--port') + 1]).toBe('18080')
   })
+
+  it('refuses a non-loopback bind or a URL with an application path', () => {
+    expect(() => hostLaunchArgv({ dshBin: '/d/bin.js', hostUrl: 'http://0.0.0.0:8080' })).toThrow(/loopback/)
+    expect(() => hostLaunchArgv({ dshBin: '/d/bin.js', hostUrl: 'http://127.0.0.1:8080/api' })).toThrow(/origin/)
+  })
 })
 
 describe('hostIsAlive', () => {
@@ -529,6 +619,16 @@ describe('hostIsAlive', () => {
       exec: { 'ps -p 123 -o command=': { status: 0, stdout: 'node /d/apps/cli/lib/bin.js web\n', stderr: '' } },
     })
     expect(await hostIsAlive(123, io)).toBe(true)
+  })
+
+  it('fails Host startup closed when both PID inspection and Host probing are unavailable', () => {
+    expect(hostStartPidDecision('unknown', false)).toBe('refuse-unverifiable')
+  })
+
+  it('only permits Host startup to clear a PID record proven dead', () => {
+    expect(hostStartPidDecision('dead', false)).toBe('clear-stale')
+    expect(hostStartPidDecision('alive', false)).toBe('refuse-alive-unreachable')
+    expect(hostStartPidDecision('unknown', true)).toBe('already-running')
   })
 })
 

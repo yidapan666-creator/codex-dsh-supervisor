@@ -5,6 +5,15 @@
     provider: deepseek-official
     model: deepseek-v4-flash
 
+# Use DSH's native absolute depth control instead of a second lock manager.
+- id: tool-subagent
+  config:
+    maxDepth: 1
+
+- id: tool-subagent-fork
+  config:
+    maxDepth: 1
+
 - insert:
     - id: dsh-gate-supervisor-tools
       name: '@dsh-gate/supervisor-tools'
@@ -13,3 +22,4 @@
         maxReservedOutputTokensPerRequest: 8192
         directChildToolNames:
           - subagent
+          - subagent_fork
