@@ -10,6 +10,8 @@ import {
   type RecoveryScope,
   type RecoveryTaskPacket,
 } from './recovery.js'
+import type { GitBaselineStore } from './git-baseline.js'
+import { authorizeSupervisorRequest } from './host-auth.js'
 
 export const TASK_ADMISSION_PATH = '/api/dsh-gate.admit'
 export const RECOVERY_CAPSULE_PATH = '/api/dsh-gate.recovery-capsule'
@@ -56,6 +58,9 @@ export interface TaskAdmissionReceipt {
   requestDigest: string
   runId: string
   reconciled: boolean
+  /** Exact durable task-packet/inbox event boundary for the first observation window. */
+  admissionBoundarySeq: number
+  /** Highest session event observed while producing this receipt; not the first-wait lower bound. */
   asOfSeq: number
 }
 
@@ -103,7 +108,7 @@ interface AdmissionAgent {
     nextStep: readonly AdmissionMessage[]
     remove(messageId: string): boolean
   }
-  followup(message: AdmissionMessage): void
+  wakePending(): void
 }
 
 export interface TaskAdmissionRuntime {
@@ -133,7 +138,7 @@ export interface TaskAdmissionRuntime {
         rpcId: string
         payload: {
           sessionId: string
-          mode: 'queue'
+          mode: 'queue-durable'
           content: Array<{ type: 'text'; text: string }>
         }
       }): Promise<{
@@ -154,6 +159,40 @@ export interface TaskAdmissionRuntime {
       }>
     }
   }
+  /** Deployment fallbacks needed to restore the exact effective policy after a failed admission. */
+  policyDefaults?: {
+    sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access'
+    approvalPolicy: 'ask' | 'never'
+  }
+}
+
+interface AdmissionModelSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+function currentModelSelection(value: unknown): AdmissionModelSelection | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const current = (value as { current?: unknown }).current
+  if (typeof current !== 'object' || current === null) return undefined
+  const selection = current as Record<string, unknown>
+  if (typeof selection.provider !== 'string' || typeof selection.model !== 'string'
+    || (selection.reasoningEffort !== undefined && typeof selection.reasoningEffort !== 'string')) return undefined
+  return {
+    provider: selection.provider,
+    model: selection.model,
+    ...selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort },
+  }
+}
+
+function latestPolicyValue<T extends string>(
+  events: readonly AdmissionEvent[],
+  type: string,
+  key: string,
+): T | undefined {
+  const value = (events.findLast(event => event.type === type)?.data as Record<string, unknown> | undefined)?.[key]
+  return typeof value === 'string' ? value as T : undefined
 }
 
 interface PacketIdentity {
@@ -204,6 +243,69 @@ function contentText(value: unknown): string {
   }).join('\n')
 }
 
+function eventText(event: AdmissionEvent): string {
+  const data = event.data as { content?: unknown; message?: { content?: unknown } }
+  return contentText(data.content ?? data.message?.content)
+}
+
+interface AcceptedTerminalHandoff {
+  result: AdmissionEvent
+  turnEnd: AdmissionEvent
+  status: 'completed' | 'blocked' | 'failed'
+}
+
+/**
+ * Find the latest protocol-terminal handoff for one exact supervised run.
+ * A bare turn/end, a failed tool result, a checkpoint, or a mismatched token is
+ * deliberately not terminal evidence.
+ */
+function acceptedTerminalHandoff(
+  events: readonly AdmissionEvent[],
+  identity: PacketIdentity,
+): AcceptedTerminalHandoff | undefined {
+  const completionToken = identity.packet.completionToken
+  if (typeof completionToken !== 'string') return undefined
+  const turnEnds = events.filter(event => event.type === 'turn/end' && event.seq > identity.seq).reverse()
+  for (const turnEnd of turnEnds) {
+    const turn = (turnEnd.data as { turn?: unknown; reason?: { kind?: unknown } }).turn
+    const reason = (turnEnd.data as { reason?: { kind?: unknown } }).reason?.kind
+    if (reason === 'interrupted') continue
+    const turnStart = events.findLast(event => event.type === 'turn/start' && event.seq < turnEnd.seq
+      && (event.data as { turn?: unknown }).turn === turn)
+    const fromSeq = turnStart?.seq ?? identity.seq
+    const calls = events.filter((event) => {
+      if (event.type !== 'tool/call' || event.seq <= fromSeq || event.seq >= turnEnd.seq) return false
+      const data = event.data as { name?: unknown; turn?: unknown }
+      return data.name === 'supervisor_handoff' && (data.turn === undefined || data.turn === turn)
+    }).reverse()
+    for (const call of calls) {
+      const callData = call.data as { callId?: unknown }
+      if (typeof callData.callId !== 'string') continue
+      const result = events.findLast((event) => {
+        if (event.type !== 'tool/result' || event.seq <= call.seq || event.seq >= turnEnd.seq) return false
+        const data = event.data as {
+          message?: { source?: { callId?: unknown }; content?: Array<{ type?: unknown; isError?: unknown }> }
+          error?: unknown
+        }
+        const resultBlock = data.message?.content?.find(block => block.type === 'tool-result')
+        return data.message?.source?.callId === callData.callId
+          && data.error === undefined && resultBlock?.isError !== true
+      })
+      if (result === undefined) continue
+      let output: { accepted?: unknown; handoff?: unknown; artifacts?: unknown }
+      try { output = JSON.parse(eventText(result)) as typeof output } catch { continue }
+      if (output.accepted !== true || !Array.isArray(output.artifacts)
+        || typeof output.handoff !== 'object' || output.handoff === null) continue
+      const handoff = output.handoff as Record<string, unknown>
+      if (handoff.sessionId !== identity.sessionId || handoff.runId !== identity.runId
+        || handoff.completionToken !== completionToken
+        || (handoff.status !== 'completed' && handoff.status !== 'blocked' && handoff.status !== 'failed')) continue
+      return { result, turnEnd, status: handoff.status }
+    }
+  }
+  return undefined
+}
+
 function eventMessages(event: AdmissionEvent): AdmissionMessage[] {
   if (event.type === 'user/message') {
     const data = event.data as AdmissionMessage & { message?: AdmissionMessage }
@@ -216,10 +318,49 @@ function eventMessages(event: AdmissionEvent): AdmissionMessage[] {
     : []
 }
 
+/** Message ids whose durable inbox insertion was explicitly canceled before claim. */
+function canceledInboxMessageIds(events: readonly AdmissionEvent[]): ReadonlySet<string> {
+  const state: Record<'next-turn' | 'next-step', AdmissionMessage[]> = {
+    'next-turn': [],
+    'next-step': [],
+  }
+  const canceled = new Set<string>()
+  for (const event of events) {
+    if (event.type !== 'agent/inbox/spliced' || typeof event.data !== 'object' || event.data === null) continue
+    const data = event.data as {
+      target?: unknown
+      start?: unknown
+      removedCount?: unknown
+      inserted?: unknown
+      outcome?: unknown
+    }
+    if (data.target !== 'next-turn' && data.target !== 'next-step') continue
+    if (!Number.isSafeInteger(data.start) || (data.start as number) < 0) continue
+    const inbox = state[data.target]
+    const start = Math.min(data.start as number, inbox.length)
+    const removedCount = data.removedCount === undefined ? 0 : data.removedCount
+    if (!Number.isSafeInteger(removedCount) || (removedCount as number) < 0) continue
+    const inserted = Array.isArray(data.inserted)
+      ? data.inserted.filter((value): value is AdmissionMessage => typeof value === 'object' && value !== null)
+      : []
+    const removed = inbox.splice(start, Math.min(removedCount as number, inbox.length - start), ...inserted)
+    if (data.outcome === 'canceled') {
+      for (const message of removed) {
+        if (typeof message.id === 'string') canceled.add(message.id)
+      }
+    }
+  }
+  return canceled
+}
+
 function packetIdentities(events: readonly AdmissionEvent[]): PacketIdentity[] {
   const identities: PacketIdentity[] = []
+  const canceled = canceledInboxMessageIds(events)
   for (const event of events) {
     for (const message of eventMessages(event)) {
+      if (event.type === 'agent/inbox/spliced'
+        && typeof message.id === 'string'
+        && canceled.has(message.id)) continue
       const text = contentText(message.content)
       let before = text.length
       while (before >= 0) {
@@ -495,6 +636,7 @@ export class TaskAdmissionCoordinator {
     private readonly runtime: TaskAdmissionRuntime,
     private readonly resolveWriterDomain: (cwd: string) => Promise<string> = resolveAdmissionWriterDomain,
     recovery?: HostRecoveryCoordinator,
+    private readonly gitBaselines?: GitBaselineStore,
   ) {
     this.recovery = recovery ?? new HostRecoveryCoordinator(runtime)
   }
@@ -588,7 +730,10 @@ export class TaskAdmissionCoordinator {
         throw new TaskAdmissionError('ADMISSION_CORRUPT', `requestId ${request.requestId} has multiple durable run ids`)
       }
       await this.rearmPendingAfterRestart(agent, matches)
-      return this.receipt(request, matches[0]?.runId as string, true, agent.session.events.at(-1)?.seq ?? -1)
+      return this.receipt(
+        request, matches[0]?.runId as string, true,
+        matches[0]?.seq as number, agent.session.events.at(-1)?.seq ?? -1,
+      )
     }
     if (request.parentRunId !== undefined && request.recoveryCapsule !== undefined) {
       const expected = await this.recovery.capsule(request.sessionId, request.parentRunId)
@@ -596,6 +741,12 @@ export class TaskAdmissionCoordinator {
         throw new TaskAdmissionError(
           'BAD_REQUEST',
           `recoveryCapsule does not match Host durable evidence for parent run ${request.parentRunId}`,
+        )
+      }
+      if (expected.uncertainEffects.truncated) {
+        throw new TaskAdmissionError(
+          'BAD_REQUEST',
+          `recoveryCapsule for parent run ${request.parentRunId} omits uncertain effects; manual reconciliation is required`,
         )
       }
     }
@@ -611,7 +762,11 @@ export class TaskAdmissionCoordinator {
         `session ${request.sessionId} requires an exact continuation of interrupted run ${currentIdentity.runId}`,
       )
     }
-    const unsettled = this.unsettledRunTree(request.sessionId, durable)
+    const exactInterruptedContinuation = interrupted !== undefined
+      && currentIdentity !== undefined && request.parentRunId === currentIdentity.runId
+    const unsettled = exactInterruptedContinuation
+      ? undefined
+      : this.unsettledRunTree(request.sessionId, durable)
     if (unsettled !== undefined) {
       throw new TaskAdmissionError(
         'SESSION_BUSY',
@@ -637,6 +792,50 @@ export class TaskAdmissionCoordinator {
         `session ${request.sessionId} is already running; wait for its current supervised run before dispatching another`,
       )
     }
+    if (request.writerMode === 'writer') {
+      if (this.gitBaselines === undefined || agent.session.header.cwd === undefined) {
+        throw new TaskAdmissionError('DURABILITY_UNAVAILABLE', 'writer admission requires the Host Git baseline store')
+      }
+      try {
+        await this.gitBaselines.capture({
+          sessionId: request.sessionId,
+          runId: request.runId,
+          cwd: agent.session.header.cwd,
+          allowedScope: request.packet.allowedScope,
+        })
+      } catch (error) {
+        throw new TaskAdmissionError(
+          'BAD_REQUEST',
+          `could not capture authoritative writer baseline: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    if (agent.session.append === undefined) {
+      throw new TaskAdmissionError('INTERNAL', 'session runtime does not expose durable sandbox policy events')
+    }
+    const models = this.runtime.apiProxy.sessions.models
+    if (models === undefined) {
+      throw new TaskAdmissionError('DURABILITY_UNAVAILABLE', 'atomic admission requires the Host model-state resolver')
+    }
+    const currentModels = await models({
+      rpcId: `${request.requestId}:current-model`, payload: { sessionId: request.sessionId },
+    })
+    const previousModel = currentModels.result.ok ? currentModelSelection(currentModels.result.value) : undefined
+    if (previousModel === undefined) {
+      const detail = currentModels.result.ok
+        ? 'Host returned malformed current model state'
+        : `${currentModels.result.error.code}: ${currentModels.result.error.message}`
+      throw new TaskAdmissionError('DURABILITY_UNAVAILABLE', `could not snapshot admission model state: ${detail}`)
+    }
+    const previousSandbox = latestPolicyValue<'read-only' | 'workspace-write' | 'danger-full-access'>(
+      agent.session.events, 'sandbox/mode', 'mode',
+    ) ?? this.runtime.policyDefaults?.sandboxMode
+    const previousApproval = latestPolicyValue<'ask' | 'never'>(
+      agent.session.events, 'approval/policy', 'policy',
+    ) ?? this.runtime.policyDefaults?.approvalPolicy
+    if (previousSandbox === undefined || previousApproval === undefined) {
+      throw new TaskAdmissionError('DURABILITY_UNAVAILABLE', 'atomic admission requires Host policy defaults')
+    }
     const selected = await this.runtime.apiProxy.sessions.selectModel({
       rpcId: `${request.requestId}:model`,
       payload: {
@@ -654,9 +853,6 @@ export class TaskAdmissionCoordinator {
         `${selected.result.error.code}: ${selected.result.error.message}`,
       )
     }
-    if (agent.session.append === undefined) {
-      throw new TaskAdmissionError('INTERNAL', 'session runtime does not expose durable sandbox policy events')
-    }
     agent.session.append('sandbox/mode', {
       mode: request.writerMode === 'read_only' ? 'read-only' : 'workspace-write',
     })
@@ -666,27 +862,44 @@ export class TaskAdmissionCoordinator {
       // approval policy; a later user-controlled policy change stays explicit.
       agent.session.append('approval/policy', { policy: 'never' })
     }
-    const response = await this.runtime.apiProxy.sessions.prompt({
-      rpcId: request.requestId,
-      payload: {
-        sessionId: request.sessionId,
-        mode: 'queue',
-        content: [{ type: 'text', text: request.prompt }],
-      },
-    })
-    if (!response.result.ok) {
-      throw new TaskAdmissionError(
-        'PROMPT_REJECTED',
-        `${response.result.error.code}: ${response.result.error.message}`,
-      )
+    let promptFailure: string | undefined
+    try {
+      const response = await this.runtime.apiProxy.sessions.prompt({
+        rpcId: request.requestId,
+        payload: {
+          sessionId: request.sessionId,
+          mode: 'queue-durable',
+          content: [{ type: 'text', text: request.prompt }],
+        },
+      })
+      if (!response.result.ok) promptFailure = `${response.result.error.code}: ${response.result.error.message}`
+    } catch (error) {
+      promptFailure = error instanceof Error ? error.message : String(error)
+    }
+    if (promptFailure !== undefined) {
+      try {
+        const restored = await this.runtime.apiProxy.sessions.selectModel({
+          rpcId: `${request.requestId}:rollback-model`,
+          payload: { sessionId: request.sessionId, ...previousModel },
+        })
+        if (!restored.result.ok) {
+          throw new Error(`${restored.result.error.code}: ${restored.result.error.message}`)
+        }
+        agent.session.append('sandbox/mode', { mode: previousSandbox })
+        if (request.writerMode === 'read_only') agent.session.append('approval/policy', { policy: previousApproval })
+        if (!await this.runtime.sessions.flush(agent.session)) throw new Error('session persistence did not participate')
+      } catch (rollbackError) {
+        throw new TaskAdmissionError(
+          'DURABILITY_UNAVAILABLE',
+          `task prompt failed (${promptFailure}) and admission configuration rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        )
+      }
+      throw new TaskAdmissionError('PROMPT_REJECTED', promptFailure)
     }
     const admittedAgent = this.runtime.agents.list()
       .find(candidate => candidate.session.header.id === request.sessionId)
     if (admittedAgent === undefined) {
       throw new TaskAdmissionError('INTERNAL', `session ${request.sessionId} detached during task admission`)
-    }
-    if (!await this.runtime.sessions.flush(admittedAgent.session)) {
-      throw new TaskAdmissionError('DURABILITY_UNAVAILABLE', 'session persistence did not participate in admission flush')
     }
     const admitted = packetIdentities(admittedAgent.session.events)
       .find(identity => identity.requestId === request.requestId)
@@ -695,7 +908,10 @@ export class TaskAdmissionCoordinator {
       || admitted.runId !== request.runId) {
       throw new TaskAdmissionError('INTERNAL', 'durable inbox does not contain the admitted task identity')
     }
-    return this.receipt(request, admitted.runId, false, admittedAgent.session.events.at(-1)?.seq ?? admitted.seq)
+    return this.receipt(
+      request, admitted.runId, false, admitted.seq,
+      admittedAgent.session.events.at(-1)?.seq ?? admitted.seq,
+    )
   }
 
   private unsettledRunTree(
@@ -718,14 +934,33 @@ export class TaskAdmissionCoordinator {
       }
       return false
     }
-    const latestTurnBoundary = root.events.findLast(event => event.seq > latest.seq
-      && (event.type === 'turn/start' || event.type === 'turn/end'))
-    const rootEnded = latestTurnBoundary?.type === 'turn/end'
-    if (!rootEnded) return 'root turn has not ended'
+    if (root.status === 'running') return 'root turn is still running'
     if (root.pending) return 'root has a pending follow-up'
-    const descendant = [...sessions].find(([id, candidate]) => isDescendant(id)
-      && (candidate.status === 'running' || candidate.pending))
-    return descendant === undefined ? undefined : `descendant ${descendant[0]} is active or has pending work`
+    const boundary = root.events.find(event => event.seq === latest.seq)
+    if (boundary?.time === undefined) return 'root task packet has no durable time'
+    let latestChildTerminalTime = Number.NEGATIVE_INFINITY
+    for (const [id, candidate] of sessions) {
+      if (!isDescendant(id)) continue
+      const activation = affiliatedChildActivation(
+        candidate.events as readonly RecoveryEvent[], id, boundary.time, latest.runId,
+      )
+      if (activation === undefined) continue
+      const childTerminal = candidate.events.findLast(event => event.type === 'turn/end' && event.seq > activation.seq)
+      const childStart = candidate.events.findLast(event => event.type === 'turn/start' && event.seq > activation.seq)
+      if (candidate.status === 'running' || candidate.pending || childTerminal === undefined
+        || (childStart !== undefined && childStart.seq > childTerminal.seq)) {
+        return `descendant ${id} is active, pending, or has no terminal turn`
+      }
+      if (childTerminal.time === undefined) return `descendant ${id} terminal turn has no durable time`
+      latestChildTerminalTime = Math.max(latestChildTerminalTime, childTerminal.time)
+    }
+    const handoff = acceptedTerminalHandoff(root.events, latest)
+    if (handoff === undefined) return 'root has no valid matching terminal supervisor_handoff and turn end'
+    if (handoff.result.time === undefined || handoff.turnEnd.time === undefined) {
+      return 'root terminal handoff has no durable time'
+    }
+    if (handoff.result.time <= latestChildTerminalTime) return 'root must hand off again after affiliated descendants settle'
+    return undefined
   }
 
   private async activeWriterOwner(
@@ -733,33 +968,13 @@ export class TaskAdmissionCoordinator {
     sessions: ReadonlyMap<string, DurableAdmissionSession>,
     permittedInterruptedOwner?: string,
   ): Promise<string | undefined> {
-    const headers = new Map([...sessions].map(([id, candidate]) => [id, candidate.header]))
-    const isDescendant = (candidateId: string, rootId: string): boolean => {
-      let current = headers.get(candidateId)
-      const seen = new Set<string>()
-      while (current?.parentSession !== undefined) {
-        if (seen.has(current.id)) return false
-        seen.add(current.id)
-        if (current.parentSession === rootId) return true
-        current = headers.get(current.parentSession)
-      }
-      return false
-    }
     for (const candidate of sessions.values()) {
       const header = candidate.header
       if (header.parentSession !== undefined || header.cwd === undefined) continue
       const latest = packetIdentities(candidate.events).at(-1)
       if (latest?.writerMode !== 'writer') continue
       if (header.id === permittedInterruptedOwner) continue
-      const latestTurnBoundary = candidate.events.findLast(event => event.seq > latest.seq
-        && (event.type === 'turn/start' || event.type === 'turn/end'))
-      const rootEnded = latestTurnBoundary?.type === 'turn/end'
-      const rootInterrupted = rootEnded
-        && (latestTurnBoundary.data as { reason?: { kind?: unknown } }).reason?.kind === 'interrupted'
-      const descendantRunning = [...sessions].some(([id, session]) => isDescendant(id, header.id)
-        && (session.status === 'running' || session.pending))
-      const rootHasPendingWork = candidate.pending
-      if (rootEnded && !rootInterrupted && !descendantRunning && !rootHasPendingWork) continue
+      if (this.unsettledRunTree(header.id, sessions) === undefined) continue
       if (await this.resolveWriterDomain(header.cwd) === domain) return header.id
     }
     return undefined
@@ -771,17 +986,14 @@ export class TaskAdmissionCoordinator {
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
       .find(message => message.id !== undefined && ids.has(message.id))
     if (pending?.id === undefined) return
-    if (!agent.inbox.remove(pending.id)) return
-    agent.followup(pending)
-    if (!await this.runtime.sessions.flush(agent.session)) {
-      throw new TaskAdmissionError('DURABILITY_UNAVAILABLE', 'session persistence did not participate in recovery flush')
-    }
+    agent.wakePending()
   }
 
   private receipt(
     request: TaskAdmissionRequest,
     runId: string,
     reconciled: boolean,
+    admissionBoundarySeq: number,
     asOfSeq: number,
   ): TaskAdmissionReceipt {
     return {
@@ -791,6 +1003,7 @@ export class TaskAdmissionCoordinator {
       requestDigest: request.requestDigest,
       runId,
       reconciled,
+      admissionBoundarySeq,
       asOfSeq,
     }
   }
@@ -886,6 +1099,7 @@ export function registerTaskAdmissionRoute(
     kind: 'exact',
     path: TASK_ADMISSION_PATH,
     handler: async (req, res) => {
+      if (!authorizeSupervisorRequest(req, res)) return
       let rpcId = 'invalid'
       try {
         const envelope = await readEnvelope(req)
@@ -911,6 +1125,7 @@ export function registerRecoveryCapsuleRoute(
     kind: 'exact',
     path: RECOVERY_CAPSULE_PATH,
     handler: async (req, res) => {
+      if (!authorizeSupervisorRequest(req, res)) return
       let rpcId = 'invalid'
       try {
         const envelope = await readRecoveryEnvelope(req)

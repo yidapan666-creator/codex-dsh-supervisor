@@ -34,7 +34,7 @@ The generic DSH network-client seam does not exist in any published DSH
 release. This project consumes it from a public fork at **exactly one commit**:
 
 - fork: `https://github.com/yidapan666-creator/deepseek-harness.git`
-- commit: `7212c955438c70c9a2d168f67e85a8014b8d4488`
+- commit: `68dd149a1834496ced7308de5a7084328855f13e`
 - branch (informational only): `codex/mcp-network-client`
 
 The **commit SHA, never the branch**, is the compatibility contract. Bootstrap
@@ -132,6 +132,7 @@ refresh headroom before returning its aggregated observation.
 | `.dsh-state/logs/http-<host>-<port>.log` | detached Host output, isolated by Host origin |
 | `.dsh-state/host/http-<host>-<port>.pid` | Host process record (pid, argv, url), isolated by Host origin |
 | `.dsh-state/host/http-<host>-<port>.start.lock` | short-lived per-origin Host startup lease; absent outside startup |
+| `.dsh-state/host/auth.token` | bootstrap-generated 256-bit Host bearer credential, mode `0600`; never logged or committed |
 
 `.dsh-state/` is in `.gitignore`: none of it can enter the public repository.
 Normal workspace build products (`node_modules/`, package `dist/` directories,
@@ -159,6 +160,12 @@ only an explicitly dispatched real task can prove that credentials and the
 provider request path work end to end. Any failed check exits non-zero with the
 reason; live checks are optional and skipped without `--live`.
 
+The supervisor descriptor's `buildId` is a content-derived identity, independent
+of the package version. `pnpm build-id:check` verifies it and `pnpm
+build-id:update` refreshes it after intentional Host-runtime changes. MCP and
+doctor import the same recorded identity and therefore reject a still-running
+Host loaded from older plugin code until that Host is restarted.
+
 ## Host lifecycle (independent of MCP)
 
 ```sh
@@ -184,6 +191,21 @@ loopback origin with no path, query, credentials, or fragment. Different ports
 have separate PID files, readiness leases, and logs, so inspecting or operating
 one Host cannot clear ownership for another. Legacy `host.pid` records are read
 only when their recorded URL exactly matches the requested origin.
+
+Bootstrap also generates `.dsh-state/host/auth.token` once with 256 bits of
+randomness and file mode `0600`. Host lifecycle commands pass it through the
+process environment without printing it; MCP reads the same file through
+`DSH_HOST_TOKEN_FILE`. Every generic HTTP RPC, plugin-owned route, and WebSocket
+upgrade requires the bearer credential. DSH Web receives it in the returned
+`browserUrl` fragment, which is not included in the initial HTTP request; the
+client applies it to API calls. Treat that fragment as a local credential and
+never paste it into logs, issues, or `hostBaseUrl`.
+
+Plain HTTP transport is allowed only for loopback. Connecting MCP to a remote
+Host requires an HTTPS origin with no embedded credentials, path, query, or
+fragment, plus the existing DSH trusted-authority configuration at the Host or
+reverse proxy. The Host's origin/DNS-rebinding checks remain in force in
+addition to bearer authentication.
 
 For continuous crash restart, copy the platform example from
 `config/launchd/com.dsh-gate.host.plist.example` or

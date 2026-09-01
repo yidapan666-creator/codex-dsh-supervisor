@@ -13,6 +13,7 @@
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { DSH_GATE_BUILD_ID } from '../packages/dsh-supervisor-tools/build-identity.mjs'
 
 // ---------------------------------------------------------------------------
 // Compatibility contract constants
@@ -26,7 +27,7 @@ export const DSH_FORK_URL = 'https://github.com/yidapan666-creator/deepseek-harn
  * contract; fetching is always by SHA. To update the pin, change this
  * constant, remove the managed checkout, and re-run bootstrap.
  */
-export const DSH_PINNED_COMMIT = '7212c955438c70c9a2d168f67e85a8014b8d4488'
+export const DSH_PINNED_COMMIT = '68dd149a1834496ced7308de5a7084328855f13e'
 
 /** Informational only: the fork branch that carries the pinned commit. */
 export const DSH_FORK_BRANCH = 'codex/mcp-network-client'
@@ -76,6 +77,7 @@ export function resolvePaths(options = {}) {
     dshHome,
     logsDir: join(stateDir, 'logs'),
     hostDir: join(stateDir, 'host'),
+    hostTokenFile: join(stateDir, 'host', 'auth.token'),
     installJson: join(stateDir, 'install.json'),
     hostPidFile: join(stateDir, 'host', 'host.pid'),
     hostStartLockFile: join(stateDir, 'host', 'host.start.lock'),
@@ -534,7 +536,11 @@ export async function profileHasPlugin(paths, io) {
 // Doctor
 // ---------------------------------------------------------------------------
 
-export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
+function bearerHeaders(token, headers = {}) {
+  return token === undefined ? headers : { ...headers, authorization: `Bearer ${token}` }
+}
+
+export async function checkLiveHost({ url, io, timeoutMs = 8000, token }) {
   const body = JSON.stringify({
     type: 'client-request',
     rpcId: `dsh-gate-${Date.now().toString(36)}`,
@@ -543,7 +549,7 @@ export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
   })
   const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/host.describe`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: bearerHeaders(token, { 'content-type': 'application/json' }),
     body,
     signal: AbortSignal.timeout(timeoutMs),
   })
@@ -557,11 +563,39 @@ export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
   return result.value
 }
 
-export async function checkSessionModels({ url, sessionId, io, timeoutMs = 8000 }) {
+export const EXPECTED_GATE_CAPABILITIES = [
+  'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+  'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1',
+  'bearer-auth-v1',
+]
+export const EXPECTED_GATE_PLUGIN_VERSION = '0.1.0'
+export const EXPECTED_GATE_BUILD_ID = DSH_GATE_BUILD_ID
+
+/** Prove that the live generic Host loaded a compatible dsh-gate supervisor plugin. */
+export async function checkGatePlugin({ url, io, timeoutMs = 8000, token }) {
+  const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/dsh-gate.describe`, {
+    method: 'GET', headers: bearerHeaders(token, { accept: 'application/json' }), signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const value = await response.json()
+  const capabilities = Array.isArray(value?.capabilities)
+    ? value.capabilities.filter(entry => typeof entry === 'string') : []
+  const missing = EXPECTED_GATE_CAPABILITIES.filter(capability => !capabilities.includes(capability))
+  if (value?.schemaVersion !== 1 || value?.gateProtocolVersion !== 1
+    || value?.pluginName !== '@dsh-gate/supervisor-tools'
+    || value?.pluginVersion !== EXPECTED_GATE_PLUGIN_VERSION
+    || value?.buildId !== EXPECTED_GATE_BUILD_ID
+    || value?.workerProtocolVersion !== 2 || missing.length > 0) {
+    throw new Error(`incompatible supervisor descriptor${missing.length === 0 ? '' : `; missing capabilities: ${missing.join(', ')}`}`)
+  }
+  return value
+}
+
+export async function checkSessionModels({ url, sessionId, io, timeoutMs = 8000, token }) {
   const rpcId = `dsh-gate-models-${Date.now().toString(36)}`
   const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/session.models`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: bearerHeaders(token, { 'content-type': 'application/json' }),
     body: JSON.stringify({
       type: 'client-request', rpcId, method: 'session.models', payload: { sessionId },
     }),
@@ -581,7 +615,7 @@ export async function checkSessionModels({ url, sessionId, io, timeoutMs = 8000 
  * Run every doctor check. `io` is the real or fake io; `live` enables the
  * optional Host probe. Returns an ordered list of check results.
  */
-export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOST_URL, readinessSession }) {
+export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOST_URL, readinessSession, hostToken }) {
   const checks = []
   const add = (name, run) => checks.push({ name, run })
 
@@ -674,7 +708,7 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
     add('live Host', async () => {
       let value
       try {
-        value = await checkLiveHost({ url: hostUrl, io })
+        value = await checkLiveHost({ url: hostUrl, io, token: hostToken })
       } catch (error) {
         return { ok: false, detail: `no live Host at ${hostUrl}: ${error instanceof Error ? error.message : String(error)}` }
       }
@@ -686,11 +720,22 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
         ? { ok: true, detail: `protocolVersion 1; hostInstanceId ${value.hostInstanceId}; version ${value.version}` }
         : { ok: false, detail: failures.join('; ') }
     })
+    add('live supervisor plugin', async () => {
+      try {
+        const value = await checkGatePlugin({ url: hostUrl, io, token: hostToken })
+        return {
+          ok: true,
+          detail: `gateProtocolVersion ${String(value.gateProtocolVersion)}; plugin ${value.pluginVersion}; build ${value.buildId}`,
+        }
+      } catch (error) {
+        return { ok: false, detail: `supervisor plugin is not ready at ${hostUrl}: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    })
     if (readinessSession !== undefined) {
       add('provider/model routing', async () => {
         let value
         try {
-          value = await checkSessionModels({ url: hostUrl, sessionId: readinessSession, io })
+          value = await checkSessionModels({ url: hostUrl, sessionId: readinessSession, io, token: hostToken })
         } catch (error) {
           return { ok: false, detail: `session ${readinessSession}: ${error instanceof Error ? error.message : String(error)}` }
         }
@@ -829,8 +874,8 @@ export function hostStartPidDecision(pidState, hostReachable) {
 }
 
 /** Describe a running host for status output; throws when unreachable. */
-export async function describeHost({ hostUrl, io, timeoutMs = 5000 }) {
-  const value = await checkLiveHost({ url: hostUrl, io, timeoutMs })
+export async function describeHost({ hostUrl, io, timeoutMs = 5000, token }) {
+  const value = await checkLiveHost({ url: hostUrl, io, timeoutMs, token })
   return value
 }
 

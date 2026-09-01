@@ -8,7 +8,9 @@ import {
   DSH_FORK_BRANCH,
   DSH_FORK_URL,
   DSH_PINNED_COMMIT,
+  EXPECTED_GATE_BUILD_ID,
   checkLiveHost,
+  checkGatePlugin,
   checkSessionModels,
   formatOutputTail,
   formatPhaseFailure,
@@ -415,7 +417,7 @@ describe('planBootstrap', () => {
 // ---------------------------------------------------------------------------
 
 describe('runDoctor', () => {
-  function goodEnv({ live = false, hostValue } = {}) {
+  function goodEnv({ live = false, hostValue, gateValue } = {}) {
     const paths = pathsFor()
     const files = {
       [paths.installJson]: { pinnedCommit: PIN, forkUrl: DSH_FORK_URL, updatedAt: 'now' },
@@ -439,7 +441,16 @@ describe('runDoctor', () => {
       realpath: (path) => path === paths.linkPath ? `${paths.dshRepo}/packages/client/connection` : path,
       fetch: hostValue === undefined ? undefined : async (url) => ({
         ok: true,
-        json: async () => ({ type: 'server-response', rpcId: 'x', result: { ok: true, value: hostValue } }),
+        json: async () => url.endsWith('/api/dsh-gate.describe')
+          ? gateValue ?? {
+              schemaVersion: 1, gateProtocolVersion: 1, pluginName: '@dsh-gate/supervisor-tools',
+              pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2,
+              capabilities: [
+                'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+                'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+              ],
+            }
+          : { type: 'server-response', rpcId: 'x', result: { ok: true, value: hostValue } },
       }),
     })
     return { paths, io }
@@ -492,19 +503,42 @@ describe('runDoctor', () => {
     expect(results.find(r => r.name === 'live Host').ok).toBe(false)
   })
 
+  it('rejects a live Host whose supervisor plugin is stale or incomplete', async () => {
+    const { paths, io } = goodEnv({
+      live: true,
+      hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.0-rc.8' },
+      gateValue: {
+        schemaVersion: 1, gateProtocolVersion: 1, pluginName: '@dsh-gate/supervisor-tools',
+        pluginVersion: 'old', buildId: 'old', workerProtocolVersion: 2, capabilities: [],
+      },
+    })
+    const results = await runDoctor({ paths, io, live: true })
+    expect(results.find(r => r.name === 'live Host')?.ok).toBe(true)
+    expect(results.find(r => r.name === 'live supervisor plugin')).toMatchObject({ ok: false })
+  })
+
   it('treats unrelated provider catalog failures as advisory when the selected route is routable', async () => {
     const { paths, io } = goodEnv()
     io.fetch = async (url) => ({
       ok: true,
-      json: async () => ({ type: 'server-response', rpcId: 'x', result: { ok: true, value:
-        url.endsWith('/api/host.describe')
+      json: async () => url.endsWith('/api/dsh-gate.describe')
+        ? {
+            schemaVersion: 1, gateProtocolVersion: 1, pluginName: '@dsh-gate/supervisor-tools',
+            pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2,
+            capabilities: [
+              'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+              'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+            ],
+          }
+        : ({ type: 'server-response', rpcId: 'x', result: { ok: true, value:
+          url.endsWith('/api/host.describe')
           ? { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.0-rc.8' }
           : {
               current: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
               routable: true,
               failures: [{ provider: 'unconfigured-provider', message: 'catalog unavailable' }],
             },
-      } }),
+        } }),
     })
     const results = await runDoctor({
       paths, io, live: true, hostUrl: DEFAULT_HOST_URL, readinessSession: 'session-1',
@@ -542,6 +576,19 @@ describe('checkLiveHost', () => {
     })
     const value = await checkLiveHost({ url: DEFAULT_HOST_URL, io })
     expect(value.protocolVersion).toBe(1)
+  })
+
+  it('sends the deployment bearer credential without putting it in the URL', async () => {
+    const token = 's'.repeat(32)
+    const io = makeFakeIo({
+      fetch: async (url, init) => {
+        expect(url).toBe(`${DEFAULT_HOST_URL}/api/host.describe`)
+        expect(url).not.toContain(token)
+        expect(init.headers.authorization).toBe(`Bearer ${token}`)
+        return { ok: true, json: async () => ({ result: { ok: true, value: { protocolVersion: 1 } } }) }
+      },
+    })
+    await checkLiveHost({ url: DEFAULT_HOST_URL, io, token })
   })
 
   it('throws on non-2xx transport failure', async () => {

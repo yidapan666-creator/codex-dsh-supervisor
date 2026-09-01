@@ -11,6 +11,7 @@ import {
   type SessionSummary,
 } from '@deepseek-ai/dsh-client-connection/network-client'
 import { taskBoundarySeq } from './fold.js'
+import { DSH_GATE_BUILD_ID } from '../../dsh-supervisor-tools/build-identity.mjs'
 import type {
   DshEvent, PendingApproval, PendingQuestion, RecoveryCapsule, TaskRuntimeState, WorkerState,
 } from './contracts.js'
@@ -73,6 +74,7 @@ export interface TaskAdmissionReceipt {
   requestDigest: string
   runId: string
   reconciled: boolean
+  admissionBoundarySeq: number
   asOfSeq: number
 }
 
@@ -112,6 +114,55 @@ export interface TokenBudgetStateReceipt {
 
 export type TokenBudgetStateTransport = (request: TokenBudgetStateRequest) => Promise<TokenBudgetStateReceipt>
 
+export const EXPECTED_GATE_CAPABILITIES = [
+  'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+  'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1',
+  'bearer-auth-v1',
+] as const
+export const EXPECTED_GATE_PLUGIN_VERSION = '0.1.0'
+export const EXPECTED_GATE_BUILD_ID = DSH_GATE_BUILD_ID
+
+export interface GateDescriptor {
+  schemaVersion: 1
+  gateProtocolVersion: 1
+  pluginName: '@dsh-gate/supervisor-tools'
+  pluginVersion: string
+  buildId: string
+  workerProtocolVersion: 2
+  capabilities: string[]
+}
+
+export type GateDescriptorTransport = () => Promise<GateDescriptor>
+
+function requestHeaders(token: string | undefined, json = false): Record<string, string> {
+  return {
+    ...(json ? { 'content-type': 'application/json' } : { accept: 'application/json' }),
+    ...token === undefined ? {} : { authorization: `Bearer ${token}` },
+  }
+}
+
+async function fetchGateDescriptor(baseUrl: string, token?: string): Promise<GateDescriptor> {
+  const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.describe`, {
+    method: 'GET', headers: requestHeaders(token), signal: AbortSignal.timeout(8_000),
+  })
+  if (response.status === 404) {
+    throw new ProtocolContractError('DSH Host did not load the dsh-gate supervisor plugin; reinstall it and restart the Host')
+  }
+  if (!response.ok) throw new ProtocolContractError(`dsh-gate descriptor returned HTTP ${String(response.status)}`)
+  const value = await response.json() as Record<string, unknown>
+  const capabilities = Array.isArray(value.capabilities)
+    ? value.capabilities.filter((entry): entry is string => typeof entry === 'string') : []
+  const missing = EXPECTED_GATE_CAPABILITIES.filter(capability => !capabilities.includes(capability))
+  if (value.schemaVersion !== 1 || value.gateProtocolVersion !== 1
+    || value.pluginName !== '@dsh-gate/supervisor-tools'
+    || value.pluginVersion !== EXPECTED_GATE_PLUGIN_VERSION
+    || value.buildId !== EXPECTED_GATE_BUILD_ID
+    || value.workerProtocolVersion !== 2 || missing.length > 0) {
+    throw new ProtocolContractError(`incompatible dsh-gate supervisor plugin${missing.length === 0 ? '' : `; missing capabilities: ${missing.join(', ')}`}`)
+  }
+  return { ...value, capabilities } as GateDescriptor
+}
+
 interface CachedSessionMetadata {
   cwd?: string
   agentPreset?: string
@@ -132,17 +183,18 @@ function taskAdmissionReceipt(value: unknown, request: TaskAdmissionRequest): Ta
     || receipt.requestDigest !== request.requestDigest
     || typeof receipt.runId !== 'string'
     || typeof receipt.reconciled !== 'boolean'
+    || typeof receipt.admissionBoundarySeq !== 'number' || !Number.isSafeInteger(receipt.admissionBoundarySeq)
     || typeof receipt.asOfSeq !== 'number' || !Number.isSafeInteger(receipt.asOfSeq)) {
     throw new ProtocolContractError('malformed dsh-gate admission receipt')
   }
   return receipt as unknown as TaskAdmissionReceipt
 }
 
-async function postTaskAdmission(baseUrl: string, request: TaskAdmissionRequest): Promise<TaskAdmissionReceipt> {
+async function postTaskAdmission(baseUrl: string, request: TaskAdmissionRequest, token?: string): Promise<TaskAdmissionReceipt> {
   const rpcId = `dsh-gate-admit-${request.requestId}`
   const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.admit`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: requestHeaders(token, true),
     body: JSON.stringify({ type: 'client-request', rpcId, method: 'dsh-gate.admit', payload: request }),
     signal: AbortSignal.timeout(30_000),
   })
@@ -181,11 +233,12 @@ function recoveryCapsuleReceipt(value: unknown, request: RecoveryCapsuleRequest)
 async function postRecoveryCapsule(
   baseUrl: string,
   request: RecoveryCapsuleRequest,
+  token?: string,
 ): Promise<RecoveryCapsule> {
   const rpcId = `dsh-gate-recovery-${request.parentRunId}`
   const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.recovery-capsule`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: requestHeaders(token, true),
     body: JSON.stringify({
       type: 'client-request', rpcId, method: 'dsh-gate.recovery-capsule', payload: request,
     }),
@@ -245,11 +298,12 @@ function tokenBudgetStateReceipt(value: unknown, request: TokenBudgetStateReques
 async function postTokenBudgetState(
   baseUrl: string,
   request: TokenBudgetStateRequest,
+  token?: string,
 ): Promise<TokenBudgetStateReceipt> {
   const rpcId = `dsh-gate-budget-${request.runId}`
   const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/dsh-gate.budget-state`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: requestHeaders(token, true),
     body: JSON.stringify({ type: 'client-request', rpcId, method: 'dsh-gate.budget-state', payload: request }),
     signal: AbortSignal.timeout(30_000),
   })
@@ -399,6 +453,7 @@ export function launchDetachedHost(config: HostLaunchConfig): Promise<void> {
 export class HostConnection {
   private readonly controller: ConnectionController
   private description: HostDescription | undefined
+  private gateDescription: GateDescriptor | undefined
   private protocolError: string | undefined
   private readonly listeners = new Set<() => void>()
   private readonly sessionListeners = new Map<string, Set<() => void>>()
@@ -417,6 +472,7 @@ export class HostConnection {
     private readonly admissionTransport: TaskAdmissionTransport = request => postTaskAdmission(baseUrl, request),
     private readonly budgetStateTransport: TokenBudgetStateTransport = request => postTokenBudgetState(baseUrl, request),
     private readonly recoveryTransport: RecoveryCapsuleTransport = request => postRecoveryCapsule(baseUrl, request),
+    private readonly gateDescriptorTransport: GateDescriptorTransport = () => fetchGateDescriptor(baseUrl),
   ) {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
@@ -427,7 +483,10 @@ export class HostConnection {
         this.publishAll()
       },
       onStateChange: (state) => {
-        if (state === 'reconnecting') this.description = undefined
+        if (state === 'reconnecting') {
+          this.description = undefined
+          this.gateDescription = undefined
+        }
         this.publishAll()
       },
       onMuxEnvelope: envelope => this.onMux(envelope),
@@ -549,6 +608,12 @@ export class HostConnection {
 
   currentDescription(): HostDescription | undefined {
     return this.description
+  }
+
+  async ensureGateReady(): Promise<GateDescriptor> {
+    await this.ensureConnected()
+    this.gateDescription ??= await this.gateDescriptorTransport()
+    return this.gateDescription
   }
 
   /** Atomically queue one idempotent supervised task through the Host plugin. */
@@ -703,6 +768,18 @@ export class HostConnection {
     })
     if (!receipt.accepted) throw new Error(`question response rejected: ${receipt.reason}`)
   }
+}
+
+/** Construct the public DSH network client and plugin transports with one bearer secret. */
+export function authenticatedHostConnection(baseUrl: string, token: string): HostConnection {
+  return new HostConnection(
+    baseUrl,
+    new WebApiClient(baseUrl, undefined, token),
+    request => postTaskAdmission(baseUrl, request, token),
+    request => postTokenBudgetState(baseUrl, request, token),
+    request => postRecoveryCapsule(baseUrl, request, token),
+    () => fetchGateDescriptor(baseUrl, token),
+  )
 }
 
 export function parseLaunchConfig(value: string | undefined): HostLaunchConfig | undefined {

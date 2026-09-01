@@ -42,16 +42,37 @@ UUID `runId` and a new completion token. The completion token is embedded in the
 durable packet but is never required from Codex after queueing. Every later
 supervision tool addresses `sessionId + runId`.
 
+The task receipt also returns `initialWaitAfterAsOfSeq`, the exact durable
+admission boundary, and `observedAsOfSeq`, the latest event already seen while
+forming the receipt. The first wait uses the former so worker events racing the
+receipt are not skipped; subsequent waits use the previous observation's
+`asOfSeq`.
+
 A task packet has this shape:
 
 ```ts
 interface TaskPacketV2 {
   schemaVersion: 2
+  instructionProfile?: 'engineering-v1'
   sessionId: string
   runId: string
   completionToken: string
   objective: string
   writerMode: 'writer' | 'read_only'
+  executionBrief?: {
+    schemaVersion: 1
+    source: 'CODEX_COMPILED' | 'SINGLE_STREAM_FALLBACK'
+    workstreams: Array<{
+      id: string
+      outcome: string
+      scopeHints?: string[]
+      evidenceToGather?: string[]
+      dependsOn?: string[]
+      delegation: 'root' | 'child_candidate'
+      doneWhen: string[]
+    }>
+    integration: string[]
+  }
   parentRunId?: string
   recoveryCapsule?: RecoveryCapsuleV1
   baseline?: {
@@ -86,6 +107,24 @@ canonical digest pin active behavior across MCP restarts. An optional shadow
 identity is pinned for reproducible comparison but has no enforcement authority.
 Older v2 packets without this field remain migration-compatible.
 
+New admissions also pin `instructionProfile=engineering-v1`. Before admission,
+the gateway deterministically fills only missing routine engineering details:
+full-session writer scope (`.`), preservation and safety constraints, concrete
+acceptance and focused-then-full verification, material-only escalation, and a
+maximum of five direct children. Explicit caller values always win, including
+a narrower scope or a zero-child limit. The compiler makes no model call, and
+its profile pin makes the exact instruction policy auditable after reconnect.
+
+Codex compiles multi-part requests into one `executionBrief` during its existing
+reasoning turn. The schema permits 1–5 unique workstreams, validates dependency
+references and acyclicity, and caps the complete brief at 16 KiB. It carries
+planning hints and observable completion conditions, never extra authority;
+`allowedScope`, constraints, approval policy, and budget remain binding. DSH
+Root may delegate `child_candidate` streams but retains shared-interface,
+integration, verification, and handoff ownership. An omitted brief becomes one
+explicit `SINGLE_STREAM_FALLBACK`, preserving migration without pretending that
+semantic decomposition occurred.
+
 ## Stale-safe control
 
 `dsh_wait`, `dsh_steer`, `dsh_cancel`, approval answers, and question answers
@@ -106,10 +145,12 @@ steers, cancels, or answers the newer run.
 
 ### Codex to DSH at queue time
 
-Codex sends the complete objective, scope, constraints, acceptance checks,
-verification commands, escalation conditions, Git baseline, authority, and
-pre-authorized child budget in one durable packet. Safe in-scope edits and
-declared verification do not require another human confirmation.
+Codex sends the objective plus any genuinely task-specific scope, constraints,
+acceptance checks, verification commands, escalation conditions, Git baseline,
+authority, and pre-authorized child budget in one durable packet. The
+deterministic instruction compiler supplies omitted routine defaults, so the
+human does not need to repeat the supervision boilerplate. Safe in-scope edits
+and declared verification do not require another human confirmation.
 The Host enforces `authority.maxDirectChildren` before configured child-start
 tools run, using durable direct-child creation times plus atomic reservations
 for concurrent starts. Within the limit the worker does not ask again; beyond

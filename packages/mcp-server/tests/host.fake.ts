@@ -293,6 +293,8 @@ export class FakeApi {
         requestDigest: request.requestDigest,
         runId: request.runId,
         reconciled: false,
+        admissionBoundarySeq: taskPacketEntries(row?.events ?? [])
+          .findLast(({ packet }) => packet.schemaVersion === 2 && packet.requestId === request.requestId)?.seq ?? -1,
         asOfSeq: row?.events.at(-1)?.seq ?? -1,
       }
       this.admissions.set(key, receipt)

@@ -33,7 +33,7 @@ describe('handoff summary limit', () => {
 describe('handoff payload limits', () => {
   const base = (): HandoffPayloadArgs => ({
     sessionId: 'session-1', runId: '11111111-1111-4111-8111-111111111111', completionToken: 'token',
-    stage: 'done', summary: 'verified', files: [], verification: [], artifacts: [],
+    status: 'completed', stage: 'done', summary: 'verified', files: [], verification: [], artifacts: [],
   })
 
   it('accepts compact fields at their boundaries', () => {
@@ -47,6 +47,14 @@ describe('handoff payload limits', () => {
     args.files = Array.from({ length: HANDOFF_FILES_LIMIT + 1 }, (_, index) => `file-${index}`)
     expect(handoffPayloadError(args)).toMatch(/files exceeds 64 entries/)
     expect(handoffPayloadError(args)).toContain(`.dsh-handoff/${args.runId}/`)
+  })
+
+  it('rejects a completed handoff whose own verification is not passing', () => {
+    for (const outcome of ['failed', 'not_run'] as const) {
+      const args = base()
+      args.verification = [{ command: 'pnpm test', outcome, summary: 'not passing' }]
+      expect(handoffPayloadError(args)).toMatch(/status completed cannot include verification outcome/)
+    }
   })
 })
 

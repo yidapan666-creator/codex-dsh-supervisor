@@ -14,6 +14,12 @@
   config:
     maxDepth: 1
 
+# Require the same deployment secret on generic HTTP RPC and WebSocket paths.
+# Browser clients read it from the URL fragment; MCP uses a bearer header.
+- id: connection
+  config:
+    authToken: !!js process.env.DSH_HOST_TOKEN
+
 - insert:
     - id: dsh-gate-supervisor-tools
       name: '@dsh-gate/supervisor-tools'

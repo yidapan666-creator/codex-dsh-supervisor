@@ -1,15 +1,15 @@
-import { mkdtemp, mkdir, realpath, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, HostDiscoveryError, attachChildObservations, resolveSessionCwd,
+  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, HostDiscoveryError, assertSecureHostUrl, attachChildObservations, resolveSessionCwd,
   resolveWriterDomain, writerLeaseHeld,
 } from '../src/gateway.js'
 import { parseTaskPacket } from '../src/fold.js'
-import { HostConnection } from '../src/host.js'
+import { EXPECTED_GATE_BUILD_ID, HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
 import type { RunJournal, RunRecord } from '@dsh-gate/run-journal'
@@ -27,6 +27,14 @@ function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
     request => api.admitTask(request),
     request => api.tokenBudgetState(request),
     request => api.recoveryCapsule(request),
+    async () => ({
+      schemaVersion: 1, gateProtocolVersion: 1, pluginName: '@dsh-gate/supervisor-tools',
+      pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2,
+      capabilities: [
+        'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+        'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+      ],
+    }),
   )
   live.push(connection)
   return connection
@@ -41,6 +49,15 @@ function managerWith(api: FakeApi, resolve: (cwd: string) => Promise<string>): G
 }
 
 const sameDomain = async (_cwd: string): Promise<string> => '/work/tree'
+const gateReady = async () => ({
+  schemaVersion: 1 as const, gateProtocolVersion: 1 as const,
+  pluginName: '@dsh-gate/supervisor-tools' as const,
+  pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2 as const,
+  capabilities: [
+    'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+    'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+  ],
+})
 
 const event = (type: string, seq: number, data: unknown): DshEvent => ({ type, seq, time: seq, data })
 
@@ -145,6 +162,37 @@ describe('writer domain resolution', () => {
 })
 
 describe('session cwd validation', () => {
+  it('permits loopback HTTP and remote HTTPS but rejects remote plaintext and credential-bearing URLs', () => {
+    expect(() => assertSecureHostUrl('http://127.0.0.1:8080')).not.toThrow()
+    expect(() => assertSecureHostUrl('http://localhost:8080')).not.toThrow()
+    expect(() => assertSecureHostUrl('https://dsh.example:8443')).not.toThrow()
+    expect(() => assertSecureHostUrl('http://192.168.1.50:8080')).toThrow(/require HTTPS/)
+    expect(() => assertSecureHostUrl('https://user:secret@dsh.example')).toThrow(/without credentials/)
+    expect(() => assertSecureHostUrl('https://dsh.example/api')).toThrow(/without credentials/)
+  })
+
+  it('accepts only an owner-private regular Host token file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-gate-host-token-'))
+    const tokenFile = join(root, 'auth.token')
+    const tokenLink = join(root, 'auth-link.token')
+    await writeFile(tokenFile, `${'t'.repeat(43)}\n`)
+    await chmod(tokenFile, 0o644)
+    expect(() => GatewayManager.fromEnvironment({
+      DSH_HOST_URL: 'http://127.0.0.1:18080', DSH_HOST_TOKEN_FILE: tokenFile,
+    })).toThrow(/owner|0600|unsafe/)
+
+    await chmod(tokenFile, 0o600)
+    const manager = GatewayManager.fromEnvironment({
+      DSH_HOST_URL: 'http://127.0.0.1:18080', DSH_HOST_TOKEN_FILE: tokenFile,
+    })
+    manager.stopClients()
+
+    await symlink(tokenFile, tokenLink)
+    expect(() => GatewayManager.fromEnvironment({
+      DSH_HOST_URL: 'http://127.0.0.1:18080', DSH_HOST_TOKEN_FILE: tokenLink,
+    })).toThrow(/regular file|symlink|unsafe/)
+  })
+
   it('requires an absolute existing directory and resolves symlinks', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-gate-session-cwd-'))
     const project = join(root, 'project')
@@ -166,6 +214,7 @@ describe('session cwd validation', () => {
     const connection = {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
       api: {
         sessions: {
           create: async (input: { cwd: string; agentPreset: string }) => {
@@ -177,7 +226,7 @@ describe('session cwd validation', () => {
       },
       refreshSession: async () => ({ cwd: '/canonical/project', agentPreset: 'standard' }),
     } as unknown as HostConnection
-    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+    const manager = new GatewayManager({ hostUrls: ['http://host'], hostToken: 't'.repeat(32), runJournal: false }, {
       createConnection: () => connection,
       resolveSessionCwd: async cwd => cwd === '/alias/project' ? '/canonical/project' : cwd,
     })
@@ -185,6 +234,7 @@ describe('session cwd validation', () => {
     await expect(manager.startOrConnect({})).rejects.toThrow(/cwd is required/)
     await expect(manager.startOrConnect({ cwd: '/alias/project' })).resolves.toMatchObject({
       sessionId: 's-new', cwd: '/canonical/project', agentPreset: 'standard',
+      browserUrl: `http://host#dsh_token=${'t'.repeat(32)}`,
     })
     expect(createdCwd).toBe('/canonical/project')
     expect(createdPreset).toBe('standard')
@@ -195,6 +245,7 @@ describe('session cwd validation', () => {
     const connection = {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
       api: { sessions: { create: async (input: { agentPreset: string }) => {
         createdPreset = input.agentPreset
         return { result: { ok: true, value: { sessionId: 's-ptc' } } }
@@ -216,6 +267,7 @@ describe('session cwd validation', () => {
     const connection = {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
     } as unknown as HostConnection
     const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
       createConnection: () => connection,
@@ -232,6 +284,7 @@ describe('session cwd validation', () => {
     const connection = {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
       sessionExists: async () => true,
       refreshSession: async () => ({ cwd: '/existing/project', agentPreset: 'standard' }),
     } as unknown as HostConnection
@@ -249,6 +302,7 @@ describe('session cwd validation', () => {
     const connection = {
       baseUrl: 'http://host',
       ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
       sessionExists: async () => true,
       refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
     } as unknown as HostConnection
@@ -544,6 +598,15 @@ describe('Web-visible task identity', () => {
       completionToken: '22222222-2222-4222-8222-222222222222',
       objective: 'continue after restart',
       writerMode: 'writer',
+      executionBrief: {
+        schemaVersion: 1,
+        source: 'CODEX_COMPILED',
+        workstreams: [{
+          id: 'RECOVER', outcome: 'Reconcile the interrupted edit', delegation: 'root',
+          doneWhen: ['The uncertain edit is reconciled before any retry.'],
+        }],
+        integration: ['Run focused verification and publish the authoritative handoff.'],
+      },
       baseline: { head: 'abc123', statusSummary: 'M user-change.ts' },
     }
     api.addRow('s1', { cwd: '/work/tree', events: [
@@ -575,6 +638,17 @@ describe('Web-visible task identity', () => {
       recoveryCapsule: recovered.recoveryCapsule,
     })).rejects.toThrow(/does not match continuation parentRunId/)
 
+    await expect(manager.task({
+      sessionId: 's1',
+      objective: 'resume from the durable recovery evidence',
+      parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+      executionBrief: {
+        workstreams: [{ id: 'DIFFERENT', outcome: 'Change the recovery plan', delegation: 'root', doneWhen: ['Changed.'] }],
+        integration: ['Use a different integration plan.'],
+      },
+    })).rejects.toThrow(/must match the interrupted parent run/)
+
     const continuation = await manager.task({
       sessionId: 's1',
       objective: 'resume from the durable recovery evidence',
@@ -590,8 +664,51 @@ describe('Web-visible task identity', () => {
         parentRunId: interruptedRunId,
         uncertainEffects: { total: 1 },
       },
+      executionBrief: {
+        source: 'CODEX_COMPILED',
+        workstreams: [{ id: 'RECOVER' }],
+      },
     })
     expect(JSON.stringify(packet)).not.toContain('private content')
+  })
+
+  it('requires manual reconciliation when the uncertain-effect ledger is truncated', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const interruptedPacket = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'recover without omitting side effects',
+      writerMode: 'writer',
+    }
+    const uncertainCalls = Array.from({ length: 21 }, (_, index) => event('tool/call', index + 2, {
+      turn: 1, step: index + 1, callId: `uncertain-${String(index)}`, name: 'bash', arguments: '{}',
+    }))
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      ...uncertainCalls,
+      event('turn/end', 23, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+    expect(recovered).toMatchObject({
+      status: 'ESCALATION_REQUIRED',
+      stage: 'recovery-effects-truncated',
+      recoveryCapsule: { uncertainEffects: { total: 21, truncated: true } },
+    })
+    expect(recovered).not.toHaveProperty('recovery')
+    if (recovered.recoveryCapsule === undefined) throw new Error('expected diagnostic recovery capsule')
+    await expect(manager.task({
+      sessionId: 's1', objective: 'unsafe automatic retry', parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+    })).rejects.toThrow(/cannot be continued automatically/)
+    expect(api.promptCalls).toBe(0)
   })
 
   it('requires the exact Host-recomputed capsule for every continuation', async () => {
@@ -845,11 +962,76 @@ describe('Web-visible task identity', () => {
 
     expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
       schemaVersion: 2,
+      instructionProfile: 'engineering-v1',
+      executionBrief: { source: 'SINGLE_STREAM_FALLBACK', workstreams: [{ id: 'W1' }] },
       sessionId: 's1',
       runId: result.runId,
       objective,
     })
     expect(JSON.stringify(api.rows.get('s1')?.events)).toContain('/dsh-supervised-worker')
+  })
+
+  it('durably carries one bounded Codex workstream graph and reports its compact receipt', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+
+    const result = await manager.task({
+      sessionId: 's1', objective: 'Harden authentication', writerMode: 'read_only',
+      executionBrief: {
+        workstreams: [
+          { id: 'AUTH', outcome: 'Inspect token lifecycle', delegation: 'child_candidate', doneWhen: ['Token behavior is documented.'] },
+          { id: 'RECOVERY', outcome: 'Verify reconnect', dependsOn: ['AUTH'], delegation: 'root', doneWhen: ['Reconnect evidence is recorded.'] },
+        ],
+        integration: ['Root reconciles the evidence and publishes one final handoff.'],
+      },
+    })
+
+    expect(result).toMatchObject({
+      executionBrief: { source: 'CODEX_COMPILED', workstreamCount: 2, workstreamIds: ['AUTH', 'RECOVERY'] },
+    })
+    expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
+      executionBrief: {
+        schemaVersion: 1, source: 'CODEX_COMPILED',
+        workstreams: [{ id: 'AUTH' }, { id: 'RECOVERY', dependsOn: ['AUTH'] }],
+      },
+    })
+  })
+
+  it('returns the exact admission boundary separately so the first wait cannot skip early work', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const admit = api.admitTask.bind(api)
+    api.admitTask = async (request) => {
+      const receipt = await admit(request)
+      const row = api.rows.get(request.sessionId)
+      if (row === undefined) throw new Error('missing admitted session')
+      row.events = [
+        ...row.events,
+        event('turn/start', receipt.asOfSeq + 1, { turn: 1 }),
+        toolCall(receipt.asOfSeq + 2, 'early-read', 'read', { file_path: 'src/early.ts' }),
+        toolResult(receipt.asOfSeq + 3, 'early-read'),
+        event('step/end', receipt.asOfSeq + 4, { turn: 1, step: 1 }),
+      ]
+      return receipt
+    }
+    const manager = managerWith(api, sameDomain)
+
+    const task = await manager.task({ sessionId: 's1', objective: 'observe early work', writerMode: 'read_only' })
+    expect(task).toMatchObject({
+      admissionBoundarySeq: expect.any(Number),
+      initialWaitAfterAsOfSeq: expect.any(Number),
+      observedAsOfSeq: expect.any(Number),
+    })
+    expect(task.initialWaitAfterAsOfSeq).toBe(task.admissionBoundarySeq)
+    expect(task.observedAsOfSeq as number).toBeGreaterThan(task.initialWaitAfterAsOfSeq as number)
+
+    await expect(manager.wait({
+      sessionId: 's1', runId: task.runId as string,
+      afterAsOfSeq: task.initialWaitAfterAsOfSeq as number, timeoutMs: 0,
+    })).resolves.toMatchObject({
+      progress: { steps: { delta: 1 }, tools: { deltaCalls: 1 } },
+    })
   })
 
   it('rejects a stale wait instead of observing a newer run in the same session', async () => {
@@ -924,6 +1106,7 @@ describe('multi-Host reconnect', () => {
     const reachable = {
       baseUrl: 'http://host-two',
       ensureConnected: async () => ({ protocolVersion: 1 }),
+      ensureGateReady: gateReady,
       sessionExists: async () => false,
     } as unknown as HostConnection
     const manager = new GatewayManager({
@@ -1040,6 +1223,7 @@ describe('Host launch coalescing', () => {
         await hostMayBecomeReady
         return { protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }
       },
+      ensureGateReady: gateReady,
       api: {
         sessions: {
           create: async () => ({ result: { ok: true, value: { sessionId: `s-${++nextSession}` } } }),
@@ -1286,6 +1470,31 @@ describe('wait cadence', () => {
     await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
       status: 'COMPLETED',
       summary: 'root integrated child result',
+    })
+  })
+
+  it('compares child settlement with the accepted handoff rather than a later root turn end', async () => {
+    const api = new FakeApi()
+    const rootEvents = s1V2CompletedEvents().map((entry) => {
+      if (entry.type === 'tool/call') return { ...entry, time: 13 }
+      if (entry.type === 'tool/result') return { ...entry, time: 14 }
+      if (entry.type === 'turn/end') return { ...entry, time: 16 }
+      return entry
+    })
+    api.addRow('s1', { cwd: '/work', events: rootEvents })
+    api.addChild('s1', 'child-1', {
+      running: false,
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+        { ...event('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }), time: 15 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING',
+      stage: 'root-rehandoff-required',
     })
   })
 

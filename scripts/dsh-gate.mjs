@@ -7,6 +7,7 @@
 // environment or credentials.
 
 import { spawn, spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { lstat, mkdir, readFile, readlink, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -30,6 +31,7 @@ import {
   probePid,
   hostStartPidDecision,
   describeHost,
+  checkGatePlugin,
   DSH_FORK_URL,
   DSH_FORK_BRANCH,
   SUPERVISOR_PROFILE,
@@ -139,7 +141,7 @@ async function writeInstallMetadata(paths, steps, gateSha, pnpm) {
     forkUrl: DSH_FORK_URL,
     pinnedCommit: DSH_PINNED_COMMIT,
     pinnedBranch: DSH_FORK_BRANCH,
-    paths: { dshRepo: paths.dshRepo, dshHome: paths.dshHome },
+    paths: { dshRepo: paths.dshRepo, dshHome: paths.dshHome, hostTokenFile: paths.hostTokenFile },
     versions: {
       node: process.version,
       pnpm: pnpm.version,
@@ -153,6 +155,39 @@ async function writeInstallMetadata(paths, steps, gateSha, pnpm) {
   await io.writeJson(tmp, metadata)
   await io.rename(tmp, paths.installJson)
   return metadata
+}
+
+async function readHostToken(paths) {
+  let metadata
+  try {
+    metadata = await io.lstat(paths.hostTokenFile)
+  } catch {
+    throw new Error(`missing Host credential at ${paths.hostTokenFile} — run 'pnpm bootstrap' first`)
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`unsafe Host credential path at ${paths.hostTokenFile}; expected a regular file, not a symlink`)
+  }
+  if ((metadata.mode & 0o077) !== 0) {
+    throw new Error(`unsafe Host credential permissions at ${paths.hostTokenFile}; expected mode 0600`)
+  }
+  const token = (await io.readFile(paths.hostTokenFile).catch(() => '')).trim()
+  if (token.length < 32) {
+    throw new Error(`missing or invalid Host credential at ${paths.hostTokenFile} — run 'pnpm bootstrap' first`)
+  }
+  return token
+}
+
+async function ensureHostToken(paths) {
+  await io.mkdir(paths.hostDir)
+  if (await io.exists(paths.hostTokenFile)) return readHostToken(paths)
+  const created = randomBytes(32).toString('base64url')
+  try {
+    await io.writeFileExclusive(paths.hostTokenFile, `${created}\n`)
+    return created
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error
+    return readHostToken(paths)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +247,9 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
     log('DRY RUN complete.')
     return true
   }
+
+  await ensureHostToken(paths)
+  log(`Host credential: ready at ${paths.hostTokenFile} (mode 0600; value is never printed)`)
 
   // Phases 2..N: install/build/link/plugin, each idempotent and bounded.
   // Seed markers from the previous successful run so skipped phases keep
@@ -291,12 +329,14 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
 }
 
 async function runDoctorCommand({ paths, options }) {
+  const hostToken = options.live ? await readHostToken(paths) : undefined
   const results = await runDoctor({
     paths,
     io,
     live: options.live,
     hostUrl: options.host ?? DEFAULT_HOST_URL,
     readinessSession: options.session,
+    hostToken,
   })
   const summary = summarizeDoctor(results)
   process.stdout.write(`${summary.text}\n`)
@@ -308,13 +348,13 @@ async function runHost({ paths, options, hostAction }) {
   const hostPaths = resolveHostStatePaths(paths, hostUrl)
   const dshBin = hostPaths.dshBin
   const lifecycleCommand = action => `node scripts/dsh-gate.mjs host ${action} --host ${hostPaths.canonicalHostUrl}`
-
   if (hostAction === 'status') {
+    const hostToken = await readHostToken(paths)
     const record = await readHostPidFile(hostPaths, io, hostUrl)
     const state = record === undefined ? 'none' : await probePid(record.pid, io)
     if (record === undefined || state === 'dead') {
       try {
-        const value = await describeHost({ hostUrl, io, timeoutMs: 2000 })
+        const value = await describeHost({ hostUrl, io, timeoutMs: 2000, token: hostToken })
         const owned = record === undefined ? 'no dsh-gate pidfile' : `pidfile pid ${record.pid} is stale`
         log(`${owned}, but a Host is serving ${hostUrl}: hostInstanceId ${value.hostInstanceId}, cwd ${value.cwd} — it is not managed by dsh-gate (stop it yourself)`)
       } catch {
@@ -324,7 +364,7 @@ async function runHost({ paths, options, hostAction }) {
       }
     } else {
       try {
-        const value = await describeHost({ hostUrl, io })
+        const value = await describeHost({ hostUrl, io, token: hostToken })
         const pidNote = state === 'unknown' ? `pid ${record.pid} (unverifiable via ps) ` : `pid ${record.pid} `
         log(`RUNNING ${pidNote}— ${hostUrl} protocolVersion ${value.protocolVersion}, hostInstanceId ${value.hostInstanceId}, version ${value.version}`)
       } catch (error) {
@@ -337,6 +377,10 @@ async function runHost({ paths, options, hostAction }) {
   }
 
   if (hostAction === 'stop') {
+    // A locally owned, command-line-verified pid remains stoppable if the
+    // credential was lost. The token is only needed for the optional port
+    // fallback when process inspection becomes unavailable mid-stop.
+    const hostToken = await readHostToken(paths).catch(() => undefined)
     const record = await readHostPidFile(hostPaths, io, hostUrl)
     if (record === undefined) {
       log('no host pidfile — nothing to stop (a Host started outside dsh-gate is untouched)')
@@ -373,7 +417,7 @@ async function runHost({ paths, options, hostAction }) {
         // ps vanished mid-wait; fall back to the port: the Host is ours (we
         // just SIGTERMed it), so a free port means it exited.
         try {
-          await describeHost({ hostUrl, io, timeoutMs: 1000 })
+          await describeHost({ hostUrl, io, timeoutMs: 1000, token: hostToken })
         } catch {
           await io.rm(record.pidFile, { force: true })
           log('Host stopped (port released)')
@@ -419,6 +463,8 @@ async function runHost({ paths, options, hostAction }) {
     return true
   }
 
+  const hostToken = await readHostToken(paths)
+
   await io.mkdir(hostPaths.hostDir)
   await io.mkdir(hostPaths.logsDir)
   const releaseStartLease = await acquireHostStartLease(hostPaths, io)
@@ -438,7 +484,8 @@ async function runHost({ paths, options, hostAction }) {
       // writer of that file) and report already-running.
       let value
       try {
-        value = await describeHost({ hostUrl, io })
+        value = await describeHost({ hostUrl, io, token: hostToken })
+        await checkGatePlugin({ url: hostUrl, io, token: hostToken })
       } catch {
         // The decision below distinguishes a proven live process from a process
         // whose state cannot be inspected. Neither condition is stale evidence.
@@ -465,7 +512,7 @@ async function runHost({ paths, options, hostAction }) {
     // Refuse to shadow a Host this checkout does not manage: the port is
     // already served (the spawned instance would die with EADDRINUSE).
     try {
-      const foreign = await describeHost({ hostUrl, io, timeoutMs: 2000 })
+      const foreign = await describeHost({ hostUrl, io, timeoutMs: 2000, token: hostToken })
       fail(`a Host is already serving ${hostUrl} (hostInstanceId ${foreign.hostInstanceId}, cwd ${foreign.cwd}) but no dsh-gate pidfile owns it`)
       fail(`stop that Host yourself or start on another port, for example: node scripts/dsh-gate.mjs host start --host http://127.0.0.1:18080`)
       return false
@@ -476,7 +523,7 @@ async function runHost({ paths, options, hostAction }) {
     if (hostAction === 'run') {
       const child = io.spawn(argv[0], argv.slice(1), {
         cwd: hostPaths.root,
-        env: { ...process.env, DSH_HOME: hostPaths.dshHome },
+        env: { ...process.env, DSH_HOME: hostPaths.dshHome, DSH_HOST_TOKEN: hostToken },
         detached: false,
         stdio: 'inherit',
       })
@@ -518,7 +565,8 @@ async function runHost({ paths, options, hostAction }) {
       let earlyExit
       while (Date.now() < deadline && value === undefined && earlyExit === undefined) {
         try {
-          value = await describeHost({ hostUrl, io, timeoutMs: 3000 })
+          value = await describeHost({ hostUrl, io, timeoutMs: 3000, token: hostToken })
+          await checkGatePlugin({ url: hostUrl, io, timeoutMs: 3000, token: hostToken })
         } catch {
           const next = await Promise.race([
             exitPromise.then(result => ({ type: 'exit', result })),
@@ -561,7 +609,7 @@ async function runHost({ paths, options, hostAction }) {
     const logFd = await openAppend(hostPaths.hostLogFile)
     const child = io.spawn(argv[0], argv.slice(1), {
       cwd: hostPaths.root,
-      env: { ...process.env, DSH_HOME: hostPaths.dshHome },
+      env: { ...process.env, DSH_HOME: hostPaths.dshHome, DSH_HOST_TOKEN: hostToken },
       detached: true,
       stdio: ['ignore', logFd, logFd],
     })
@@ -585,13 +633,16 @@ async function runHost({ paths, options, hostAction }) {
     let value
     while (Date.now() < deadline) {
       try {
-        value = await describeHost({ hostUrl, io, timeoutMs: 3000 })
+        value = await describeHost({ hostUrl, io, timeoutMs: 3000, token: hostToken })
+        await checkGatePlugin({ url: hostUrl, io, timeoutMs: 3000, token: hostToken })
         break
       } catch {
         await new Promise(resolvePromise => setTimeout(resolvePromise, 1000))
       }
     }
     if (value === undefined) {
+      if (!child.killed) child.kill('SIGTERM')
+      await io.rm(hostPaths.hostPidFile, { force: true })
       fail(`Host pid ${pid} did not become reachable at ${hostUrl} within 30s; see ${hostPaths.hostLogFile}`)
       return false
     }

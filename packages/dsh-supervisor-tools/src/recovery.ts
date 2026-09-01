@@ -1,7 +1,8 @@
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 
 export const RECOVERY_CAPSULE_MAX_BYTES = 16_384
-export const UNCERTAIN_EFFECTS_LIMIT = 32
+/** Wire-protocol bound; keep aligned with @dsh-gate/mcp-server contracts schema v1. */
+export const UNCERTAIN_EFFECTS_LIMIT = 16
 
 export interface RecoveryEvent {
   type: string

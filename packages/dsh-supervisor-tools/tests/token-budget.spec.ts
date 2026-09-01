@@ -1,8 +1,13 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  FileBudgetReservationLedger,
   installDirectChildAuthorityGuards,
   installTokenBudgetGuards,
   liveTokenBudgetState,
+  MemoryBudgetReservationLedger,
   tokenBudgetStateForRun,
 } from '../src/index.js'
 
@@ -212,7 +217,7 @@ describe('Host token budget fold', () => {
         inspect: async () => ({ meta: child.header, events: child.events }),
       },
     }
-    installTokenBudgetGuards(ctx as never)
+    installTokenBudgetGuards(ctx as never, { reservationLedger: new MemoryBudgetReservationLedger() })
     const decision = await preStep?.({ agent: rootAgent }, async () => ({ kind: 'enter', messages: [] }))
 
     expect(decision).toEqual({ kind: 'reject' })
@@ -248,7 +253,7 @@ describe('Host token budget fold', () => {
         inspect: async () => { throw new Error('not used') },
       },
     }
-    installTokenBudgetGuards(ctx as never)
+    installTokenBudgetGuards(ctx as never, { reservationLedger: new MemoryBudgetReservationLedger() })
 
     sessionEvent?.(child, childUsage)
 
@@ -282,7 +287,7 @@ describe('Host token budget fold', () => {
       next: () => Promise<{ provider: string; model: string }>,
     ) => Promise<{ provider: string; model: string; maxTokens?: number }>) | undefined
     const ctx = {
-      sessions: { list: () => [root] },
+      sessions: { list: () => [root], flush: async () => true },
       agents: { list: () => [agent] },
       tokenMeter: {
         measure: (_session: typeof root, header: unknown) => {
@@ -299,7 +304,10 @@ describe('Host token budget fold', () => {
         inspect: async () => { throw new Error('not used') },
       },
     }
-    installTokenBudgetGuards(ctx as never, { maxReservedOutputTokensPerRequest: 80 })
+    installTokenBudgetGuards(ctx as never, {
+      maxReservedOutputTokensPerRequest: 80,
+      reservationLedger: new MemoryBudgetReservationLedger(),
+    })
     await assemble?.(assembly, { agent }, async () => assembly)
     const config = await request?.(
       { agent, turn: 1, step: 1, signal: new AbortController().signal },
@@ -313,6 +321,92 @@ describe('Host token budget fold', () => {
       tools: assembly.tools,
     })
     expect(cancellations).toEqual([])
+  })
+
+  it('charges an ambiguous crash-durable reservation after Host restart', async () => {
+    const root = {
+      header: { id: 'root' },
+      events: [
+        packetEvent(0, 100),
+        { type: 'step/start', seq: 1, time: 110, data: { turn: 1, step: 1 } },
+      ],
+    }
+    const child = {
+      header: { id: 'child', createdAt: 120, parentSession: 'root' },
+      events: [userMessage(0, 121)],
+    }
+    const rootAgent = { session: root, cancel: () => {} }
+    const childAgent = { session: child, cancel: () => {} }
+    const ledger = new MemoryBudgetReservationLedger()
+    await ledger.reserve({
+      schemaVersion: 1, rootSessionId: 'root', runId, requestSessionId: 'root',
+      turn: 1, step: 1, inputTokens: 20, outputTokens: 100, createdAt: 115,
+    })
+    const assembly = { sections: [], contexts: [], tools: [], variables: {} }
+    let assemble: ((value: typeof assembly, context: { agent: typeof childAgent }, next: () => Promise<typeof assembly>) => Promise<typeof assembly>) | undefined
+    let request: ((payload: { agent: typeof childAgent; turn: number; step: number; signal: AbortSignal }, next: () => Promise<{ provider: string; model: string; maxTokens: number }>) => Promise<{ provider: string; model: string; maxTokens: number }>) | undefined
+    const byId = new Map([['root', root], ['child', child]])
+    const ctx = {
+      sessions: { list: () => [root, child], flush: async () => true },
+      agents: { list: () => [rootAgent, childAgent] },
+      tokenMeter: { measure: () => ({ totalTokens: 20 }) },
+      on(name: string, listener: unknown) {
+        if (name === 'system-prompt/assemble') assemble = listener as typeof assemble
+        if (name === 'agent/request') request = listener as typeof request
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [...byId.values()].map(session => ({ header: session.header, revision: `${session.header.id}-r1` })),
+        inspect: async (id: string) => {
+          const session = byId.get(id)
+          if (session === undefined) throw new Error('missing session')
+          return { meta: session.header, events: session.events }
+        },
+      },
+    }
+    installTokenBudgetGuards(ctx as never, { maxReservedOutputTokensPerRequest: 100, reservationLedger: ledger })
+    await assemble?.(assembly, { agent: childAgent }, async () => assembly)
+
+    await expect(request?.(
+      { agent: childAgent, turn: 1, step: 1, signal: new AbortController().signal },
+      async () => ({ provider: 'deepseek', model: 'flash', maxTokens: 100 }),
+    )).resolves.toMatchObject({ maxTokens: 10 })
+    await expect(ledger.list('root', runId)).resolves.toHaveLength(2)
+  })
+
+  it('reclaims a reservation that never crossed the durable request checkpoint', async () => {
+    const root = { header: { id: 'root' }, events: [packetEvent(0, 100)] }
+    const agent = { session: root, cancel: () => {} }
+    const ledger = new MemoryBudgetReservationLedger()
+    await ledger.reserve({
+      schemaVersion: 1, rootSessionId: 'root', runId, requestSessionId: 'root',
+      turn: 1, step: 1, inputTokens: 20, outputTokens: 100, createdAt: 110,
+    })
+    const assembly = { sections: [], contexts: [], tools: [], variables: {} }
+    let assemble: ((value: typeof assembly, context: { agent: typeof agent }, next: () => Promise<typeof assembly>) => Promise<typeof assembly>) | undefined
+    let request: ((payload: { agent: typeof agent; turn: number; step: number; signal: AbortSignal }, next: () => Promise<{ provider: string; model: string; maxTokens: number }>) => Promise<{ provider: string; model: string; maxTokens: number }>) | undefined
+    const ctx = {
+      sessions: { list: () => [root], flush: async () => true },
+      agents: { list: () => [agent] },
+      tokenMeter: { measure: () => ({ totalTokens: 20 }) },
+      on(name: string, listener: unknown) {
+        if (name === 'system-prompt/assemble') assemble = listener as typeof assemble
+        if (name === 'agent/request') request = listener as typeof request
+      },
+      sessionPersistence: {
+        listSnapshots: async () => [{ header: root.header, revision: 'root-r1' }],
+        inspect: async () => ({ meta: root.header, events: root.events }),
+      },
+    }
+    installTokenBudgetGuards(ctx as never, { maxReservedOutputTokensPerRequest: 100, reservationLedger: ledger })
+    await assemble?.(assembly, { agent }, async () => assembly)
+
+    await expect(request?.(
+      { agent, turn: 2, step: 1, signal: new AbortController().signal },
+      async () => ({ provider: 'deepseek', model: 'flash', maxTokens: 100 }),
+    )).resolves.toMatchObject({ maxTokens: 100 })
+    const records = await ledger.list('root', runId)
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({ turn: 2, step: 1 })
   })
 
   it('waits for an in-flight tree reservation instead of overselling or cancelling it', async () => {
@@ -339,7 +433,7 @@ describe('Host token budget fold', () => {
     ) => Promise<{ provider: string; model: string; maxTokens: number }>) | undefined
     let sessionEvent: ((session: typeof root, event: ReturnType<typeof usage>) => void) | undefined
     const ctx = {
-      sessions: { list: () => [root, child] },
+      sessions: { list: () => [root, child], flush: async () => true },
       agents: { list: () => [rootAgent, childAgent] },
       tokenMeter: { measure: () => ({ totalTokens: 20 }) },
       on(name: string, listener: unknown) {
@@ -352,7 +446,10 @@ describe('Host token budget fold', () => {
         inspect: async () => { throw new Error('not used') },
       },
     }
-    installTokenBudgetGuards(ctx as never, { maxReservedOutputTokensPerRequest: 100 })
+    installTokenBudgetGuards(ctx as never, {
+      maxReservedOutputTokensPerRequest: 100,
+      reservationLedger: new MemoryBudgetReservationLedger(),
+    })
     await assemble?.(assembly, { agent: rootAgent }, async () => assembly)
     await assemble?.(assembly, { agent: childAgent }, async () => assembly)
     const signal = new AbortController().signal
@@ -373,6 +470,28 @@ describe('Host token budget fold', () => {
 
     await expect(secondPromise).resolves.toMatchObject({ maxTokens: 90 })
     expect(cancelled.size).toBe(0)
+  })
+})
+
+describe('durable token reservation ledger', () => {
+  it('persists idempotent per-request records and rejects conflicting reuse', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-gate-reservations-'))
+    try {
+      const ledger = new FileBudgetReservationLedger(directory)
+      const reservation = {
+        schemaVersion: 1 as const, rootSessionId: 'root', runId, requestSessionId: 'child',
+        turn: 2, step: 1, inputTokens: 30, outputTokens: 70, createdAt: 123,
+      }
+      await ledger.reserve(reservation)
+      await ledger.reserve({ ...reservation, createdAt: 456 })
+      await expect(ledger.list('root', runId)).resolves.toEqual([reservation])
+      await expect(ledger.reserve({ ...reservation, outputTokens: 71 }))
+        .rejects.toThrow('conflicting durable token reservation identity')
+      await ledger.settle(reservation)
+      await expect(ledger.list('root', runId)).resolves.toEqual([])
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })
 

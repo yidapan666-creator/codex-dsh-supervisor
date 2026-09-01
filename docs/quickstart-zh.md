@@ -21,6 +21,33 @@ Minimal 没有经过严格只读边界认证；Creator 拥有修改 DSH runtime 
 
 > 用 DSH 在 `/绝对路径/项目目录` 完成登录接口的超时修复。先复现，再修改并跑相关测试。允许最多 3 个直接子 agent；任务 token 上限 60000。每五分钟给我一次聚合进度，打开 DSH Web 让我能看到会话。
 
+也可以只说：
+
+> 用 DSH 在 `/绝对路径/项目目录` 修复登录接口超时。
+
+网关会用不调用模型的 `engineering-v1` 编译器补齐常规工程约束、验收、先聚焦后全量的验证、仅在重大问题时升级、writer 的工作区范围，以及默认最多 5 个直接子 agent。你明确写出的范围、验证、预算或子 agent 上限永远优先；设为 0 就完全禁用子 agent。
+
+## Codex 怎样高效拆分后交给 DSH
+
+对于包含多个结果的需求，Codex 会在当前理解请求的同一次推理里生成一个有界 `executionBrief`，不会额外调用一次规划模型，也不会给同一 working tree 启动多个互相竞争的 Root。拆分遵循以下规则：
+
+- 提取真正的交付结果，不按原句顺序机械切段；
+- 把共享文件、状态或公共接口的工作放进同一个 workstream；
+- 最多生成 5 个 workstream，只记录真实依赖；
+- 独立调查、Review、测试或局部实现标为 `child_candidate`；公共接口、交叉整合和最终验证留给 Root；
+- 每项都带可验证的 `doneWhen`，但不复制聊天记录、推理、日志、diff 或工具输出。
+
+例如“修复登录、token 刷新、断连恢复和并发请求”会被压缩成类似：
+
+```text
+AUTH       token 生命周期与聚焦测试             child_candidate
+RECOVERY   断连后复用同一 Host/session          dependsOn: AUTH
+RACE       并发刷新和失败回滚                    child_candidate
+Root       统一接口、解决交叉修改、完整验证与 handoff
+```
+
+这四项作为一个 durable task packet 一次性交给一个 DSH Root。Root 再根据成本和依赖决定是否真的开子 agent；`scopeHints` 只是规划提示，真正的写入权限仍由 `allowedScope` 强制限定。任务确实只有一项时，Codex 可以省略该结构，网关会明确记录 `SINGLE_STREAM_FALLBACK`，不会假装做过语义拆分。
+
 没有指定模式时，Codex 会选择 Standard。开始时 Codex 应明确告诉你：
 
 - 新建还是复用哪个 DSH Root；
@@ -76,7 +103,7 @@ MCP 退出不会顺带停止独立运行的 DSH Host。若 Host 本身重启并�
 ## Codex 实际执行的链路
 
 1. 记录 Git 基线，决定新建或复用 Root，并选择 Standard/PTC。
-2. 调用 `dsh_start_or_connect`，打开返回的 DSH Web。
+2. 调用 `dsh_start_or_connect`，用返回的 `browserUrl` 打开已鉴权的 DSH Web；该 URL fragment 是本机凭据，不写日志、不分享，也不能当成 `hostBaseUrl` 回传。
 3. 调用 `dsh_task`，记录唯一的 `sessionId + runId`。
 4. 使用 `dsh_wait` 每五分钟取得一次聚合观察；必要时处理明确的交互或恢复。
 5. 只在严格完成条件成立后汇报完成，并给出步骤、工具、token、文件和验证总结。

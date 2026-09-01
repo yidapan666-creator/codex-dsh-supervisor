@@ -70,10 +70,25 @@ export async function admitArtifact(
 
   const handle = await open(resolvedTarget, READ_FLAGS)
   try {
-    const entry = await handle.stat()
+    const entry = await handle.stat({ bigint: true })
     if (!entry.isFile()) throw new Error(`artifact must be a regular file: ${artifactPath}`)
-    if (entry.nlink !== 1) throw new Error(`artifact must not be hard-linked: ${artifactPath}`)
-    if (entry.size > maxBytes) throw new Error(`artifact exceeds ${maxBytes} bytes: ${artifactPath}`)
+    if (entry.nlink !== 1n) throw new Error(`artifact must not be hard-linked: ${artifactPath}`)
+    if (entry.size > BigInt(maxBytes)) throw new Error(`artifact exceeds ${maxBytes} bytes: ${artifactPath}`)
+
+    // Re-resolve after open and prove that the path now names the exact inode
+    // held by the fd. This closes the intermediate-directory swap window that
+    // O_NOFOLLOW alone cannot cover: either the post-open realpath escapes, or
+    // its dev/ino differs from the already-open file and admission fails.
+    const stableTarget = await realpath(lexicalTarget)
+    if (!isContained(workspace, stableTarget)) {
+      throw new Error(`artifact resolves outside the session cwd: ${artifactPath}`)
+    }
+    const stableEntry = await lstat(stableTarget, { bigint: true })
+    if (stableEntry.isSymbolicLink() || !stableEntry.isFile()
+      || stableEntry.dev !== entry.dev || stableEntry.ino !== entry.ino) {
+      throw new Error(`artifact path changed during admission: ${artifactPath}`)
+    }
+    if (stableEntry.nlink !== 1n) throw new Error(`artifact must not be hard-linked: ${artifactPath}`)
 
     const hash = createHash('sha256')
     const buffer = Buffer.alloc(READ_CHUNK_BYTES)
@@ -86,7 +101,7 @@ export async function admitArtifact(
       hash.update(buffer.subarray(0, bytesRead))
     }
     return {
-      path: relative(workspace, resolvedTarget),
+      path: relative(workspace, stableTarget),
       bytes,
       sha256: hash.digest('hex'),
     }

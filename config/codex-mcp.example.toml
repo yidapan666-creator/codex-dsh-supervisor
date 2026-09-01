@@ -23,6 +23,7 @@ approval_mode = "prompt"
 
 [mcp_servers.dsh_gate.env]
 DSH_HOST_URL = "http://127.0.0.1:8080"
+DSH_HOST_TOKEN_FILE = "<workspace-root>/.dsh-state/host/auth.token"
 DSH_WORKER_PROVIDER = "deepseek-official"
 DSH_WORKER_MODEL = "deepseek-v4-flash"
 DSH_WORKER_REASONING_EFFORT = "high"

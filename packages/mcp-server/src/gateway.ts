@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstat, realpath, stat } from 'node:fs/promises'
-import { readFileSync, readdirSync } from 'node:fs'
+import { lstatSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
@@ -16,14 +16,17 @@ import {
   FileRunJournal, isRunRecordOutcome, runRecordId, type RunJournal, type RunRecord,
 } from '@dsh-gate/run-journal'
 import {
-  HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
+  authenticatedHostConnection, HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
 import {
-  FAILURE_MESSAGE_LIMIT, TASK_PACKET_END, TASK_PACKET_START, recoveryCapsuleSchema, taskPacketSchema,
+  FAILURE_MESSAGE_LIMIT, recoveryCapsuleSchema, taskPacketV2Schema,
   telemetrySessionStatsSchema, telemetryTokenUsageSchema,
-  type DshEvent, type Observation, type RecoveryCapsule, type TaskRuntimeState,
+  type DshEvent, type ExecutionBrief, type ExecutionBriefInput, type Observation, type RecoveryCapsule, type TaskRuntimeState,
 } from './contracts.js'
 import { UsageMonitorClient } from './usage-monitor.js'
+import {
+  compileTaskPrompt, normalizeExecutionBrief, normalizeTaskInstructions, TASK_INSTRUCTION_PROFILE,
+} from './task-prompt.js'
 
 interface SessionAddress {
   sessionId?: string | undefined
@@ -47,6 +50,37 @@ function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; err
 
 function normalizedUrl(value: string): string {
   return new URL(value).origin
+}
+
+function loopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  return normalized === 'localhost' || normalized === '::1' || normalized.startsWith('127.')
+}
+
+/** Refuse credential/path-bearing endpoints and remote plaintext transport. */
+export function assertSecureHostUrl(value: string): void {
+  const url = new URL(value)
+  if (url.username !== '' || url.password !== '' || (url.pathname !== '' && url.pathname !== '/')
+    || url.search !== '' || url.hash !== '') {
+    throw new Error('DSH Host URL must be an origin without credentials, path, query, or fragment')
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('DSH Host URL must use http or https')
+  }
+  if (url.protocol === 'http:' && !loopbackHostname(url.hostname)) {
+    throw new Error('non-loopback DSH Host URLs require HTTPS')
+  }
+}
+
+function readPrivateHostTokenFile(path: string): string {
+  const metadata = lstatSync(path)
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error('DSH Host token path must be a regular file, not a symlink')
+  }
+  if ((metadata.mode & 0o077) !== 0) {
+    throw new Error('DSH Host token file must not be accessible by group or other users (expected mode 0600)')
+  }
+  return readFileSync(path, 'utf8').trim()
 }
 
 function positiveIntegerEnvironment(env: NodeJS.ProcessEnv, name: string): number | undefined {
@@ -227,6 +261,8 @@ function affiliatedChildActivation(
 
 export interface GatewayConfig {
   hostUrls: string[]
+  hostToken?: string
+  enforceTransportSecurity?: boolean
   launch?: HostLaunchConfig
   defaultProvider?: string
   defaultModel?: string
@@ -240,6 +276,7 @@ export interface GatewayConfig {
 }
 
 export const DEFAULT_RUN_JOURNAL_DIR = fileURLToPath(new URL('../../../.dsh-state/memory/runs/', import.meta.url))
+export const DEFAULT_HOST_TOKEN_FILE = fileURLToPath(new URL('../../../.dsh-state/host/auth.token', import.meta.url))
 export const DEFAULT_DECISION_POLICY_DIR = fileURLToPath(new URL('../../../config/decision-policies/', import.meta.url))
 export const DEFAULT_DECISION_POLICY_FILE = join(DEFAULT_DECISION_POLICY_DIR, '2026-08-26.v1.json')
 
@@ -298,8 +335,16 @@ export class GatewayManager {
   private launchPromise: Promise<void> | undefined
 
   constructor(private readonly config: GatewayConfig, deps: GatewayDependencies = {}) {
+    if (config.enforceTransportSecurity === true) {
+      if (config.hostToken === undefined || config.hostToken.length < 32) {
+        throw new Error('DSH Host authentication requires a token with at least 32 characters')
+      }
+      for (const url of config.hostUrls) assertSecureHostUrl(url)
+    }
     this.knownUrls = [...new Set(config.hostUrls.map(normalizedUrl))]
-    this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
+    this.createConnection = deps.createConnection ?? (baseUrl => config.hostToken === undefined
+      ? new HostConnection(baseUrl)
+      : authenticatedHostConnection(baseUrl, config.hostToken))
     this.launchHost = deps.launchHost ?? launchDetachedHost
     this.resolveCwd = deps.resolveSessionCwd ?? resolveSessionCwd
     this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
@@ -325,6 +370,15 @@ export class GatewayManager {
     if (!Array.isArray(urls) || !urls.every(url => typeof url === 'string')) {
       throw new Error('DSH_HOST_URLS must be a JSON string array')
     }
+    const tokenFile = env.DSH_HOST_TOKEN_FILE ?? DEFAULT_HOST_TOKEN_FILE
+    let hostToken = env.DSH_HOST_TOKEN?.trim()
+    if (hostToken === undefined || hostToken.length === 0) {
+      try {
+        hostToken = readPrivateHostTokenFile(tokenFile)
+      } catch (error) {
+        throw new Error(`DSH Host token is unavailable or unsafe at ${tokenFile}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
     const policyDirectory = env.DSH_DECISION_POLICY_DIR ?? DEFAULT_DECISION_POLICY_DIR
     const catalog = readDecisionPolicyCatalog(policyDirectory)
     const filePolicy = readDecisionPolicy(env.DSH_DECISION_POLICY_FILE ?? DEFAULT_DECISION_POLICY_FILE)
@@ -344,6 +398,8 @@ export class GatewayManager {
     }
     return new GatewayManager({
       hostUrls: urls,
+      hostToken,
+      enforceTransportSecurity: true,
       ...env.DSH_HOST_LAUNCH === undefined ? {} : { launch: parseLaunchConfig(env.DSH_HOST_LAUNCH) as HostLaunchConfig },
       defaultProvider: env.DSH_WORKER_PROVIDER ?? 'deepseek-official',
       defaultModel: env.DSH_WORKER_MODEL ?? 'deepseek-v4-flash',
@@ -390,6 +446,7 @@ export class GatewayManager {
 
   connection(url = this.knownUrls[0]): HostConnection {
     if (url === undefined) throw new Error('no DSH Host URL configured')
+    if (this.config.enforceTransportSecurity === true) assertSecureHostUrl(url)
     const baseUrl = normalizedUrl(url)
     const existing = this.connections.get(baseUrl)
     if (existing !== undefined) return existing
@@ -439,6 +496,7 @@ export class GatewayManager {
         description = await connection.ensureConnected(15_000)
       }
     }
+    const gateDescription = await connection.ensureGateReady()
     let sessionId = input.sessionId
     if (sessionId === undefined) {
       if (requestedCwd === undefined) throw new Error('validated cwd is unavailable for new DSH session')
@@ -468,9 +526,16 @@ export class GatewayManager {
     return {
       schemaVersion: 1,
       hostBaseUrl: connection.baseUrl,
+      ...this.config.hostToken === undefined ? {} : {
+        browserUrl: `${connection.baseUrl}#dsh_token=${encodeURIComponent(this.config.hostToken)}`,
+      },
       hostInstanceId: description.hostInstanceId,
       hostVersion: description.version,
       protocolVersion: description.protocolVersion,
+      gateProtocolVersion: gateDescription.gateProtocolVersion,
+      gatePluginVersion: gateDescription.pluginVersion,
+      gateBuildId: gateDescription.buildId,
+      gateCapabilities: gateDescription.capabilities,
       sessionId,
       // Compatibility alias for v1 callers. New control calls use sessionId + runId.
       taskId: sessionId,
@@ -490,6 +555,7 @@ export class GatewayManager {
       const bound = this.connection(boundUrl)
       try {
         await bound.ensureConnected()
+        await bound.ensureGateReady()
         if (await bound.sessionExists(taskId)) return bound
         this.sessionHosts.delete(taskId)
       } catch {
@@ -504,6 +570,7 @@ export class GatewayManager {
       const connection = this.connection(url)
       try {
         await connection.ensureConnected()
+        await connection.ensureGateReady()
         reachable++
         if (await connection.sessionExists(taskId)) {
           this.sessionHosts.set(taskId, connection.baseUrl)
@@ -540,6 +607,7 @@ export class GatewayManager {
     model?: string | undefined
     reasoningEffort?: string | undefined
     context?: string | undefined
+    executionBrief?: ExecutionBriefInput | undefined
     allowedScope?: string[] | undefined
     constraints?: string[] | undefined
     acceptanceCriteria?: string[] | undefined
@@ -568,6 +636,9 @@ export class GatewayManager {
     const recoveryCapsule = input.recoveryCapsule === undefined
       ? undefined
       : recoveryCapsuleSchema.parse(input.recoveryCapsule)
+    if (recoveryCapsule?.uncertainEffects.truncated === true) {
+      throw new Error('truncated recoveryCapsule cannot be continued automatically; manually reconcile the omitted uncertain effects')
+    }
     if (input.parentRunId !== undefined && recoveryCapsule === undefined) {
       throw new Error('parentRunId requires the exact recoveryCapsule returned by dsh_recover')
     }
@@ -580,6 +651,32 @@ export class GatewayManager {
     const budget = input.tokenBudget ?? (this.config.defaultTaskTokenBudget === undefined
       ? undefined
       : { maxTokens: this.config.defaultTaskTokenBudget })
+    const instructions = normalizeTaskInstructions({
+      writerMode,
+      allowedScope: input.allowedScope,
+      constraints: input.constraints,
+      acceptanceCriteria: input.acceptanceCriteria,
+      verification: input.verification,
+      escalationConditions: input.escalationConditions,
+      authority: input.authority,
+    })
+    const proposedExecutionBrief = normalizeExecutionBrief(input.objective, input.executionBrief)
+    let executionBrief: ExecutionBrief = proposedExecutionBrief
+    if (input.parentRunId !== undefined) {
+      const parentEntry = taskPacketEntries(snapshot.events).find(({ packet }) =>
+        packet.schemaVersion === 2 && packet.runId === input.parentRunId)
+      // Do not replace the authoritative recovery error for a stale or
+      // cross-session parent. Host admission validates that case below.
+      if (parentEntry?.packet.schemaVersion === 2) {
+        const parentBrief = parentEntry.packet.executionBrief
+          ?? normalizeExecutionBrief(parentEntry.packet.objective)
+        if (input.executionBrief !== undefined
+          && JSON.stringify(proposedExecutionBrief) !== JSON.stringify(parentBrief)) {
+          throw new Error('continuation executionBrief must match the interrupted parent run')
+        }
+        executionBrief = parentBrief
+      }
+    }
     const requestDigest = createHash('sha256').update(JSON.stringify({
       sessionId,
       objective: input.objective,
@@ -588,15 +685,19 @@ export class GatewayManager {
       model: input.model,
       reasoningEffort: input.reasoningEffort,
       context: input.context,
-      allowedScope: input.allowedScope,
-      constraints: input.constraints,
-      acceptanceCriteria: input.acceptanceCriteria,
-      verification: input.verification,
-      escalationConditions: input.escalationConditions,
+      // Preserve the pre-executionBrief digest for omitted/atomic calls so an
+      // ambiguous admission made before this upgrade remains reconcilable.
+      executionBrief: input.executionBrief === undefined ? undefined : executionBrief,
+      allowedScope: instructions.allowedScope,
+      constraints: instructions.constraints,
+      acceptanceCriteria: instructions.acceptanceCriteria,
+      verification: instructions.verification,
+      escalationConditions: instructions.escalationConditions,
       parentRunId: input.parentRunId,
       recoveryCapsule,
       baseline: input.baseline,
-      authority: input.authority,
+      authority: instructions.authority,
+      instructionProfile: TASK_INSTRUCTION_PROFILE,
       budget,
     })).digest('hex')
 
@@ -630,13 +731,15 @@ export class GatewayManager {
     }
 
     const runId = randomUUID()
-    const packet = taskPacketSchema.parse({
+    const packet = taskPacketV2Schema.parse({
       schemaVersion: 2,
+      instructionProfile: TASK_INSTRUCTION_PROFILE,
       sessionId,
       runId,
       completionToken: randomUUID(),
       objective: input.objective,
       writerMode,
+      executionBrief,
       requestId,
       requestDigest,
       ...budget === undefined ? {} : { budget },
@@ -655,23 +758,17 @@ export class GatewayManager {
       ...recoveryCapsule === undefined ? {} : { recoveryCapsule },
       ...input.baseline === undefined ? {} : { baseline: input.baseline },
       ...input.context === undefined ? {} : { context: input.context },
-      ...input.allowedScope === undefined ? {} : { allowedScope: input.allowedScope },
-      ...input.constraints === undefined ? {} : { constraints: input.constraints },
-      ...input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria },
-      ...input.verification === undefined ? {} : { verification: input.verification },
-      ...input.escalationConditions === undefined ? {} : { escalationConditions: input.escalationConditions },
-      ...input.authority === undefined ? {} : { authority: input.authority },
+      ...instructions.allowedScope === undefined ? {} : { allowedScope: instructions.allowedScope },
+      constraints: instructions.constraints,
+      acceptanceCriteria: instructions.acceptanceCriteria,
+      verification: instructions.verification,
+      escalationConditions: instructions.escalationConditions,
+      authority: instructions.authority,
     })
     // Put the human objective first so DSH Web gives the session a meaningful
     // title instead of "<dsh-supervised-task>…". The durable packet remains in
     // the same message and parseTaskPacket deliberately accepts it anywhere.
-    const prompt = `${input.objective}\n\n/dsh-supervised-worker\n\n`
-      + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
-      + 'The DSH supervised-worker skill above is mandatory. Only a successful supervisor_handoff with the matching sessionId, '
-      + 'runId, and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
-      + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature. '
-      + (recoveryCapsule === undefined ? '' : 'This continuation carries a runtime-generated recoveryCapsule. Reconcile every uncertain effect before retrying it; never blindly replay an unresolved tool call. ')
-      + 'The DSH Host enforces any task token budget even when the external supervisor is disconnected.'
+    const prompt = compileTaskPrompt(packet)
     const admit = async (): Promise<Record<string, unknown>> => {
       const receipt = await connection.admitTask({
         schemaVersion: 1,
@@ -685,6 +782,7 @@ export class GatewayManager {
         modelSelection,
       })
       const refreshed = await connection.refreshSession(sessionId)
+      const observedAsOfSeq = Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1)
       return {
         schemaVersion: 1,
         hostInstanceId: refreshed.hostInstanceId,
@@ -695,9 +793,19 @@ export class GatewayManager {
         objective: input.objective,
         writerMode,
         agentPreset,
+        instructionProfile: TASK_INSTRUCTION_PROFILE,
+        executionBrief: {
+          source: executionBrief.source,
+          workstreamCount: executionBrief.workstreams.length,
+          workstreamIds: executionBrief.workstreams.map(stream => stream.id),
+        },
         accepted: true,
         reconciled: receipt.reconciled,
-        asOfSeq: Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1),
+        admissionBoundarySeq: receipt.admissionBoundarySeq,
+        initialWaitAfterAsOfSeq: receipt.admissionBoundarySeq,
+        observedAsOfSeq,
+        /** @deprecated Use initialWaitAfterAsOfSeq for the first wait and observedAsOfSeq for diagnostics. */
+        asOfSeq: observedAsOfSeq,
         ...budget === undefined ? {} : { tokenBudget: budget },
         ...recoveryCapsule === undefined ? {} : { recoveryCapsuleAccepted: true },
         disconnectBehavior: 'HOST_CONTINUES',
@@ -815,11 +923,23 @@ export class GatewayManager {
   ): Promise<Observation> {
     if (observation.recovery?.kind !== 'CONTINUATION_REQUIRED') return observation
     try {
+      const recoveryCapsule = await this.exactRecoveryCapsule(
+        connection, snapshot, observation.sessionId, observation.runId,
+      )
+      if (recoveryCapsule.uncertainEffects.truncated) {
+        const { recovery: _recovery, ...withoutRecovery } = observation
+        return {
+          ...withoutRecovery,
+          status: 'ESCALATION_REQUIRED',
+          stage: 'recovery-effects-truncated',
+          summary: `Recovery evidence contains ${String(recoveryCapsule.uncertainEffects.total)} uncertain effects but only ${String(recoveryCapsule.uncertainEffects.entries.length)} fit in the bounded capsule; manual reconciliation is required.`,
+          recoveryCapsule,
+          decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.policiesFor(snapshot).active),
+        }
+      }
       return {
         ...observation,
-        recoveryCapsule: await this.exactRecoveryCapsule(
-          connection, snapshot, observation.sessionId, observation.runId,
-        ),
+        recoveryCapsule,
       }
     } catch (error) {
       const { recovery: _recovery, recoveryCapsule: _capsule, ...withoutRecovery } = observation
@@ -927,9 +1047,8 @@ export class GatewayManager {
         },
       }
     }
-    const rootTerminal = snapshot.events.find(event => event.seq === observation.boundarySeq && event.type === 'turn/end')
     if (tree.latestChildTerminalTime !== undefined
-      && (rootTerminal === undefined || rootTerminal.time <= tree.latestChildTerminalTime)) {
+      && (observation.handoffTime === undefined || observation.handoffTime <= tree.latestChildTerminalTime)) {
       return {
         snapshot,
         observation: {
@@ -1187,6 +1306,7 @@ export class GatewayManager {
     observation = validated.observation
     observation = await this.validateRecoveryContinuation(connection, snapshot, observation)
     const recovered: Observation = observation.recovery?.kind === 'CONTINUATION_REQUIRED'
+      || observation.stage === 'recovery-effects-truncated'
       || observation.failure?.kind === 'PROTOCOL_ERROR'
       ? observation
       : {

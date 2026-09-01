@@ -295,6 +295,8 @@ export const observationSchema = z.object({
   summary: z.string().max(2_048),
   files: z.array(z.string().max(HANDOFF_PATH_LIMIT)).max(HANDOFF_FILES_LIMIT),
   verification: z.array(verificationSchema).max(HANDOFF_VERIFICATION_LIMIT),
+  /** Independent meaning of worker-supplied verification claims; protocol completion alone is never implicit acceptance. */
+  acceptanceStatus: z.enum(['UNVERIFIED', 'PASSED', 'FAILED']).optional(),
   blocker: z.string().max(HANDOFF_BLOCKER_LIMIT).optional(),
   failure: z.object({
     kind: failureKindSchema,
@@ -390,6 +392,9 @@ export const observationSchema = z.object({
   }).strict().optional(),
   asOfSeq: z.number().int().min(-1),
   boundarySeq: z.number().int().min(-1),
+  /** Durable accepted supervisor_handoff tool-result boundary, when terminal state came from a handoff. */
+  handoffSeq: z.number().int().min(-1).optional(),
+  handoffTime: z.number().nonnegative().optional(),
   sessionId: z.string().max(512),
   runId: z.string().max(512),
 })
@@ -397,6 +402,78 @@ export type Observation = z.infer<typeof observationSchema>
 
 const packetTextSchema = z.string().max(32_768)
 const packetListSchema = z.array(z.string().max(4_096)).max(64)
+
+export const EXECUTION_BRIEF_MAX_BYTES = 16_384
+export const EXECUTION_BRIEF_MAX_WORKSTREAMS = 5
+
+const workstreamSchema = z.object({
+  id: z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/),
+  outcome: z.string().min(1).max(512),
+  scopeHints: z.array(z.string().min(1).max(256)).max(12).optional(),
+  evidenceToGather: z.array(z.string().min(1).max(512)).max(8).optional(),
+  dependsOn: z.array(z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/)).max(4).optional(),
+  delegation: z.enum(['root', 'child_candidate']),
+  doneWhen: z.array(z.string().min(1).max(512)).min(1).max(8),
+}).strict()
+
+interface ExecutionBriefFields {
+  workstreams: Array<z.infer<typeof workstreamSchema>>
+  integration: string[]
+}
+
+function validateExecutionBrief(value: ExecutionBriefFields, context: z.RefinementCtx): void {
+  const byId = new Map<string, z.infer<typeof workstreamSchema>>()
+  for (const [index, stream] of value.workstreams.entries()) {
+    if (byId.has(stream.id)) {
+      context.addIssue({ code: 'custom', path: ['workstreams', index, 'id'], message: `duplicate workstream id ${stream.id}` })
+    }
+    byId.set(stream.id, stream)
+  }
+  for (const [index, stream] of value.workstreams.entries()) {
+    for (const dependency of stream.dependsOn ?? []) {
+      if (dependency === stream.id) {
+        context.addIssue({ code: 'custom', path: ['workstreams', index, 'dependsOn'], message: 'workstream cannot depend on itself' })
+      } else if (!byId.has(dependency)) {
+        context.addIssue({ code: 'custom', path: ['workstreams', index, 'dependsOn'], message: `unknown dependency ${dependency}` })
+      }
+    }
+  }
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const visit = (id: string): boolean => {
+    if (visiting.has(id)) return false
+    if (visited.has(id)) return true
+    visiting.add(id)
+    const stream = byId.get(id)
+    if (stream !== undefined && (stream.dependsOn ?? []).some(dependency => !visit(dependency))) return false
+    visiting.delete(id)
+    visited.add(id)
+    return true
+  }
+  if ([...byId.keys()].some(id => !visit(id))) {
+    context.addIssue({ code: 'custom', path: ['workstreams'], message: 'workstream dependencies must be acyclic' })
+  }
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > EXECUTION_BRIEF_MAX_BYTES) {
+    context.addIssue({ code: 'custom', message: `execution brief exceeds ${String(EXECUTION_BRIEF_MAX_BYTES)} bytes` })
+  }
+}
+
+const executionBriefFields = {
+  workstreams: z.array(workstreamSchema).min(1).max(EXECUTION_BRIEF_MAX_WORKSTREAMS),
+  integration: z.array(z.string().min(1).max(512)).min(1).max(12),
+}
+
+/** Codex-authored semantic decomposition accepted by dsh_task. */
+export const executionBriefInputSchema = z.object(executionBriefFields).strict().superRefine(validateExecutionBrief)
+
+/** Durable form, including whether Codex supplied a decomposition or the gateway used one-stream fallback. */
+export const executionBriefSchema = z.object({
+  schemaVersion: z.literal(1),
+  source: z.enum(['CODEX_COMPILED', 'SINGLE_STREAM_FALLBACK']),
+  ...executionBriefFields,
+}).strict().superRefine(validateExecutionBrief)
+export type ExecutionBriefInput = z.infer<typeof executionBriefInputSchema>
+export type ExecutionBrief = z.infer<typeof executionBriefSchema>
 
 export const taskPacketV1Schema = z.object({
   schemaVersion: z.literal(1),
@@ -414,11 +491,14 @@ export const taskPacketV1Schema = z.object({
 
 export const taskPacketV2Schema = z.object({
   schemaVersion: z.literal(2),
+  /** Deterministic supervisor instruction profile pinned when this run was admitted. */
+  instructionProfile: z.literal('engineering-v1').optional(),
   sessionId: z.string().min(1).max(512),
   runId: z.string().uuid(),
   completionToken: z.string().uuid(),
   objective: z.string().min(1).max(8_192),
   writerMode: z.enum(['writer', 'read_only']),
+  executionBrief: executionBriefSchema.optional(),
   requestId: z.string().uuid().optional(),
   requestDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   budget: z.object({

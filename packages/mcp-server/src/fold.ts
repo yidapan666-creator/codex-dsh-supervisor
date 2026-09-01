@@ -987,6 +987,8 @@ function handoffObservation(
     const common = {
       ...base(state, packet),
       boundarySeq: turnEnd.seq,
+      handoffSeq: result.seq,
+      handoffTime: result.time,
       stage,
       summary,
       files,
@@ -999,7 +1001,24 @@ function handoffObservation(
       ...truncated.size === 0 ? {} : { handoffTruncated: { fields: [...truncated] } },
     }
     switch (handoff.status) {
-      case 'completed': return { ...common, status: 'COMPLETED' }
+      case 'completed': {
+        const acceptanceStatus = verification.length === 0
+          ? 'UNVERIFIED' as const
+          : verification.every(entry => entry.outcome === 'passed') ? 'PASSED' as const : 'FAILED' as const
+        if (acceptanceStatus === 'FAILED') {
+          return {
+            ...common,
+            status: 'FAILED',
+            acceptanceStatus,
+            failure: {
+              kind: 'WORKER_FAILED',
+              message: 'worker reported completion with failed or not-run verification',
+              retryable: false,
+            },
+          }
+        }
+        return { ...common, status: 'COMPLETED', acceptanceStatus }
+      }
       case 'blocked': return { ...common, status: 'BLOCKED' }
       case 'major_checkpoint': return { ...common, status: 'MAJOR_CHECKPOINT' }
       case 'escalation_required': return { ...common, status: 'ESCALATION_REQUIRED' }

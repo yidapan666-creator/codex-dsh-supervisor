@@ -3,7 +3,7 @@ import { z } from 'zod'
 import {
   FAILURE_MESSAGE_LIMIT, INTERACTION_ID_LIMIT, QUESTION_COUNT_LIMIT, QUESTION_ID_LIMIT,
   QUESTION_OPTION_LABEL_LIMIT,
-  observationSchema, recoveryCapsuleSchema,
+  executionBriefInputSchema, observationSchema, recoveryCapsuleSchema,
 } from './contracts.js'
 import { GatewayManager, HostDiscoveryError } from './gateway.js'
 import { ProtocolContractError } from './host.js'
@@ -65,6 +65,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
       + 'Treat sessionId and runId as distinct: every wait or control call must carry the runId returned by dsh_task; stale controls are rejected. '
       + 'When creating a session, pass the target project absolute cwd; reconnect preserves the durable session cwd and must not redirect it. '
       + 'Always give dsh_task a fresh requestId and reuse that same requestId after an ambiguous client disconnect; Host-side atomic admission returns the durable receipt and does not duplicate the task. '
+      + 'Compile a multi-part request into one bounded executionBrief with 1-5 cohesive workstreams, real dependency edges, observable done conditions, child-candidate hints, and Root integration duties; send it once to one Root instead of creating competing Roots in one worktree. '
       + 'A configured tokenBudget is enforced inside the independent DSH Host across the run tree with request preflight, atomic reservations, and output caps; provider usage settles the estimate, so it is a cutoff rather than an exact billing cap. Budgeted observations include the Host-owned cumulative run-tree buckets; cursor tokenDelta remains the root-session delta. The external dsh-usage-monitor reading is session-lifetime root observability only and never budget authority. '
       + 'After MCP/Codex reconnect, use dsh_runs to rediscover identity and dsh_recover to reattach before waiting. Do not replay the objective. '
       + 'When recovery returns CONTINUATION_REQUIRED, pass its exact full-run-tree recoveryCapsule and parentRunId into a fresh dsh_task; either field without the other is rejected, and admission recomputes the capsule from refreshed Host evidence before accepting it. Reconcile session-scoped uncertainEffects before retry and never reconstruct omitted arguments. '
@@ -85,12 +86,16 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.startOrConnect(input)))
 
   server.registerTool('dsh_task', {
-    description: 'Atomically admit one supervised run into an idle durable session. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits a durable inbox receipt and returns the original runId without duplicating the task. A different new task is rejected while the session is running. A Host-restart continuation must supply both the exact full-run-tree recoveryCapsule returned by dsh_recover and its matching parentRunId. Admission refreshes Host history, proves the parent is the current interrupted run for the same session, recomputes the capsule, and rejects missing, fabricated, stale, cross-session, or child-incomplete evidence before a provider call. Optional tokenBudget.maxTokens is a Host-enforced whole-run-tree cutoff: requests atomically reserve estimated full input plus capped output before dispatch, then settle with provider-reported input/cache/output usage. Concurrent requests cannot claim the same allowance; tokenizer/provider variance means this is not an exact billing cap. authority.maxDirectChildren is also enforced in the Host from durable child creations and in-flight start reservations, so allowed child use needs no repeat approval. Every later wait/control call must carry sessionId + runId. The Host atomically enforces one writer per working tree across MCP clients; writer dispatch fails closed under multi-Host configuration, and parallel writers require independent worktrees.',
+    description: 'Atomically admit one supervised run into an idle durable session. Codex should compile a bounded executionBrief with 1-5 cohesive workstreams, dependency edges, child-candidate hints, per-stream done conditions, and Root integration duties; omit it only for an intentional single-stream fallback. This is one Root task, not multiple competing roots. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits the task before execution and returns the original runId without duplicating it. Start the first dsh_wait with afterAsOfSeq=initialWaitAfterAsOfSeq (the exact admission boundary); observedAsOfSeq is diagnostic only. A Host-restart continuation requires the exact dsh_recover capsule and parentRunId; missing, stale, cross-session, child-incomplete, or truncated evidence is rejected before a provider call. tokenBudget.maxTokens is enforced across the run tree with crash-durable per-request reservations. authority.maxDirectChildren is Host-enforced from durable child creations and concurrent reservations. Every later wait/control call carries sessionId + runId. Writer mode requires one Host and a Git worktree: the Host captures the actual baseline before execution, permits one writer per worktree, and rejects completed handoff if task-era changes escape workspace-relative allowedScope prefixes. Parallel writers require independent worktrees.',
     inputSchema: z.object({
       requestId: z.string().uuid().optional(),
       sessionId: z.string().max(512), taskId: z.string().max(512).optional(), objective: z.string().min(1).max(8_192), writerMode: z.enum(['writer', 'read_only']).optional(),
       provider: z.string().max(256).optional(), model: z.string().max(256).optional(), reasoningEffort: z.string().max(128).optional(),
-      context: z.string().max(32_768).optional(), allowedScope: z.array(z.string().max(4_096)).max(64).optional(), constraints: z.array(z.string().max(4_096)).max(64).optional(),
+      context: z.string().max(32_768).optional(),
+      executionBrief: executionBriefInputSchema.optional().describe('Codex-compiled work map. Workstream scopeHints are planning hints only; allowedScope remains the authoritative write boundary.'),
+      allowedScope: z.array(z.string().max(4_096)).min(1).max(64).optional()
+        .describe('Writer mode: workspace-relative path prefixes; use "." for the full session cwd. Absolute and parent-traversing paths are rejected.'),
+      constraints: z.array(z.string().max(4_096)).max(64).optional(),
       acceptanceCriteria: z.array(z.string().max(4_096)).max(64).optional(), verification: z.array(z.string().max(4_096)).max(64).optional(),
       escalationConditions: z.array(z.string().max(4_096)).max(64).optional(),
       tokenBudget: z.object({ maxTokens: z.number().int().positive() }).optional(),

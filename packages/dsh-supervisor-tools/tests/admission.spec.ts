@@ -18,6 +18,10 @@ const requestId = '33333333-3333-4333-8333-333333333333'
 const firstRunId = '11111111-1111-4111-8111-111111111111'
 const secondRunId = '22222222-2222-4222-8222-222222222222'
 const digest = 'a'.repeat(64)
+const gitBaselines = {
+  capture: async () => ({}) as never,
+  verify: async () => ({ headBefore: 'a', headAfter: 'a', changedPaths: [], outOfScopePaths: [] }),
+}
 
 function request(runId = firstRunId, requestDigest = digest): TaskAdmissionRequest {
   const packet = {
@@ -41,11 +45,18 @@ function request(runId = firstRunId, requestDigest = digest): TaskAdmissionReque
   }
 }
 
-function harness(options: { cold?: boolean; running?: boolean; seed?: ReturnType<typeof inboxEvent>[] } = {}): {
+function harness(options: {
+  cold?: boolean
+  running?: boolean
+  seed?: ReturnType<typeof inboxEvent>[]
+  failDurablePrompts?: number
+} = {}): {
   coordinator: TaskAdmissionCoordinator
   events: ReturnType<typeof inboxEvent>[]
   pending: Array<{ id: string; content: unknown[] }>
   calls: { models: number; prompt: number; flush: number; rearm: number; selectModel: number }
+  modelSelections: Array<{ provider: string; model: string; reasoningEffort?: string }>
+  timeline: string[]
   runtime: TaskAdmissionRuntime
 } {
   const events = [...(options.seed ?? [])]
@@ -53,6 +64,8 @@ function harness(options: { cold?: boolean; running?: boolean; seed?: ReturnType
     ? ((event.data as { inserted?: Array<{ id: string; content: unknown[] }> }).inserted ?? [])
     : [])
   const calls = { models: 0, prompt: 0, flush: 0, rearm: 0, selectModel: 0 }
+  const modelSelections: Array<{ provider: string; model: string; reasoningEffort?: string }> = []
+  const timeline: string[] = []
   const agent: {
     status: 'idle' | 'running'
     session: { header: { id: string }; events: typeof events; append(type: string, data: unknown): ReturnType<typeof inboxEvent> }
@@ -61,7 +74,7 @@ function harness(options: { cold?: boolean; running?: boolean; seed?: ReturnType
       nextStep: typeof pending
       remove(id: string): boolean
     }
-    followup(message: { id?: string; content?: unknown }): void
+    wakePending(): void
   } = {
     status: options.running === true ? 'running' as const : 'idle' as const,
     session: {
@@ -87,11 +100,9 @@ function harness(options: { cold?: boolean; running?: boolean; seed?: ReturnType
         return true
       },
     },
-    followup(message: { id?: string; content?: unknown }) {
+    wakePending() {
       calls.rearm++
-      const admitted = message as { id: string; content: unknown[] }
-      pending.push(admitted)
-      events.push(inboxEvent((events.at(-1)?.seq ?? -1) + 1, admitted))
+      agent.status = 'running'
     },
   }
   const attached = options.cold === true ? [] : [agent]
@@ -104,27 +115,49 @@ function harness(options: { cold?: boolean; running?: boolean; seed?: ReturnType
         models: async () => {
           calls.models++
           if (!attached.includes(agent)) attached.push(agent)
-          return { result: { ok: true as const, value: {} } }
+          return { result: { ok: true as const, value: {
+            current: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
+          } } }
         },
-        selectModel: async () => {
+        selectModel: async (input) => {
           calls.selectModel++
+          modelSelections.push({
+            provider: input.payload.provider, model: input.payload.model,
+            ...input.payload.reasoningEffort === undefined ? {} : { reasoningEffort: input.payload.reasoningEffort },
+          })
           return { result: { ok: true as const, value: {} } }
         },
         prompt: async (input) => {
           calls.prompt++
+          expect(input.payload.mode).toBe('queue-durable')
           const message = {
             id: `message-${calls.prompt}`,
             content: input.payload.content,
           }
+          timeline.push('stage')
           pending.push(message)
           events.push(inboxEvent((events.at(-1)?.seq ?? -1) + 1, message))
+          // queue-durable owns the persistence barrier before it wakes the agent.
+          timeline.push('flush')
+          calls.flush++
+          if (calls.prompt <= (options.failDurablePrompts ?? 0)) {
+            const index = pending.findIndex(candidate => candidate.id === message.id)
+            pending.splice(index, 1)
+            events.push({
+              type: 'agent/inbox/spliced', seq: (events.at(-1)?.seq ?? -1) + 1, time: Date.now(),
+              data: { target: 'next-turn', start: index, removedCount: 1, inserted: [], outcome: 'canceled' },
+            })
+            return { result: { ok: false as const, error: { code: 'internal', message: 'durability failed' } } }
+          }
+          timeline.push('wake')
           agent.status = 'running'
           return { result: { ok: true as const, value: { accepted: true as const } } }
         },
       },
     },
+    policyDefaults: { sandboxMode: 'workspace-write', approvalPolicy: 'ask' },
   }
-  return { coordinator: new TaskAdmissionCoordinator(runtime), events, pending, calls, runtime }
+  return { coordinator: new TaskAdmissionCoordinator(runtime), events, pending, calls, modelSelections, timeline, runtime }
 }
 
 function inboxEvent(seq: number, message = {
@@ -137,6 +170,49 @@ function inboxEvent(seq: number, message = {
     time: Date.now(),
     data: { target: 'next-turn', start: 0, inserted: [message] },
   }
+}
+
+function nextRequest(sessionId = 's1'): TaskAdmissionRequest {
+  const nextRequestId = '88888888-8888-4888-8888-888888888888'
+  const nextRunId = '99999999-9999-4999-8999-999999999999'
+  const nextDigest = 'c'.repeat(64)
+  const packet = {
+    schemaVersion: 2, sessionId, runId: nextRunId,
+    completionToken: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    requestId: nextRequestId, requestDigest: nextDigest,
+    objective: 'next task', writerMode: 'read_only',
+  }
+  return {
+    schemaVersion: 1, sessionId, requestId: nextRequestId, requestDigest: nextDigest, runId: nextRunId,
+    prompt: `next task\n\n<dsh-supervised-task>\n${JSON.stringify(packet)}\n</dsh-supervised-task>`,
+    modelSelection: { provider: 'provider-b', model: 'model-b' },
+  }
+}
+
+function terminalHandoffEvents(
+  startSeq: number,
+  options: { resultTime?: number; turn?: number; status?: 'completed' | 'blocked' | 'failed' } = {},
+): Array<{ type: string; seq: number; time: number; data: unknown }> {
+  const turn = options.turn ?? 1
+  const resultTime = options.resultTime ?? Date.now()
+  const handoff = {
+    sessionId: 's1', runId: firstRunId,
+    completionToken: '44444444-4444-4444-8444-444444444444',
+    status: options.status ?? 'completed', stage: 'done', summary: 'terminal', files: [], verification: [],
+  }
+  return [
+    { type: 'turn/start', seq: startSeq, time: resultTime - 2, data: { turn } },
+    { type: 'tool/call', seq: startSeq + 1, time: resultTime - 1, data: {
+      turn, step: 1, callId: `handoff-${String(turn)}`, name: 'supervisor_handoff', arguments: JSON.stringify(handoff),
+    } },
+    { type: 'tool/result', seq: startSeq + 2, time: resultTime, data: {
+      turn, step: 1, message: { source: { callId: `handoff-${String(turn)}` }, content: [{
+        type: 'tool-result', isError: false,
+        content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff, artifacts: [] }) }],
+      }] },
+    } },
+    { type: 'turn/end', seq: startSeq + 3, time: resultTime + 1, data: { turn, reason: { kind: 'completed' } } },
+  ]
 }
 
 function persistenceFrom(
@@ -214,6 +290,68 @@ describe('Host task admission', () => {
     expect(test.events).toHaveLength(3)
     expect(test.events[0]).toMatchObject({ type: 'sandbox/mode', data: { mode: 'read-only' } })
     expect(test.events[1]).toMatchObject({ type: 'approval/policy', data: { policy: 'never' } })
+    expect(test.timeline).toEqual(['stage', 'flush', 'wake'])
+  })
+
+  it('does not reconcile a canceled non-durable insertion and safely retries the same request', async () => {
+    const test = harness({ failDurablePrompts: 1 })
+
+    await expect(test.coordinator.admit(request())).rejects.toMatchObject({ code: 'PROMPT_REJECTED' })
+    expect(test.timeline).toEqual(['stage', 'flush'])
+    expect(test.pending).toHaveLength(0)
+    expect(test.events.findLast(event => event.type === 'sandbox/mode'))
+      .toMatchObject({ data: { mode: 'workspace-write' } })
+    expect(test.events.findLast(event => event.type === 'approval/policy'))
+      .toMatchObject({ data: { policy: 'ask' } })
+    expect(test.modelSelections.slice(0, 2)).toEqual([
+      { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
+      { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
+    ])
+
+    await expect(test.coordinator.admit(request())).resolves.toMatchObject({
+      requestId,
+      runId: firstRunId,
+      reconciled: false,
+    })
+    expect(test.calls).toMatchObject({ models: 2, prompt: 2, flush: 3, selectModel: 3 })
+    expect(test.timeline).toEqual(['stage', 'flush', 'stage', 'flush', 'wake'])
+    expect(test.pending).toHaveLength(1)
+  })
+
+  it('does not treat a bare turn end as completed supervised work', async () => {
+    const test = harness({ seed: [inboxEvent(0)] })
+    test.pending.splice(0)
+    test.events.push(
+      { type: 'turn/start', seq: 1, time: Date.now(), data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: Date.now() + 1, data: { turn: 1, reason: { kind: 'completed' } } },
+    )
+
+    await expect(test.coordinator.admit(nextRequest()))
+      .rejects.toMatchObject<TaskAdmissionError>({ code: 'SESSION_BUSY' })
+    expect(test.calls.prompt).toBe(0)
+  })
+
+  it('requires a fresh Root handoff after an affiliated child settles', async () => {
+    const test = harness({ seed: [inboxEvent(0)] })
+    test.pending.splice(0)
+    const boundaryTime = test.events[0]!.time
+    test.events.push(...terminalHandoffEvents(1, { resultTime: boundaryTime + 10 }))
+    const child = {
+      header: { id: 'child-1', parentSession: 's1' },
+      events: [
+        { type: 'user/message', seq: 0, time: boundaryTime + 5, data: { content: [{ type: 'text', text: 'delegated work' }] } },
+        { type: 'turn/start', seq: 1, time: boundaryTime + 15, data: { turn: 1 } },
+        { type: 'turn/end', seq: 2, time: boundaryTime + 20, data: { turn: 1, reason: { kind: 'completed' } } },
+      ],
+    }
+    const root = test.runtime.agents.list()[0]!.session
+    test.runtime.sessionPersistence = persistenceFrom(() => [root, child])
+
+    await expect(test.coordinator.admit(nextRequest()))
+      .rejects.toMatchObject<TaskAdmissionError>({ code: 'SESSION_BUSY' })
+
+    test.events.push(...terminalHandoffEvents(5, { turn: 2, resultTime: boundaryTime + 30 }))
+    await expect(test.coordinator.admit(nextRequest())).resolves.toMatchObject({ reconciled: false })
   })
 
   it('serializes writer admission across sessions in one Host worktree domain', async () => {
@@ -250,7 +388,7 @@ describe('Host task admission', () => {
             },
           },
           inbox: { nextTurn: [], nextStep: [], remove: () => false },
-          followup: () => undefined,
+          wakePending: () => undefined,
         })),
       },
       sessions: { flush: async () => true },
@@ -259,6 +397,9 @@ describe('Host task admission', () => {
       }))),
       apiProxy: {
         sessions: {
+          models: async () => ({ result: { ok: true as const, value: {
+            current: { provider: 'provider-a', model: 'model-a' },
+          } } }),
           selectModel: async () => { selections++; return { result: { ok: true as const, value: {} } } },
           prompt: async (input) => {
             prompts++
@@ -272,8 +413,9 @@ describe('Host task admission', () => {
           },
         },
       },
+      policyDefaults: { sandboxMode: 'workspace-write', approvalPolicy: 'ask' },
     }
-    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/work/tree')
+    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/work/tree', undefined, gitBaselines)
 
     const results = await Promise.allSettled([coordinator.admit(first), coordinator.admit(second)])
 
@@ -322,19 +464,23 @@ describe('Host task admission', () => {
           },
         },
         inbox: { nextTurn: [], nextStep: [], remove: () => false },
-        followup: () => undefined,
+        wakePending: () => undefined,
       })) },
       sessions: { flush: async () => true },
       sessionPersistence: persistenceFrom(() => agents.map(agent => agent.session)),
       apiProxy: { sessions: {
+        models: async () => ({ result: { ok: true as const, value: {
+          current: { provider: 'provider-a', model: 'model-a' },
+        } } }),
         selectModel: async () => ({ result: { ok: true as const, value: {} } }),
         prompt: async (input) => {
           rootEvents.push(inboxEvent(1, { id: 'root-task', content: input.payload.content }))
           return { result: { ok: true as const, value: { accepted: true as const } } }
         },
       } },
+      policyDefaults: { sandboxMode: 'workspace-write', approvalPolicy: 'ask' },
     }
-    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/worktree')
+    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/worktree', undefined, gitBaselines)
     await coordinator.admit(first)
     rootEvents.push({ type: 'turn/end', seq: 2, data: { turn: 1 } })
     agents[1]!.status = 'running'
@@ -375,11 +521,14 @@ describe('Host task admission', () => {
           },
         },
         inbox: { nextTurn: [], nextStep: [], remove: () => false },
-        followup: () => undefined,
+        wakePending: () => undefined,
       })) },
       sessions: { flush: async () => true },
       sessionPersistence: persistenceFrom(() => agents.map(agent => agent.session)),
       apiProxy: { sessions: {
+        models: async () => ({ result: { ok: true as const, value: {
+          current: { provider: 'provider-a', model: 'model-a' },
+        } } }),
         selectModel: async () => ({ result: { ok: true as const, value: {} } }),
         prompt: async (input) => {
           prompts++
@@ -387,8 +536,9 @@ describe('Host task admission', () => {
           return { result: { ok: true as const, value: { accepted: true as const } } }
         },
       } },
+      policyDefaults: { sandboxMode: 'workspace-write', approvalPolicy: 'ask' },
     }
-    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/worktree')
+    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/worktree', undefined, gitBaselines)
     await coordinator.admit(first)
     rootEvents.push({ type: 'turn/end', seq: rootEvents.length + 1, data: { turn: 1 } })
     agents[1]!.status = 'running'
@@ -472,12 +622,12 @@ describe('Host task admission', () => {
     const capsule = await new HostRecoveryCoordinator(test.runtime).capsule('s1', firstRunId)
     const continuation = continuationRequest(capsule)
     continuation.prompt = continuation.prompt.replace('"writerMode":"read_only"', '"writerMode":"writer"')
-    const coordinator = new TaskAdmissionCoordinator(test.runtime, async cwd => cwd)
+    const coordinator = new TaskAdmissionCoordinator(test.runtime, async cwd => cwd, undefined, gitBaselines)
 
     const receipt = await coordinator.admit(continuation)
 
     expect(receipt).toMatchObject({ runId: '99999999-9999-4999-8999-999999999999', reconciled: false })
-    expect(test.calls).toMatchObject({ models: 1, prompt: 1, selectModel: 1 })
+    expect(test.calls).toMatchObject({ models: 2, prompt: 1, selectModel: 1 })
   })
 
   it('fails closed when the native cold-session resolver cannot resume the Root', async () => {
@@ -515,7 +665,7 @@ describe('Host task admission', () => {
     const runtime: TaskAdmissionRuntime = {
       agents: { list: () => [{
         status: 'idle', session: targetSession,
-        inbox: { nextTurn: [], nextStep: [], remove: () => false }, followup: () => undefined,
+        inbox: { nextTurn: [], nextStep: [], remove: () => false }, wakePending: () => undefined,
       }] },
       sessions: { flush: async () => true },
       sessionPersistence: {
@@ -532,7 +682,7 @@ describe('Host task admission', () => {
         prompt: async () => ({ result: { ok: true as const, value: { accepted: true as const } } }),
       } },
     }
-    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/same-worktree')
+    const coordinator = new TaskAdmissionCoordinator(runtime, async () => '/same-worktree', undefined, gitBaselines)
     await expect(coordinator.admit(writer))
       .rejects.toMatchObject<TaskAdmissionError>({ code: 'WRITER_CONFLICT' })
   })
@@ -567,7 +717,7 @@ describe('Host task admission', () => {
     const receipt = await test.coordinator.admit(request(secondRunId))
 
     expect(receipt).toMatchObject({ runId: firstRunId, reconciled: true })
-    expect(test.calls).toMatchObject({ prompt: 0, rearm: 1, flush: 1 })
+    expect(test.calls).toMatchObject({ prompt: 0, rearm: 1, flush: 0 })
     expect(test.pending).toHaveLength(1)
     expect(test.pending[0]?.id).toBe('message-seed')
   })

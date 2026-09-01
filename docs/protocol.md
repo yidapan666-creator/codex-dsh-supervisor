@@ -21,7 +21,12 @@ The worker receives a durable task packet containing the durable `sessionId`, a 
 A completed `turn/end` without the handoff facts is `FAILED` with `MISSING_HANDOFF`. A valid Root handoff with an affiliated child still running remains `WAITING/children-running`; an inactive child without a durable terminal boundary remains `WAITING/child-settlement-unverified`. Once children settle, their latest terminal time is a completion watermark: the Root must integrate the reports and publish a newer valid handoff plus corresponding `turn/end`, otherwise the run remains `WAITING/root-rehandoff-required`. A child's durable token-budget stop takes precedence over an older Root handoff. Other failures use `WORKER_FAILED`, `HOST_FAILED`, or `PROTOCOL_ERROR`. Every wait, recover, and control call for a v2 run carries `sessionId + runId`; a stale run is rejected before it can observe or mutate the newer execution and never carries a contradictory `REATTACHED` marker.
 
 Schema v2 may pin a caller `requestId`, its task-payload digest, and a
-`budget.maxTokens`. Admission is a Host-owned operation: the supervisor plugin
+`budget.maxTokens`; new packets also pin the deterministic
+`instructionProfile=engineering-v1`. Before admission, the gateway fills only
+missing routine engineering defaults (writer scope, preservation/safety,
+acceptance, focused-then-full verification, material-only escalation, and at
+most five direct children). Explicit caller values—including zero—win, and the
+compiler consumes no model tokens. Admission is a Host-owned operation: the supervisor plugin
 serializes requests per session, checks every durable inbox/message packet
 carrying the request id, queues the prompt through the Host API, and flushes the
 inbox insertion before returning its stable run receipt. A same-id, same-digest
@@ -34,9 +39,29 @@ input plus a bounded output allowance atomically across the run tree. A request
 temporarily blocked by another live reservation waits for settlement; it does
 not oversell or cancel that request.
 
+A multi-part request carries one `executionBrief` in the same durable packet:
+1–5 cohesive workstreams, unique ids, an acyclic dependency graph, bounded
+scope/evidence hints, Root/child-candidate labels, observable per-stream done
+conditions, and Root integration duties. The complete structure is capped at
+16 KiB and included in the idempotency digest. Codex creates it in its existing
+reasoning turn rather than invoking another planner. DSH Root decides actual
+fanout and integrates every result; workstream hints never broaden
+`allowedScope`. Atomic tasks record `SINGLE_STREAM_FALLBACK`.
+
 ## Observation cursor
 
 `asOfSeq` is the highest DSH session event sequence observed while producing a response. `boundarySeq` is the event sequence that established the returned state. `afterAsOfSeq` only states the caller's prior observation and is never passed to DSH `events.mux({ since })`, because DSH v1 does not implement a usable server resume cursor. Reconnect always refreshes authoritative history.
+
+The `dsh_task` receipt separates admission from observation: `admissionBoundarySeq` (also returned as the convenience field `initialWaitAfterAsOfSeq`) is the exact durable task-packet/inbox boundary, while `observedAsOfSeq` is the latest event seen before the receipt returned. Early worker events may already be included in `observedAsOfSeq`, so the first `dsh_wait` must use `afterAsOfSeq=initialWaitAfterAsOfSeq`. Later waits carry the preceding observation's `asOfSeq` normally.
+
+Before creating, reconnecting, locating, or resuming a session, MCP validates the plugin-owned `GET /api/dsh-gate.describe` endpoint in addition to DSH's generic `host.describe`. The descriptor pins the gate protocol, plugin/build identity, worker protocol, and required capability set. A generic Host with a missing, stale, or partially loaded supervisor plugin fails closed before task admission. `doctor --live` and managed Host startup apply the same readiness gate.
+
+Every generic HTTP/RPC/WebSocket carrier and each plugin-owned endpoint requires
+the same Host bearer credential. Bootstrap creates a non-symlink regular token
+file with owner-only permissions, and MCP refuses an unsafe token file. Plain
+HTTP is valid only on loopback; remote endpoints require HTTPS. The Web client
+accepts the local token through a URL fragment, then sends it as a header or
+WebSocket query credential without putting it in the initial HTTP request.
 
 `dsh_wait` runs a five-minute aggregated progress cadence: with the default timeout (300000 ms) it returns about one observation per window and returns early when the attached decision outcome says `timing=immediate`. Terminal state, approval/question, checkpoint, blocker, escalation, and Host/protocol failure are locked protocol boundaries; structured worker requests are evaluated by the versioned worker policy. Ordinary event churn does not produce rapid repeated wait calls. The `WAITING` return at the window boundary is `wait.reason=TIMEOUT` with the aggregate `progress` since the caller's observation cursor; `workerState` independently says whether the worker was `RUNNING`, `IDLE`, or `UNKNOWN` at the observation. The `PROGRESS` wait reason remains in the schema for compatibility but is not emitted by the current cadence.
 
@@ -58,6 +83,7 @@ than an implicit fallback to prose-only instructions.
 ## Safety boundaries
 
 - One nonterminal writer task is allowed per real working tree: the writer domain is the nearest ancestor carrying a `.git` worktree marker, so different subdirectories of one worktree share a domain and linked worktrees remain distinct; a non-Git directory falls back to its exact `realpath`. Read-only roots may coexist, but a Root cannot accept a new run of either mode while its previous supervised run has an unfinished Root turn, pending follow-up, or active/pending descendant. Parallel writers require distinct existing Git worktrees; there is no workspace lock manager. One Host-local critical section serializes writer check-and-admit across every MCP client, and its ownership scan includes attached agents plus cold persisted sessions. A writer dispatch fails closed unless exactly one Host URL is configured, because separate Hosts have no shared atomic admission authority; read-only discovery and work remain multi-Host capable.
+- Writer execution additionally requires a Git worktree. Inside the same Host admission critical section, the runtime fsyncs an authoritative HEAD and fingerprints every pre-existing dirty path before the provider can run. Caller baseline prose is not an authority. Writer `allowedScope` entries are workspace-relative path prefixes; absent scope means the complete session cwd, while absolute/traversing scope is rejected. A `completed` handoff is rejected if the recomputed task-era committed or uncommitted path set escapes those prefixes. Unchanged pre-existing dirty files are not attributed to the worker; further edits or reverts of those files are.
 - A writer lease belongs to the queued/active run. Its root `turn/end` is necessary but does not release the lease while a descendant agent is still running or the root has queued follow-up work; an `interrupted` turn also retains ownership until the same Root supplies an exact Host-validated continuation. Other terminal reasons release once the tree is quiet. This prevents both an early root handoff and a crash boundary with uncertain effects from overlapping another writer.
 - `read_only` is an execution boundary, not prompt advice. Host admission appends DSH's native `sandbox/mode=read-only` and `approval/policy=never` before queueing the packet. DSH filesystem and bash sandbox consumers resolve that durable policy for each call, one-shot elevation is rejected, and child agents inherit it. Writer admission applies `workspace-write` but never broadens an existing approval policy; changing `never` back to `ask` remains an explicit user/deployment action.
 - Artifact admission starts from the authoritative `session.list` cwd, requires path containment, rejects absolute paths, traversal, symlinks, hardlinks, and non-regular files, and hashes through a validated open file handle (so the file fstat'ed is the file hashed) with per-artifact and total byte limits; admission is sequential and never loads an artifact wholly into memory.
@@ -80,7 +106,12 @@ new work in a later run while excluding its earlier work. Reaching
 the limit cancels the run tree with a durable hook reason and yields
 `ESCALATION_REQUIRED/token-budget-exhausted`. Request reservations prevent
 concurrent agents from claiming the same remaining allowance, and each request's
-`maxTokens` is capped before dispatch. If the next complete input cannot fit,
+`maxTokens` is capped before dispatch. Reservations are fsynced as independent
+Host-private records before request admission and are removed only after the
+corresponding usage or step terminal boundary is durably flushed. After a Host
+restart, an open durable step without usage remains charged pessimistically;
+an orphan record that never reached DSH's durable provider checkpoint is
+reclaimed. If the next complete input cannot fit,
 no provider call is made and the terminal hook is
 `token-budget-request-rejected` with used, remaining, and required-input
 figures; this is distinct from `token-budget-exhausted`. Because provider usage is authoritative

@@ -6,6 +6,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { admitArtifacts } from './artifacts.js'
 import {
+  FileBudgetReservationLedger,
+  type BudgetReservationLedger,
+  type DurableBudgetReservation,
+} from './reservation-ledger.js'
+import { FileGitBaselineStore } from './git-baseline.js'
+import { authorizeSupervisorRequest, requiredHostToken } from './host-auth.js'
+import { DSH_GATE_COMPILED_BUILD_ID } from './build-identity.js'
+import {
   HostRecoveryCoordinator,
   registerRecoveryCapsuleRoute,
   registerTaskAdmissionRoute,
@@ -14,6 +22,20 @@ import {
 } from './admission.js'
 
 export { admitArtifact, admitArtifacts, type ArtifactManifestEntry } from './artifacts.js'
+export {
+  FileBudgetReservationLedger,
+  MemoryBudgetReservationLedger,
+  defaultBudgetReservationDirectory,
+  type BudgetReservationLedger,
+  type DurableBudgetReservation,
+} from './reservation-ledger.js'
+export {
+  FileGitBaselineStore,
+  defaultGitBaselineDirectory,
+  type GitBaselineRecord,
+  type GitBaselineStore,
+  type GitBaselineVerification,
+} from './git-baseline.js'
 export {
   HostRecoveryCoordinator,
   RECOVERY_CAPSULE_PATH,
@@ -39,8 +61,23 @@ export {
 } from './recovery.js'
 
 export const name = 'dsh-gate-supervisor-tools'
+export const DSH_GATE_DESCRIPTOR_PATH = '/api/dsh-gate.describe'
+export const DSH_GATE_PROTOCOL_VERSION = 1
+export const DSH_GATE_PLUGIN_VERSION = '0.1.0'
+export const DSH_GATE_CAPABILITIES = [
+  'idempotent-admission-v1',
+  'durable-before-execute-v1',
+  'recovery-capsule-v1',
+  'run-tree-token-budget-v1',
+  'crash-durable-token-reservations-v1',
+  'host-git-baseline-v1',
+  'direct-child-authority-v1',
+  'strict-handoff-v1',
+  'bearer-auth-v1',
+] as const
 export const inject = [
   'tools', 'systemPrompt', 'tokenMeter', 'agents', 'sessions', 'sessionPersistence', 'apiProxy', 'webServer',
+  'sandboxPolicy', 'approval',
 ]
 
 export interface Config {
@@ -85,6 +122,39 @@ export const REPORTED_FAILURE_HYPOTHESIS_LIMIT = 512
 export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
 export const TOKEN_BUDGET_STATE_PATH = '/api/dsh-gate.budget-state'
 
+/** Plugin-owned readiness endpoint; proves the generic Host loaded the expected supervisor runtime. */
+export function registerSupervisorDescriptorRoute(
+  webServer: SupervisorRuntimeContext['webServer'],
+): () => void {
+  return webServer.register({
+    kind: 'exact',
+    path: DSH_GATE_DESCRIPTOR_PATH,
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      if (!authorizeSupervisorRequest(req, res)) return
+      if (req.method !== 'GET') {
+        res.writeHead(405, { allow: 'GET', 'cache-control': 'no-store' })
+        res.end()
+        return
+      }
+      const body = JSON.stringify({
+        schemaVersion: 1,
+        gateProtocolVersion: DSH_GATE_PROTOCOL_VERSION,
+        pluginName: '@dsh-gate/supervisor-tools',
+        pluginVersion: DSH_GATE_PLUGIN_VERSION,
+        buildId: DSH_GATE_COMPILED_BUILD_ID,
+        workerProtocolVersion: 2,
+        capabilities: DSH_GATE_CAPABILITIES,
+      })
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': Buffer.byteLength(body),
+      })
+      res.end(body)
+    },
+  })
+}
+
 /**
  * Validate the handoff summary length. Returns undefined when the summary is at
  * or below {@link HANDOFF_SUMMARY_LIMIT}, otherwise an actionable error message
@@ -120,6 +190,7 @@ type HandoffIdentityArgs = {
 }
 
 export type HandoffPayloadArgs = HandoffIdentityArgs & {
+  status: typeof HANDOFF_STATUSES[number]
   stage: string
   summary: string
   files: string[]
@@ -132,6 +203,12 @@ export type HandoffPayloadArgs = HandoffIdentityArgs & {
 
 /** Defense-in-depth for programmatic callers that bypass the generated tool schema. */
 export function handoffPayloadError(args: HandoffPayloadArgs): string | undefined {
+  if (args.status === 'completed') {
+    const nonPassing = args.verification.find(entry => entry.outcome !== 'passed')
+    if (nonPassing !== undefined) {
+      return `supervisor_handoff status completed cannot include verification outcome ${nonPassing.outcome}; report blocked or failed, or complete the verification first.`
+    }
+  }
   const checks: Array<[boolean, string]> = [
     [args.stage.length > HANDOFF_STAGE_LIMIT, `stage exceeds ${HANDOFF_STAGE_LIMIT} characters`],
     [args.files.length > HANDOFF_FILES_LIMIT, `files exceeds ${HANDOFF_FILES_LIMIT} entries`],
@@ -214,6 +291,7 @@ type TaskIdentity = {
   completionToken: string
   tokenBudget?: number | undefined
   maxDirectChildren?: number | undefined
+  writerMode: 'writer' | 'read_only'
 }
 
 type TaskIdentityBoundary = { identity: TaskIdentity; boundarySeq: number; boundaryTime?: number }
@@ -264,7 +342,7 @@ interface RuntimeRequestHeader {
 }
 
 interface SupervisorRuntimeContext {
-  sessions: { list(): RuntimeSession[] }
+  sessions: { list(): RuntimeSession[]; flush(session: RuntimeSession): Promise<boolean> }
   agents: { list(): RuntimeAgent[] }
   sessionPersistence: {
     listSnapshots(): Promise<Array<{ header: RuntimeSessionHeader; revision: string }>>
@@ -313,6 +391,8 @@ interface SupervisorRuntimeContext {
     ) => Promise<PromptAssembly>,
   ): void
   apiProxy: TaskAdmissionRuntime['apiProxy']
+  sandboxPolicy: { defaultMode: 'read-only' | 'workspace-write' | 'danger-full-access' }
+  approval: { config: { policy?: 'ask' | 'never' } }
   webServer: Parameters<typeof registerTaskAdmissionRoute>[0]
 }
 
@@ -346,6 +426,7 @@ function latestTaskIdentityBoundary(
               sessionId: value.sessionId,
               runId: value.runId,
               completionToken: value.completionToken,
+              writerMode: value.writerMode,
               ...typeof maxTokens === 'number' && Number.isSafeInteger(maxTokens) && maxTokens > 0
                 ? { tokenBudget: maxTokens }
                 : {},
@@ -364,7 +445,10 @@ function latestTaskIdentityBoundary(
           && typeof value.objective === 'string' && value.objective.length > 0
           && (value.writerMode === 'writer' || value.writerMode === 'read_only')) {
           return {
-            identity: { schemaVersion: 1, sessionId: value.taskId, completionToken: value.completionToken },
+            identity: {
+              schemaVersion: 1, sessionId: value.taskId, completionToken: value.completionToken,
+              writerMode: value.writerMode,
+            },
             boundarySeq: event.seq ?? index,
             ...event.time === undefined ? {} : { boundaryTime: event.time },
           }
@@ -699,6 +783,7 @@ export function registerTokenBudgetStateRoute(
     kind: 'exact',
     path: TOKEN_BUDGET_STATE_PATH,
     handler: async (req: IncomingMessage, res: ServerResponse) => {
+      if (!authorizeSupervisorRequest(req, res)) return
       let rpcId = 'invalid'
       const send = (result: unknown): void => {
         if (res.destroyed) return
@@ -742,11 +827,6 @@ const BUDGET_REASON = 'dsh-gate:token-budget-exhausted'
 const BUDGET_REQUEST_REASON = 'dsh-gate:token-budget-request-rejected'
 const BUDGET_ACCOUNTING_REASON = 'dsh-gate:token-budget-accounting-failed'
 
-type BudgetReservation = {
-  inputTokens: number
-  outputTokens: number
-}
-
 function runBudgetKey(rootId: string, runId: string): string {
   return `${rootId}\u0000${runId}`
 }
@@ -755,12 +835,64 @@ function requestBudgetKey(sessionId: string, turn: number, step: number): string
   return `${sessionId}\u0000${turn}\u0000${step}`
 }
 
-function reservedTokens(reservations: ReadonlyMap<string, BudgetReservation>, except?: string): number {
+function reservedTokens(reservations: readonly DurableBudgetReservation[], except?: string): number {
   let total = 0
-  for (const [key, reservation] of reservations) {
+  for (const reservation of reservations) {
+    const key = requestBudgetKey(reservation.requestSessionId, reservation.turn, reservation.step)
     if (key !== except) total += reservation.inputTokens + reservation.outputTokens
   }
   return total
+}
+
+function durableReservationId(reservation: DurableBudgetReservation): string {
+  return `${runBudgetKey(reservation.rootSessionId, reservation.runId)}\u0000${requestBudgetKey(
+    reservation.requestSessionId, reservation.turn, reservation.step,
+  )}`
+}
+
+function durableReservationStatus(
+  events: readonly RuntimeEvent[],
+  reservation: DurableBudgetReservation,
+): 'ambiguous' | 'never_dispatched' | 'settled' {
+  const startIndex = events.findIndex(event => event.type === 'step/start'
+    && (event.data as { turn?: unknown; step?: unknown }).turn === reservation.turn
+    && (event.data as { turn?: unknown; step?: unknown }).step === reservation.step)
+  if (startIndex < 0) return 'never_dispatched'
+  for (const event of events.slice(startIndex + 1)) {
+    const data = event.data as { turn?: unknown; step?: unknown }
+    if (data.turn !== reservation.turn) continue
+    if (usageSample(event)?.key === `${String(reservation.turn)}:${String(reservation.step)}`) return 'settled'
+    if (event.type === 'step/end' && data.step === reservation.step) return 'settled'
+    if (event.type === 'turn/end') return 'settled'
+  }
+  return 'ambiguous'
+}
+
+async function reconcileDurableReservations(
+  runtime: SupervisorRuntimeContext,
+  ledger: BudgetReservationLedger,
+  rootSessionId: string,
+  runId: string,
+  active: ReadonlySet<string>,
+): Promise<DurableBudgetReservation[]> {
+  const reservations = await ledger.list(rootSessionId, runId)
+  const snapshots = await runtime.sessionPersistence.listSnapshots()
+  const durableIds = new Set(snapshots.map(snapshot => snapshot.header.id))
+  const retained: DurableBudgetReservation[] = []
+  for (const reservation of reservations) {
+    if (active.has(durableReservationId(reservation))) {
+      retained.push(reservation)
+      continue
+    }
+    if (!durableIds.has(reservation.requestSessionId)) {
+      await ledger.settle(reservation)
+      continue
+    }
+    const inspected = await runtime.sessionPersistence.inspect(reservation.requestSessionId)
+    if (durableReservationStatus(inspected.events, reservation) === 'ambiguous') retained.push(reservation)
+    else await ledger.settle(reservation)
+  }
+  return retained
 }
 
 /** Minimal keyed mutex used only for short Host-side admission accounting sections. */
@@ -1028,20 +1160,21 @@ export function installDirectChildAuthorityGuards(
 
 export function installTokenBudgetGuards(
   runtime: SupervisorRuntimeContext,
-  options: { maxReservedOutputTokensPerRequest?: number } = {},
+  options: {
+    maxReservedOutputTokensPerRequest?: number
+    reservationLedger?: BudgetReservationLedger
+  } = {},
 ): void {
   const maxReservedOutputTokensPerRequest = options.maxReservedOutputTokensPerRequest ?? 8_192
+  const reservationLedger = options.reservationLedger ?? new FileBudgetReservationLedger()
   const durableUsageCache = new Map<string, { revision: string; session: RuntimeSession }>()
   const promptAssemblies = new WeakMap<RuntimeAgent, PromptAssembly>()
   const locks = new Map<string, Promise<void>>()
-  const reservations = new Map<string, Map<string, BudgetReservation>>()
+  const activeReservations = new Set<string>()
   const reservationGenerations = new Map<string, number>()
   const reservationWaiters = new Map<string, Set<() => void>>()
 
-  const releaseReservation = (runKey: string, requestKey: string): void => {
-    const runReservations = reservations.get(runKey)
-    if (runReservations?.delete(requestKey) !== true) return
-    if (runReservations.size === 0) reservations.delete(runKey)
+  const notifyReservationChange = (runKey: string): void => {
     reservationGenerations.set(runKey, (reservationGenerations.get(runKey) ?? 0) + 1)
     const waiters = reservationWaiters.get(runKey)
     if (waiters === undefined) return
@@ -1049,20 +1182,27 @@ export function installTokenBudgetGuards(
     for (const wake of waiters) wake()
   }
 
-  const releaseEventReservation = (session: RuntimeSession, event: RuntimeEvent): void => {
+  const settleEventReservations = async (session: RuntimeSession, event: RuntimeEvent): Promise<void> => {
     if (event.type !== 'assistant/message' && event.type !== 'step/end' && event.type !== 'turn/end') return
     const packet = budgetIdentityForSession(session, runtime.sessions.list())
     if (packet?.schemaVersion !== 2 || packet.runId === undefined) return
     const data = event.data as { turn?: unknown; step?: unknown }
     if (typeof data.turn !== 'number') return
     const runKey = runBudgetKey(packet.sessionId, packet.runId)
-    if (typeof data.step === 'number') {
-      releaseReservation(runKey, requestBudgetKey(session.header.id, data.turn, data.step))
-      return
-    }
-    const prefix = `${session.header.id}\u0000${data.turn}\u0000`
-    for (const key of reservations.get(runKey)?.keys() ?? []) {
-      if (key.startsWith(prefix)) releaseReservation(runKey, key)
+    try {
+      if (!await runtime.sessions.flush(session)) return
+      const durable = await reservationLedger.list(packet.sessionId, packet.runId)
+      const matches = durable.filter(reservation => reservation.requestSessionId === session.header.id
+        && reservation.turn === data.turn
+        && (typeof data.step !== 'number' || reservation.step === data.step))
+      for (const reservation of matches) {
+        await reservationLedger.settle(reservation)
+        activeReservations.delete(durableReservationId(reservation))
+      }
+      if (matches.length > 0) notifyReservationChange(runKey)
+    } catch {
+      // Fail closed: a reservation remains charged until a later durable
+      // checkpoint or restart reconciliation proves the request settled.
     }
   }
 
@@ -1104,7 +1244,7 @@ export function installTokenBudgetGuards(
   // immediate live-tree brake; every pre-step also reconciles persisted cold
   // descendants so Host restart and completed children remain accounted for.
   runtime.on('session/event', (session, event) => {
-    releaseEventReservation(session, event)
+    void settleEventReservations(session, event)
     if (usageSample(event) === undefined) return
     const sessions = runtime.sessions.list()
     const packet = budgetIdentityForSession(session, sessions)
@@ -1134,16 +1274,10 @@ export function installTokenBudgetGuards(
     return { kind: 'reject' }
   })
 
-  runtime.on('agent/request-error', async ({ agent, turn, step }, next) => {
-    const packet = budgetIdentityForSession(agent.session, runtime.sessions.list())
-    if (packet?.schemaVersion === 2 && packet.runId !== undefined) {
-      releaseReservation(
-        runBudgetKey(packet.sessionId, packet.runId),
-        requestBudgetKey(agent.session.header.id, turn, step),
-      )
-    }
-    return next()
-  })
+  // Request errors settle only after the loop appends and checkpoints the
+  // corresponding step/end. Releasing here would lose the reservation if the
+  // Host crashed between this hook and that durable boundary.
+  runtime.on('agent/request-error', async (_payload, next) => next())
 
   runtime.on('agent/request', async ({ agent, turn, step, signal }, next) => {
     const proposed = await next()
@@ -1172,16 +1306,22 @@ export function installTokenBudgetGuards(
             ...assembly.tools.length === 0 ? {} : { tools: assembly.tools },
           }
           const inputTokens = Math.max(0, Math.ceil(runtime.tokenMeter.measure(agent.session, requestHeader).totalTokens))
-          const runReservations = reservations.get(runKey) ?? new Map<string, BudgetReservation>()
+          const runReservations = await reconcileDurableReservations(
+            runtime, reservationLedger, rootId, runId, activeReservations,
+          )
+          const existing = runReservations.find(reservation =>
+            requestBudgetKey(reservation.requestSessionId, reservation.turn, reservation.step) === requestKey)
           const otherReserved = reservedTokens(runReservations, requestKey)
           const actualRemaining = state.remainingTokens
           if (state.exhausted) {
-            runReservations.delete(requestKey)
             return { kind: 'exhausted' as const, state }
           }
           if (actualRemaining <= inputTokens) {
-            runReservations.delete(requestKey)
             return { kind: 'insufficient' as const, state, inputTokens }
+          }
+          if (existing !== undefined) {
+            activeReservations.add(durableReservationId(existing))
+            return { kind: 'admitted' as const, outputTokens: existing.outputTokens }
           }
           const available = actualRemaining - otherReserved
           if (available <= inputTokens) {
@@ -1194,8 +1334,19 @@ export function installTokenBudgetGuards(
             ? maxReservedOutputTokensPerRequest
             : Math.max(1, Math.floor(proposed.maxTokens))
           const outputTokens = Math.min(requestedOutput, maxReservedOutputTokensPerRequest, available - inputTokens)
-          runReservations.set(requestKey, { inputTokens, outputTokens })
-          reservations.set(runKey, runReservations)
+          const reservation: DurableBudgetReservation = {
+            schemaVersion: 1,
+            rootSessionId: rootId,
+            runId,
+            requestSessionId: agent.session.header.id,
+            turn,
+            step,
+            inputTokens,
+            outputTokens,
+            createdAt: Date.now(),
+          }
+          await reservationLedger.reserve(reservation)
+          activeReservations.add(durableReservationId(reservation))
           return { kind: 'admitted' as const, outputTokens }
         } catch (error) {
           return { kind: 'error' as const, error }
@@ -1225,17 +1376,30 @@ export function installTokenBudgetGuards(
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
+  requiredHostToken()
   const resolved = Config(config) as Required<Config>
   const directChildToolNames = [...new Set(resolved.directChildToolNames.map(value => value.trim()))]
   if (directChildToolNames.length === 0 || directChildToolNames.some(value => value.length === 0)) {
     throw new Error('dsh-gate supervisor tools: directChildToolNames must contain at least one non-empty tool name')
   }
   const runtime = ctx as unknown as SupervisorRuntimeContext
-  const recovery = new HostRecoveryCoordinator(runtime as unknown as TaskAdmissionRuntime)
+  const admissionRuntime: TaskAdmissionRuntime = {
+    agents: runtime.agents as unknown as TaskAdmissionRuntime['agents'],
+    sessions: runtime.sessions as unknown as TaskAdmissionRuntime['sessions'],
+    sessionPersistence: runtime.sessionPersistence as unknown as TaskAdmissionRuntime['sessionPersistence'],
+    apiProxy: runtime.apiProxy,
+    policyDefaults: {
+      sandboxMode: runtime.sandboxPolicy.defaultMode,
+      approvalPolicy: runtime.approval.config.policy ?? 'ask',
+    },
+  }
+  const recovery = new HostRecoveryCoordinator(admissionRuntime)
+  const gitBaselines = new FileGitBaselineStore()
   const admission = new TaskAdmissionCoordinator(
-    runtime as unknown as TaskAdmissionRuntime,
+    admissionRuntime,
     undefined,
     recovery,
+    gitBaselines,
   )
   ctx.effect(() => registerTaskAdmissionRoute(
     runtime.webServer,
@@ -1249,6 +1413,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.webServer,
     runtime,
   ), 'dsh-gate token budget state route')
+  ctx.effect(() => registerSupervisorDescriptorRoute(
+    runtime.webServer,
+  ), 'dsh-gate supervisor descriptor route')
   installDirectChildAuthorityGuards(runtime, { directChildToolNames })
   installTokenBudgetGuards(runtime, {
     maxReservedOutputTokensPerRequest: resolved.maxReservedOutputTokensPerRequest,
@@ -1390,7 +1557,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     name: 'supervisor_handoff',
     description: 'Create the authoritative external-supervisor handoff and conclude this turn. Completion is valid '
       + 'only when the packet session/run identity and completionToken match and this successful tool result is followed by '
-      + 'the corresponding turn/end event. All model-facing fields and collection sizes are bounded; put complete detail '
+      + 'the corresponding turn/end event. A completed handoff cannot contain failed or not-run verification; an empty '
+      + 'verification list remains protocol-complete but externally unverified. All model-facing fields and collection sizes are bounded; put complete detail '
       + 'in an admitted .dsh-handoff/<runId>/ report instead of expanding the tool payload.',
     parameters: {
       taskId: { type: 'string', description: 'Legacy schemaVersion 1 session/task id.' },
@@ -1455,6 +1623,21 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (summaryError !== undefined) throw new Error(summaryError)
       const payloadError = handoffPayloadError(args)
       if (payloadError !== undefined) throw new Error(payloadError)
+      const identity = latestTaskIdentity(exec.agent.session.events)
+      let gitValidation
+      if (identity?.writerMode === 'writer') {
+        if (exec.agent.session.header.cwd === undefined) {
+          throw new Error('supervisor_handoff writer session has no authoritative cwd')
+        }
+        gitValidation = await gitBaselines.verify({
+          sessionId: identity.sessionId,
+          runId: identity.runId ?? args.runId ?? '',
+          cwd: exec.agent.session.header.cwd,
+        })
+        if (gitValidation.outOfScopePaths.length > 0) {
+          throw new Error(`supervisor_handoff found out-of-scope writer changes: ${gitValidation.outOfScopePaths.join(', ')}`)
+        }
+      }
       const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       const handoff = {
         ...args.taskId === undefined ? {} : { taskId: args.taskId },

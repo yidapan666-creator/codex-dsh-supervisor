@@ -16,11 +16,17 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./build-identity": {
+      "types": "./build-identity.d.mts",
+      "default": "./build-identity.mjs"
     }
   },
   "files": [
     "dist",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "build-identity.mjs",
+    "build-identity.d.mts"
   ],
   "dsh": {
     "bundle": {
@@ -28,8 +34,8 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "build": "node ../../scripts/update-build-identity.mjs --check && tsc -p tsconfig.json",
+    "check": "node ../../scripts/update-build-identity.mjs --check && tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4 <5",

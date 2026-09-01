@@ -69,7 +69,39 @@ describe('authoritative completion fold', () => {
   it('requires both a valid handoff result and the corresponding turn end', () => {
     expect(deriveObservation(state(handoffEvents(false))).status).toBe('WAITING')
     const complete = deriveObservation(state(handoffEvents()))
-    expect(complete).toMatchObject({ status: 'COMPLETED', boundarySeq: 4, asOfSeq: 4, taskId: 's1' })
+    expect(complete).toMatchObject({
+      status: 'COMPLETED', acceptanceStatus: 'UNVERIFIED',
+      boundarySeq: 4, handoffSeq: 3, handoffTime: 3, asOfSeq: 4, taskId: 's1',
+    })
+  })
+
+  it('separates passing verification from protocol completion and fails closed on contradictory claims', () => {
+    const passing = handoffEvents()
+    const passingCall = passing.find(entry => entry.type === 'tool/call')
+    const passingResult = passing.find(entry => entry.type === 'tool/result')
+    if (passingCall === undefined || passingResult === undefined) throw new Error('missing handoff fixture')
+    const args = {
+      taskId: 's1', completionToken: 'token', status: 'completed', stage: 'done', summary: 'verified', files: [],
+      verification: [{ command: 'pnpm test', outcome: 'passed', summary: 'passed' }],
+    }
+    passingCall.data = { ...(passingCall.data as object), arguments: JSON.stringify(args) }
+    passingResult.data = {
+      ...(passingResult.data as object),
+      message: { source: { callId: 'c1' }, content: [{
+        type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, artifacts: [] }) }],
+      }] },
+    }
+    expect(deriveObservation(state(passing))).toMatchObject({ status: 'COMPLETED', acceptanceStatus: 'PASSED' })
+
+    const contradictory = handoffEvents()
+    const failedCall = contradictory.find(entry => entry.type === 'tool/call')
+    if (failedCall === undefined) throw new Error('missing handoff fixture')
+    failedCall.data = { ...(failedCall.data as object), arguments: JSON.stringify({
+      ...args, verification: [{ command: 'pnpm test', outcome: 'failed', summary: 'failed' }],
+    }) }
+    expect(deriveObservation(state(contradictory))).toMatchObject({
+      status: 'FAILED', acceptanceStatus: 'FAILED', failure: { kind: 'WORKER_FAILED' },
+    })
   })
 
   it('uses the accepted canonical v2 handoff result as the authoritative terminal payload', () => {
