@@ -10,7 +10,7 @@
 //   - all generated state (managed clone, DSH_HOME, logs, host metadata,
 //     install metadata) lives under one gitignored repository-local dir.
 
-import { dirname, join, resolve } from 'node:path'
+import { delimiter as pathDelimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { DSH_GATE_BUILD_ID } from '../packages/dsh-supervisor-tools/build-identity.mjs'
@@ -75,6 +75,7 @@ export function resolvePaths(options = {}) {
     stateDir,
     dshRepo,
     dshHome,
+    corepackBinDir: join(stateDir, 'corepack-bin'),
     logsDir: join(stateDir, 'logs'),
     hostDir: join(stateDir, 'host'),
     hostTokenFile: join(stateDir, 'host', 'auth.token'),
@@ -397,14 +398,20 @@ export async function resolvePnpm(io) {
 }
 
 /**
- * Remove the caller's package-manager entrypoint before crossing into the
- * independently pinned DSH repository. Some package managers preserve an
- * inherited `npm_execpath`; DSH then reuses dsh-gate's pnpm for nested build
- * scripts instead of the version selected from DSH's own packageManager field.
+ * Put repo-aware Corepack shims ahead of caller package-manager shims before
+ * crossing into the independently pinned DSH repository. Some package
+ * managers preserve `npm_execpath`, while pnpm/action-setup puts its fixed
+ * version first via `PNPM_HOME`; either can make DSH reuse dsh-gate's pnpm
+ * instead of its own packageManager version. Call this only after creating the
+ * shim directory with `corepack enable --install-directory`.
  */
-export function packageManagerBoundaryEnv(environment = process.env) {
+export function packageManagerBoundaryEnv(environment = process.env, corepackBinDir) {
+  if (typeof corepackBinDir !== 'string' || corepackBinDir === '') {
+    throw new Error('package-manager boundary needs a Corepack shim directory')
+  }
   const isolated = { ...environment }
   delete isolated.npm_execpath
+  isolated.PATH = [corepackBinDir, isolated.PATH].filter(value => typeof value === 'string' && value !== '').join(pathDelimiter)
   return isolated
 }
 

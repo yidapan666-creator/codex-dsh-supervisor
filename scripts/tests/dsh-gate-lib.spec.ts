@@ -41,12 +41,26 @@ const PIN = DSH_PINNED_COMMIT
 const ROOT = '/repo/dsh-gate'
 
 describe('package-manager boundary', () => {
-  it('drops a stale caller npm_execpath without mutating other environment values', () => {
-    const source = { npm_execpath: '/root/pnpm-11.19.cjs', PATH: '/bin', DSH_HOME: '/state/home' }
-    const isolated = packageManagerBoundaryEnv(source)
+  it('prefers repo-aware Corepack shims and drops a stale npm_execpath', () => {
+    const source = {
+      npm_execpath: '/pnpm-home/pnpm-11.19.cjs',
+      PNPM_HOME: '/pnpm-home',
+      PATH: ['/pnpm-home', '/bin'].join(process.platform === 'win32' ? ';' : ':'),
+      DSH_HOME: '/state/home',
+    }
+    const isolated = packageManagerBoundaryEnv(source, '/state/corepack-bin')
 
-    expect(isolated).toEqual({ PATH: '/bin', DSH_HOME: '/state/home' })
-    expect(source.npm_execpath).toBe('/root/pnpm-11.19.cjs')
+    expect(isolated).toEqual({
+      PNPM_HOME: '/pnpm-home',
+      PATH: ['/state/corepack-bin', '/pnpm-home', '/bin'].join(process.platform === 'win32' ? ';' : ':'),
+      DSH_HOME: '/state/home',
+    })
+    expect(source.npm_execpath).toBe('/pnpm-home/pnpm-11.19.cjs')
+    expect(source.PNPM_HOME).toBe('/pnpm-home')
+  })
+
+  it('requires the generated Corepack shim directory', () => {
+    expect(() => packageManagerBoundaryEnv({ PATH: '/bin' })).toThrow(/Corepack shim directory/)
   })
 })
 
@@ -158,6 +172,7 @@ describe('resolvePaths', () => {
     expect(paths.stateDir).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}`)
     expect(paths.dshRepo).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/dsh`)
     expect(paths.dshHome).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/dsh-home`)
+    expect(paths.corepackBinDir).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/corepack-bin`)
     expect(paths.hostPidFile).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/host/host.pid`)
     expect(paths.hostStartLockFile).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/host/host.start.lock`)
     expect(paths.installJson).toBe(`${ROOT}/${DEFAULT_STATE_DIR_NAME}/install.json`)

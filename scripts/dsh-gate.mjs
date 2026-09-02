@@ -257,7 +257,17 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
   // their recorded state across re-runs; phases that run overwrite theirs.
   const previous = await io.readJson(paths.installJson).catch(() => undefined)
   const steps = { ...(previous?.steps ?? {}) }
-  const dshPackageManagerEnv = packageManagerBoundaryEnv(process.env)
+  let dshPackageManagerEnv = process.env
+  if (pnpm.via === 'corepack') {
+    await io.mkdir(paths.corepackBinDir)
+    const shimsReady = await runCommand(
+      { name: 'corepack-shims' },
+      { argv: ['corepack', 'enable', '--install-directory', paths.corepackBinDir] },
+      { cwd: paths.root, hint: 'Corepack must be able to create repo-local package-manager shims' },
+    )
+    if (!shimsReady) return false
+    dshPackageManagerEnv = packageManagerBoundaryEnv(process.env, paths.corepackBinDir)
+  }
   for (const phase of phases) {
     if (phase.name === 'metadata') continue
     if (phase.action === 'skip') {
