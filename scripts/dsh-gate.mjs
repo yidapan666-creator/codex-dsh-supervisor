@@ -17,6 +17,7 @@ import {
   formatPhaseFailure,
   hostLaunchArgv,
   parseCliArgs,
+  packageManagerBoundaryEnv,
   planBootstrap,
   readHostPidFile,
   resolveHostStatePaths,
@@ -256,6 +257,7 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
   // their recorded state across re-runs; phases that run overwrite theirs.
   const previous = await io.readJson(paths.installJson).catch(() => undefined)
   const steps = { ...(previous?.steps ?? {}) }
+  const dshPackageManagerEnv = packageManagerBoundaryEnv(process.env)
   for (const phase of phases) {
     if (phase.name === 'metadata') continue
     if (phase.action === 'skip') {
@@ -266,12 +268,12 @@ async function runBootstrap({ paths, options, pnpm, gateSha }) {
     let ok
     switch (phase.name) {
       case 'dsh-install': {
-        ok = await runCommand(phase, { argv: phase.argv }, { cwd: phase.cwd, hint: 'if the frozen lockfile is out of sync with the pinned commit, the checkout is not the pinned tree' })
+        ok = await runCommand(phase, { argv: phase.argv }, { cwd: phase.cwd, env: dshPackageManagerEnv, hint: 'if the frozen lockfile is out of sync with the pinned commit, the checkout is not the pinned tree' })
         if (ok) steps.dshInstall = { done: true, sha: DSH_PINNED_COMMIT }
         break
       }
       case 'dsh-build': {
-        ok = await runCommand(phase, { argv: phase.argv }, { cwd: phase.cwd, timeoutMs: 30 * 60 * 1000, hint: 'DSH build failures usually mean missing build prerequisites; see DEPLOYMENT.md' })
+        ok = await runCommand(phase, { argv: phase.argv }, { cwd: phase.cwd, env: dshPackageManagerEnv, timeoutMs: 30 * 60 * 1000, hint: 'DSH build failures usually mean missing build prerequisites; see DEPLOYMENT.md' })
         if (ok) steps.dshBuild = { done: true, sha: DSH_PINNED_COMMIT }
         break
       }

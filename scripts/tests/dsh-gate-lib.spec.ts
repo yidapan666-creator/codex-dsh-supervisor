@@ -23,6 +23,7 @@ import {
   linkTargetMatches,
   normalizeRemoteUrl,
   obtainCheckoutCommands,
+  packageManagerBoundaryEnv,
   parseCliArgs,
   planBootstrap,
   redactOutput,
@@ -38,6 +39,16 @@ import {
 
 const PIN = DSH_PINNED_COMMIT
 const ROOT = '/repo/dsh-gate'
+
+describe('package-manager boundary', () => {
+  it('drops a stale caller npm_execpath without mutating other environment values', () => {
+    const source = { npm_execpath: '/root/pnpm-11.19.cjs', PATH: '/bin', DSH_HOME: '/state/home' }
+    const isolated = packageManagerBoundaryEnv(source)
+
+    expect(isolated).toEqual({ PATH: '/bin', DSH_HOME: '/state/home' })
+    expect(source.npm_execpath).toBe('/root/pnpm-11.19.cjs')
+  })
+})
 
 // ---------------------------------------------------------------------------
 // fakes

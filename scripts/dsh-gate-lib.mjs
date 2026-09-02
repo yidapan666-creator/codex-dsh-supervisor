@@ -396,6 +396,18 @@ export async function resolvePnpm(io) {
   return { argv: ['pnpm'], via: 'path', version: pnpmProbe.stdout.trim() }
 }
 
+/**
+ * Remove the caller's package-manager entrypoint before crossing into the
+ * independently pinned DSH repository. Some package managers preserve an
+ * inherited `npm_execpath`; DSH then reuses dsh-gate's pnpm for nested build
+ * scripts instead of the version selected from DSH's own packageManager field.
+ */
+export function packageManagerBoundaryEnv(environment = process.env) {
+  const isolated = { ...environment }
+  delete isolated.npm_execpath
+  return isolated
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap planning
 // ---------------------------------------------------------------------------
