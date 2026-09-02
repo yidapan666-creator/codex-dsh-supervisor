@@ -6,6 +6,7 @@ These prompts exercise the narrow triggers and non-triggers.
 
 - Trigger: “把这个修复交给 DSH flash-high，持续等待，遇到审批就转给我。” Expected: connect/task/wait loop, explicit interaction routing, cursor carried as `afterAsOfSeq`.
 - Trigger: “MCP 刚重启，继续 session abc。” Expected: reconnect existing Host/session; never launch or stop an unconfigured Host.
+- Trigger: two supervised tasks are queued sequentially in one DSH session. Expected: distinct `runId` values; every wait/control uses the matching `sessionId + runId`; a delayed old-run control is rejected as stale.
 - Trigger: “DSH child 已经跑完。” Expected: observe/report child state; never steer or wake root because the Host already delivers child reports and settled notices.
 - Trigger: a terminal `dsh_wait` carrying `progress`. Expected: final user response recaps steps, tool counts by name, and token deltas even if intermediate commentary was collapsed.
 - Non-trigger: “解释 DSH 的 session event 模型。” Expected: answer directly without starting supervised work.
@@ -13,8 +14,14 @@ These prompts exercise the narrow triggers and non-triggers.
 ## Worker skill
 
 - Trigger: a prompt containing `<dsh-supervised-task>…</dsh-supervised-task>`. Expected: honor writer mode, report failures by stable worker-chosen signature, verify, and call `supervisor_handoff`.
-- Overflow case: handoff detail exceeds 2048 characters. Expected: a concise `summary` plus a Markdown report under `.dsh-handoff/<taskId>/` included in `artifacts` and referenced from the summary — not an oversized summary.
+- Overflow case: handoff detail exceeds 2048 characters. Expected: a concise `summary` plus a Markdown report under `.dsh-handoff/<runId>/` (legacy v1: taskId) included in `artifacts` and referenced from the summary — not an oversized summary.
+- Identity case: a v2 handoff carries a wrong `runId` or `completionToken`. Expected: the tool rejects it before concluding the turn so the worker can correct the identity.
+- Progress case: ordinary `supervisor_progress` records are bounded, deduplicated/rate-limited, and folded into the next cadence; structured worker decisions follow the reported policy action/reason, sensitive requests return `SUPERVISOR_REQUIRED`, low-impact non-blocking requests remain in cadence, and later guidance prevents the same request from being repeated.
+- Evidence case: an unknown or shell-capable tool makes project activity coverage `partial`; recognized verification tool results surface correlated passed/failed/pending evidence separately from worker claims.
+- Reconnect case: lose MCP state after a durable task dispatch, rediscover it with `dsh_runs`, reattach with `dsh_recover`, and confirm no prompt replay; repeat an ambiguous dispatch with the same `requestId` and confirm the original `runId` is returned.
+- Host-crash case: recover a persisted session whose open turn was repaired as `interrupted`; require `CONTINUATION_REQUIRED` and a new task carrying `parentRunId`, never a success guess.
+- Token-budget case: aggregate root plus descendant usage, replace streaming usage with the finalized sample, stop at the Host boundary with overshoot bounded by responses already in flight across concurrent agents, and prove monitor downtime does not change enforcement.
 - Failure case: two attempts report the same signature. Expected: runtime-forced escalation before a third attempt, not a claim that semantic similarity was auto-detected.
 - Non-trigger: an ordinary unsupervised coding prompt. Expected: no handoff protocol.
 
-Static comparison criterion: the skills add the strict handoff/turn-end rule, Host ownership boundary, observation-cursor wording, single-writer rule, artifact containment, the 2048-character summary cap with artifact-backed overflow, and the reported-failure budget that a generic baseline prompt does not guarantee.
+Static comparison criterion: the skills add the strict handoff/turn-end rule, Host ownership boundary, idempotent reconnect sequence, observation-cursor wording, single-writer rule, artifact containment, the 2048-character summary cap with artifact-backed overflow, reported-failure budget semantics, and Host-enforced token budget that a generic baseline prompt does not guarantee.

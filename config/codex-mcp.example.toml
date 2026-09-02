@@ -14,16 +14,35 @@
 command = "node"
 args = ["<workspace-root>/packages/mcp-server/dist/cli.js"]
 startup_timeout_sec = 20
-tool_timeout_sec = 310
+# dsh_wait may hold for the full 300-second cadence, then perform a bounded
+# authoritative refresh before returning. Keep enough client-side headroom.
+tool_timeout_sec = 360
 
 [mcp_servers.dsh_gate.tools.dsh_answer_approval]
 approval_mode = "prompt"
 
 [mcp_servers.dsh_gate.env]
 DSH_HOST_URL = "http://127.0.0.1:8080"
+DSH_HOST_TOKEN_FILE = "<workspace-root>/.dsh-state/host/auth.token"
 DSH_WORKER_PROVIDER = "deepseek-official"
 DSH_WORKER_MODEL = "deepseek-v4-flash"
 DSH_WORKER_REASONING_EFFORT = "high"
+DSH_DECISION_POLICY_DIR = "<workspace-root>/config/decision-policies"
+DSH_DECISION_POLICY_FILE = "<workspace-root>/config/decision-policies/2026-08-26.v1.json"
+# Optional observer-only candidate. It is pinned per run but never controls behavior.
+# DSH_DECISION_SHADOW_POLICY_FILE = "<workspace-root>/config/decision-policies/2026-08-26.shadow-v1.json"
+DSH_RUN_JOURNAL_DIR = "<workspace-root>/.dsh-state/memory/runs"
+# Set to "false" to disable model-free terminal run records.
+# DSH_RUN_JOURNAL_ENABLED = "false"
+
+# Optional deployment default for a whole supervised run tree. A dsh_task
+# tokenBudget overrides it. The Host counts provider-reported uncached input,
+# cache read/write, and output tokens; no money estimate is used.
+# DSH_DEFAULT_TASK_TOKEN_BUDGET = "300000"
+
+# Optional read-only cross-check against the user's dsh-usage-monitor bridge.
+# It is session-level observability only and never controls the hard budget.
+# DSH_USAGE_MONITOR_URL = "http://127.0.0.1:41999"
 
 # Optional: let the MCP server auto-launch the Host when it is not reachable.
 # The launch is detached and MCP never retains a kill capability; stop the

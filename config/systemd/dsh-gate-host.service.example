@@ -1,0 +1,15 @@
+[Unit]
+Description=dsh-gate independent DSH Host
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/TO/dsh-gate
+ExecStart=/ABSOLUTE/PATH/TO/node /ABSOLUTE/PATH/TO/dsh-gate/scripts/dsh-gate.mjs host run --host http://127.0.0.1:8080
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

@@ -16,11 +16,17 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./build-identity": {
+      "types": "./build-identity.d.mts",
+      "default": "./build-identity.mjs"
     }
   },
   "files": [
     "dist",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "build-identity.mjs",
+    "build-identity.d.mts"
   ],
   "dsh": {
     "bundle": {
@@ -28,11 +34,13 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "build": "node ../../scripts/update-build-identity.mjs --check && tsc -p tsconfig.json",
+    "check": "node ../../scripts/update-build-identity.mjs --check && tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4 <5",
+    "@deepseek-ai/dsh-host-apiproxy": ">=0.1.0-rc.8 <1",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.0-rc.8 <1",
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <1",
     "@deepseek-ai/dsh-system-prompt": ">=0.1.0-rc.8 <1"
   },
@@ -41,6 +49,8 @@
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-host-apiproxy": { "optional": true },
+    "@deepseek-ai/dsh-host-webserver": { "optional": true },
     "@deepseek-ai/dsh-tools": { "optional": true },
     "@deepseek-ai/dsh-system-prompt": { "optional": true }
   }

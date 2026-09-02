@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { HANDOFF_SUMMARY_LIMIT, handoffSummaryError } from '../src/index.js'
+import {
+  HANDOFF_FILES_LIMIT, HANDOFF_PATH_LIMIT, HANDOFF_SUMMARY_LIMIT, SUPERVISOR_PROGRESS_MIN_INTERVAL_MS,
+  handoffIdentityError, handoffPayloadError, handoffSummaryError, progressIdentityError, progressPayloadError,
+  supervisorProgressDecision,
+  type HandoffPayloadArgs,
+} from '../src/index.js'
 
 describe('handoff summary limit', () => {
   it('accepts a summary at exactly the 2048-character boundary', () => {
@@ -22,5 +27,145 @@ describe('handoff summary limit', () => {
   it('falls back to a generic placeholder when no task id is available', () => {
     const error = handoffSummaryError('x'.repeat(HANDOFF_SUMMARY_LIMIT + 1))
     expect(error).toContain('.dsh-handoff/<taskId>/')
+  })
+})
+
+describe('handoff payload limits', () => {
+  const base = (): HandoffPayloadArgs => ({
+    sessionId: 'session-1', runId: '11111111-1111-4111-8111-111111111111', completionToken: 'token',
+    status: 'completed', stage: 'done', summary: 'verified', files: [], verification: [], artifacts: [],
+  })
+
+  it('accepts compact fields at their boundaries', () => {
+    const args = base()
+    args.files = Array.from({ length: HANDOFF_FILES_LIMIT }, () => 'x'.repeat(HANDOFF_PATH_LIMIT))
+    expect(handoffPayloadError(args)).toBeUndefined()
+  })
+
+  it('rejects an oversized field with the artifact recovery convention', () => {
+    const args = base()
+    args.files = Array.from({ length: HANDOFF_FILES_LIMIT + 1 }, (_, index) => `file-${index}`)
+    expect(handoffPayloadError(args)).toMatch(/files exceeds 64 entries/)
+    expect(handoffPayloadError(args)).toContain(`.dsh-handoff/${args.runId}/`)
+  })
+
+  it('rejects a completed handoff whose own verification is not passing', () => {
+    for (const outcome of ['failed', 'not_run'] as const) {
+      const args = base()
+      args.verification = [{ command: 'pnpm test', outcome, summary: 'not passing' }]
+      expect(handoffPayloadError(args)).toMatch(/status completed cannot include verification outcome/)
+    }
+  })
+})
+
+describe('handoff run identity', () => {
+  const packet = (value: object): { type: string; data: unknown } => ({
+    type: 'user/message',
+    data: { content: [{ type: 'text', text: `<dsh-supervised-task>\n${JSON.stringify(value)}\n</dsh-supervised-task>` }] },
+  })
+  const v2 = {
+    schemaVersion: 2,
+    sessionId: 'session-1',
+    runId: '11111111-1111-4111-8111-111111111111',
+    completionToken: '22222222-2222-4222-8222-222222222222',
+    objective: 'ship it',
+    writerMode: 'writer',
+  }
+
+  it('accepts the exact latest session, run, and completion token', () => {
+    expect(handoffIdentityError([packet(v2)], {
+      sessionId: v2.sessionId, runId: v2.runId, completionToken: v2.completionToken,
+    })).toBeUndefined()
+  })
+
+  it('rejects a stale run before the worker concludes its turn', () => {
+    expect(handoffIdentityError([packet(v2)], {
+      sessionId: v2.sessionId,
+      runId: '33333333-3333-4333-8333-333333333333',
+      completionToken: v2.completionToken,
+    })).toMatch(/runId does not match/i)
+  })
+
+  it('rejects a wrong completion token before the worker concludes its turn', () => {
+    expect(handoffIdentityError([packet(v2)], {
+      sessionId: v2.sessionId,
+      runId: v2.runId,
+      completionToken: '33333333-3333-4333-8333-333333333333',
+    })).toMatch(/completionToken does not match/i)
+  })
+})
+
+describe('bounded supervisor progress', () => {
+  const packet = (value: object): { type: string; time?: number; data: unknown } => ({
+    type: 'user/message',
+    data: { content: [{ type: 'text', text: `<dsh-supervised-task>\n${JSON.stringify(value)}\n</dsh-supervised-task>` }] },
+  })
+  const v2 = {
+    schemaVersion: 2,
+    sessionId: 'session-1',
+    runId: '11111111-1111-4111-8111-111111111111',
+    completionToken: '22222222-2222-4222-8222-222222222222',
+    objective: 'ship it',
+    writerMode: 'writer',
+  }
+  const progress = {
+    sessionId: v2.sessionId, runId: v2.runId,
+    phase: 'implementing' as const,
+    milestone: 'Identity fold is implemented.',
+    nextAction: 'Run tests.',
+    needsSupervisor: false,
+  }
+  const call = (args: object, time: number) => ({
+    type: 'tool/call', time,
+    data: { name: 'supervisor_progress', arguments: JSON.stringify(args) },
+  })
+
+  it('accepts progress for the current run and rejects stale run identity', () => {
+    expect(progressIdentityError([packet(v2)], progress)).toBeUndefined()
+    expect(progressIdentityError([packet(v2)], {
+      ...progress, runId: '33333333-3333-4333-8333-333333333333',
+    })).toMatch(/runId does not match/i)
+  })
+
+  it('enforces progress field and collection bounds at the Host execution boundary', () => {
+    expect(progressPayloadError(progress)).toBeUndefined()
+    expect(progressPayloadError({ ...progress, milestone: 'x'.repeat(513) }))
+      .toBe('supervisor_progress milestone exceeds 512 characters')
+    expect(progressPayloadError({
+      ...progress,
+      decision: {
+        category: 'information', impact: 'low', blocking: false, request: 'choose',
+        options: Array.from({ length: 6 }, (_, index) => `option-${index}`),
+      },
+    })).toBe('supervisor_progress decision.options exceeds 5 entries')
+  })
+
+  it('deduplicates an identical prior progress record', () => {
+    expect(supervisorProgressDecision([
+      packet(v2), call(progress, 1_000), call(progress, 2_000),
+    ], progress, 2_000)).toEqual({ accepted: false, reason: 'duplicate' })
+  })
+
+  it('rate-limits changed ordinary progress but lets a supervisor decision through', () => {
+    const changed = { ...progress, milestone: 'Focused tests pass.' }
+    expect(supervisorProgressDecision([
+      packet(v2), call(progress, 1_000), call(changed, 2_000),
+    ], changed, 1_000 + SUPERVISOR_PROGRESS_MIN_INTERVAL_MS - 1)).toEqual({
+      accepted: false, reason: 'rate_limited',
+    })
+    const decision = { ...changed, needsSupervisor: true }
+    expect(supervisorProgressDecision([
+      packet(v2), call(progress, 1_000), call(decision, 2_000),
+    ], decision, 2_000)).toEqual({ accepted: true })
+    const structuredDecision = {
+      ...changed,
+      decision: {
+        category: 'information' as const, impact: 'low' as const, blocking: false,
+        request: 'Review this naming choice at the normal cadence.',
+      },
+    }
+    expect(supervisorProgressDecision([
+      packet(v2), call(progress, 1_000), call(structuredDecision, 2_000),
+    ], structuredDecision, 2_000)).toEqual({ accepted: true })
   })
 })

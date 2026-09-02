@@ -1,12 +1,47 @@
-import { randomUUID } from 'node:crypto'
-import { lstat, realpath } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { lstat, realpath, stat } from 'node:fs/promises'
+import { lstatSync, readFileSync, readdirSync } from 'node:fs'
+import { dirname, isAbsolute, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
-import { deriveObservation, parseTaskPacket, progressObservation, timeoutObservation } from './fold.js'
 import {
-  HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
+  decisionPolicyDigest, DEFAULT_DECISION_POLICY, evaluateDecision, parseDecisionPolicy,
+  type DecisionCategory, type DecisionPolicy,
+} from '@dsh-gate/decision-policy'
+import {
+  deriveObservation, parseTaskPacket, progressObservation,
+  supervisorDecisionHistory, taskBoundarySeq, taskPacketEntries, timeoutObservation,
+} from './fold.js'
+import {
+  FileRunJournal, isRunRecordOutcome, runRecordId, type RunJournal, type RunRecord,
+} from '@dsh-gate/run-journal'
+import {
+  authenticatedHostConnection, HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
 } from './host.js'
-import { TASK_PACKET_END, TASK_PACKET_START, type Observation, type TaskPacket } from './contracts.js'
+import {
+  FAILURE_MESSAGE_LIMIT, recoveryCapsuleSchema, taskPacketV2Schema,
+  telemetrySessionStatsSchema, telemetryTokenUsageSchema,
+  type DshEvent, type ExecutionBrief, type ExecutionBriefInput, type Observation, type RecoveryCapsule, type TaskRuntimeState,
+} from './contracts.js'
+import { UsageMonitorClient } from './usage-monitor.js'
+import {
+  compileTaskPrompt, normalizeExecutionBrief, normalizeTaskInstructions, TASK_INSTRUCTION_PROFILE,
+} from './task-prompt.js'
+
+interface SessionAddress {
+  sessionId?: string | undefined
+  /** Deprecated v1 alias for sessionId. */
+  taskId?: string | undefined
+}
+
+function sessionIdOf(input: SessionAddress): string {
+  if (input.sessionId !== undefined && input.taskId !== undefined && input.sessionId !== input.taskId) {
+    throw new Error(`sessionId ${input.sessionId} does not match deprecated taskId ${input.taskId}`)
+  }
+  const sessionId = input.sessionId ?? input.taskId
+  if (sessionId === undefined || sessionId.trim() === '') throw new Error('sessionId is required')
+  return sessionId
+}
 
 function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; error: { code: string; message: string } } }): T {
   if (!response.result.ok) throw new Error(`${response.result.error.code}: ${response.result.error.message}`)
@@ -15,6 +50,55 @@ function unwrap<T>(response: { result: { ok: true; value: T } | { ok: false; err
 
 function normalizedUrl(value: string): string {
   return new URL(value).origin
+}
+
+function loopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  return normalized === 'localhost' || normalized === '::1' || normalized.startsWith('127.')
+}
+
+/** Refuse credential/path-bearing endpoints and remote plaintext transport. */
+export function assertSecureHostUrl(value: string): void {
+  const url = new URL(value)
+  if (url.username !== '' || url.password !== '' || (url.pathname !== '' && url.pathname !== '/')
+    || url.search !== '' || url.hash !== '') {
+    throw new Error('DSH Host URL must be an origin without credentials, path, query, or fragment')
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('DSH Host URL must use http or https')
+  }
+  if (url.protocol === 'http:' && !loopbackHostname(url.hostname)) {
+    throw new Error('non-loopback DSH Host URLs require HTTPS')
+  }
+}
+
+function readPrivateHostTokenFile(path: string): string {
+  const metadata = lstatSync(path)
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error('DSH Host token path must be a regular file, not a symlink')
+  }
+  if ((metadata.mode & 0o077) !== 0) {
+    throw new Error('DSH Host token file must not be accessible by group or other users (expected mode 0600)')
+  }
+  return readFileSync(path, 'utf8').trim()
+}
+
+function positiveIntegerEnvironment(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const raw = env[name]
+  if (raw === undefined) return undefined
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`)
+  return value
+}
+
+/** Discovery could not prove absence because at least one configured Host was unavailable. */
+export class HostDiscoveryError extends Error {
+  readonly retryable = true
+
+  constructor(message: string, readonly unavailableHosts: readonly string[]) {
+    super(message)
+    this.name = 'HostDiscoveryError'
+  }
 }
 
 /**
@@ -45,11 +129,32 @@ export async function resolveWriterDomain(cwd: string): Promise<string> {
   return resolved
 }
 
+/** Resolve and validate the project directory used to create a DSH session. */
+export async function resolveSessionCwd(cwd: string): Promise<string> {
+  if (!isAbsolute(cwd)) throw new Error('cwd must be an absolute path for a new DSH session')
+  let resolved: string
+  try {
+    resolved = await realpath(cwd)
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(`cwd does not exist or cannot be resolved: ${cwd}`)
+    throw error
+  }
+  if (!(await stat(resolved)).isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`)
+  return resolved
+}
+
 export interface GatewayDependencies {
-  /** Overridable for tests; defaults to {@link resolveWriterDomain}. */
+  /** @deprecated Writer admission is Host-owned; retained for source compatibility and ignored. */
   resolveWriterDomain?: (cwd: string) => Promise<string>
   /** Overridable for tests; defaults to a real {@link HostConnection}. */
   createConnection?: (baseUrl: string) => HostConnection
+  /** Overridable for tests; defaults to detached Host launch. */
+  launchHost?: (config: HostLaunchConfig) => Promise<void>
+  /** Overridable for tests; defaults to realpath plus directory validation. */
+  resolveSessionCwd?: (cwd: string) => Promise<string>
 }
 
 export function attachChildObservations<T extends { id: string }>(
@@ -61,6 +166,8 @@ export function attachChildObservations<T extends { id: string }>(
     const row = rows.get(entry.id)
     if (row === undefined) return { ...entry }
     const values = row.projections?.values as Record<string, unknown> | undefined
+    const sessionStats = telemetrySessionStatsSchema.safeParse(values?.sessionStats)
+    const tokenUsage = telemetryTokenUsageSchema.safeParse(values?.tokenUsage)
     return {
       ...entry,
       observation: {
@@ -68,8 +175,8 @@ export function attachChildObservations<T extends { id: string }>(
         ...row.projections === undefined ? {} : {
           telemetry: {
             asOfSeq: row.projections.asOfSeq,
-            ...values?.sessionStats === undefined ? {} : { sessionStats: values.sessionStats },
-            ...values?.tokenUsage === undefined ? {} : { tokenUsage: values.tokenUsage },
+            ...sessionStats.success ? { sessionStats: sessionStats.data } : {},
+            ...tokenUsage.success ? { tokenUsage: tokenUsage.data } : {},
           },
         },
       },
@@ -77,29 +184,183 @@ export function attachChildObservations<T extends { id: string }>(
   })
 }
 
+function boundedChildLabel<T extends { label?: string }>(entry: T): T {
+  return entry.label === undefined || entry.label.length <= 256
+    ? entry
+    : { ...entry, label: entry.label.slice(0, 256) }
+}
+
+interface RunTreeBudgetStop {
+  kind: 'exhausted' | 'request_rejected'
+  usedTokens?: number
+  limitTokens?: number
+  remainingTokens?: number
+  requiredInputTokens?: number
+}
+
+interface RunTreeConvergence {
+  activeSessionIds: string[]
+  unsettledSessionIds: string[]
+  latestChildTerminalTime?: number
+  budgetStop?: RunTreeBudgetStop
+}
+
+function reasonFields(text: string): Map<string, string> {
+  return new Map(text.split(';').slice(1).flatMap((part) => {
+    const separator = part.indexOf('=')
+    return separator < 0 ? [] : [[part.slice(0, separator), part.slice(separator + 1)] as const]
+  }))
+}
+
+function hookBudgetStop(events: readonly DshEvent[], afterSeq: number, runId: string): RunTreeBudgetStop | undefined {
+  const terminal = events.findLast((event) => {
+    if (event.type !== 'turn/end' || event.seq <= afterSeq) return false
+    const reason = (event.data as { reason?: { kind?: unknown; reason?: { kind?: unknown; reason?: unknown } } }).reason
+    return reason?.kind === 'aborted' && reason.reason?.kind === 'hook'
+      && typeof reason.reason.reason === 'string'
+      && (reason.reason.reason.startsWith('dsh-gate:token-budget-exhausted;')
+        || reason.reason.reason.startsWith('dsh-gate:token-budget-request-rejected;'))
+      && reasonFields(reason.reason.reason).get('runId') === runId
+  })
+  if (terminal === undefined) return undefined
+  const text = ((terminal.data as { reason: { reason: { reason: string } } }).reason.reason.reason)
+  const fields = reasonFields(text)
+  const used = Number(fields.get('used'))
+  const limit = Number(fields.get('limit'))
+  const remaining = Number(fields.get('remaining'))
+  const requiredInput = Number(fields.get('requiredInput'))
+  return {
+    kind: text.startsWith('dsh-gate:token-budget-request-rejected;') ? 'request_rejected' : 'exhausted',
+    ...Number.isSafeInteger(used) && used >= 0 ? { usedTokens: used } : {},
+    ...Number.isSafeInteger(limit) && limit > 0 ? { limitTokens: limit } : {},
+    ...Number.isSafeInteger(remaining) && remaining >= 0 ? { remainingTokens: remaining } : {},
+    ...Number.isSafeInteger(requiredInput) && requiredInput > 0 ? { requiredInputTokens: requiredInput } : {},
+  }
+}
+
+/** A direct child belongs to this run only after a post-boundary activation that does not start another run. */
+function affiliatedChildActivation(
+  events: readonly DshEvent[],
+  childSessionId: string,
+  rootBoundaryTime: number,
+  runId: string,
+): DshEvent | undefined {
+  const nested = taskPacketEntries(events).findLast(({ packet, seq }) => {
+    const boundary = events.find(event => event.seq === seq)
+    return packet.schemaVersion === 2 && packet.sessionId === childSessionId
+      && boundary !== undefined && boundary.time >= rootBoundaryTime
+  })
+  if (nested !== undefined && nested.packet.schemaVersion === 2 && nested.packet.runId !== runId) return undefined
+  return events.find((event) => {
+    if (event.type !== 'user/message' || event.time < rootBoundaryTime) return false
+    const packet = parseTaskPacket([event])
+    return packet === undefined || (packet.schemaVersion === 2 && packet.sessionId === childSessionId
+      && packet.runId === runId)
+  })
+}
+
 export interface GatewayConfig {
   hostUrls: string[]
+  hostToken?: string
+  enforceTransportSecurity?: boolean
   launch?: HostLaunchConfig
   defaultProvider?: string
   defaultModel?: string
   defaultReasoningEffort?: string
+  decisionPolicy?: DecisionPolicy
+  shadowDecisionPolicy?: DecisionPolicy
+  decisionPolicyCatalog?: DecisionPolicy[]
+  runJournal?: RunJournal | false
+  defaultTaskTokenBudget?: number
+  usageMonitor?: UsageMonitorClient | false
+}
+
+export const DEFAULT_RUN_JOURNAL_DIR = fileURLToPath(new URL('../../../.dsh-state/memory/runs/', import.meta.url))
+export const DEFAULT_HOST_TOKEN_FILE = fileURLToPath(new URL('../../../.dsh-state/host/auth.token', import.meta.url))
+export const DEFAULT_DECISION_POLICY_DIR = fileURLToPath(new URL('../../../config/decision-policies/', import.meta.url))
+export const DEFAULT_DECISION_POLICY_FILE = join(DEFAULT_DECISION_POLICY_DIR, '2026-08-26.v1.json')
+
+function readDecisionPolicy(path: string): DecisionPolicy {
+  return parseDecisionPolicy(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+}
+
+function readDecisionPolicyCatalog(directory: string): DecisionPolicy[] {
+  return readdirSync(directory).filter(name => name.endsWith('.json')).sort()
+    .map(name => readDecisionPolicy(join(directory, name)))
 }
 
 /** The five-minute aggregated progress cadence used by {@link GatewayManager.wait}. */
 export const DEFAULT_WAIT_TIMEOUT_MS = 300_000
+/** Periodic authoritative reconciliation while mux events drive cached observations. */
+export const WAIT_RECONCILE_INTERVAL_MS = 30_000
+
+/** Presets whose durable event surface preserves every dsh-gate supervision invariant. */
+export const SUPERVISED_AGENT_PRESETS = ['standard', 'code'] as const
+export type SupervisedAgentPreset = typeof SUPERVISED_AGENT_PRESETS[number]
+
+function supervisedAgentPreset(value: string | undefined): SupervisedAgentPreset {
+  if (value === 'standard' || value === 'code') return value
+  const detail = value === undefined
+    ? 'the Host did not report a durable preset'
+    : value === 'minimal'
+      ? 'Minimal uses a reduced tool/skill stack and cannot guarantee the supervised read-only boundary'
+      : value === 'cordis'
+        ? 'Creator can modify the DSH runtime and preset compositions outside project-scoped task authority'
+        : `preset ${JSON.stringify(value)} has not been qualified against the strict supervision protocol`
+  throw new Error(`${detail}; use agentPreset "standard" or "code" (PTC mode) for dsh-gate sessions`)
+}
+
+/** Diagnostic fold matching Host ownership: an interrupted writer stays owned until exact continuation. */
+export function writerLeaseHeld(events: readonly import('./contracts.js').DshEvent[]): boolean {
+  const boundary = taskBoundarySeq(events)
+  const packet = parseTaskPacket(events)
+  if (boundary === undefined || packet?.writerMode !== 'writer') return false
+  const terminal = events.findLast(event => event.type === 'turn/end' && event.seq > boundary)
+  if (terminal === undefined) return true
+  return (terminal.data as { reason?: { kind?: unknown } }).reason?.kind === 'interrupted'
+}
 
 export class GatewayManager {
   private readonly connections = new Map<string, HostConnection>()
+  private readonly sessionHosts = new Map<string, string>()
   private readonly knownUrls: string[]
-  private readonly resolveDomain: (cwd: string) => Promise<string>
   private readonly createConnection: (baseUrl: string) => HostConnection
-  /** Tail of the in-process writer-admission queue; serializes check-then-act within one GatewayManager. */
-  private admissionTail: Promise<void> = Promise.resolve()
+  private readonly launchHost: (config: HostLaunchConfig) => Promise<void>
+  private readonly resolveCwd: (cwd: string) => Promise<string>
+  private readonly decisionPolicy: DecisionPolicy
+  private readonly shadowDecisionPolicy: DecisionPolicy | undefined
+  private readonly decisionPolicies = new Map<string, DecisionPolicy>()
+  private readonly runJournal: RunJournal | undefined
+  private readonly usageMonitor: UsageMonitorClient | undefined
+  private launchPromise: Promise<void> | undefined
 
   constructor(private readonly config: GatewayConfig, deps: GatewayDependencies = {}) {
+    if (config.enforceTransportSecurity === true) {
+      if (config.hostToken === undefined || config.hostToken.length < 32) {
+        throw new Error('DSH Host authentication requires a token with at least 32 characters')
+      }
+      for (const url of config.hostUrls) assertSecureHostUrl(url)
+    }
     this.knownUrls = [...new Set(config.hostUrls.map(normalizedUrl))]
-    this.resolveDomain = deps.resolveWriterDomain ?? resolveWriterDomain
-    this.createConnection = deps.createConnection ?? (baseUrl => new HostConnection(baseUrl))
+    this.createConnection = deps.createConnection ?? (baseUrl => config.hostToken === undefined
+      ? new HostConnection(baseUrl)
+      : authenticatedHostConnection(baseUrl, config.hostToken))
+    this.launchHost = deps.launchHost ?? launchDetachedHost
+    this.resolveCwd = deps.resolveSessionCwd ?? resolveSessionCwd
+    this.decisionPolicy = config.decisionPolicy ?? DEFAULT_DECISION_POLICY
+    this.shadowDecisionPolicy = config.shadowDecisionPolicy
+    for (const policy of [...config.decisionPolicyCatalog ?? [], this.decisionPolicy,
+      ...this.shadowDecisionPolicy === undefined ? [] : [this.shadowDecisionPolicy]]) {
+      const existing = this.decisionPolicies.get(policy.version)
+      if (existing !== undefined && decisionPolicyDigest(existing) !== decisionPolicyDigest(policy)) {
+        throw new Error(`decision policy version ${policy.version} has conflicting contents`)
+      }
+      this.decisionPolicies.set(policy.version, policy)
+    }
+    this.runJournal = config.runJournal === false
+      ? undefined
+      : config.runJournal ?? new FileRunJournal(DEFAULT_RUN_JOURNAL_DIR)
+    this.usageMonitor = config.usageMonitor === false ? undefined : config.usageMonitor
   }
 
   static fromEnvironment(env: NodeJS.ProcessEnv = process.env): GatewayManager {
@@ -109,17 +370,83 @@ export class GatewayManager {
     if (!Array.isArray(urls) || !urls.every(url => typeof url === 'string')) {
       throw new Error('DSH_HOST_URLS must be a JSON string array')
     }
+    const tokenFile = env.DSH_HOST_TOKEN_FILE ?? DEFAULT_HOST_TOKEN_FILE
+    let hostToken = env.DSH_HOST_TOKEN?.trim()
+    if (hostToken === undefined || hostToken.length === 0) {
+      try {
+        hostToken = readPrivateHostTokenFile(tokenFile)
+      } catch (error) {
+        throw new Error(`DSH Host token is unavailable or unsafe at ${tokenFile}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    const policyDirectory = env.DSH_DECISION_POLICY_DIR ?? DEFAULT_DECISION_POLICY_DIR
+    const catalog = readDecisionPolicyCatalog(policyDirectory)
+    const filePolicy = readDecisionPolicy(env.DSH_DECISION_POLICY_FILE ?? DEFAULT_DECISION_POLICY_FILE)
+    const inlinePolicy = env.DSH_DECISION_POLICY_JSON === undefined
+      ? undefined
+      : parseDecisionPolicy(JSON.parse(env.DSH_DECISION_POLICY_JSON) as unknown)
+    const shadowPolicy = env.DSH_DECISION_SHADOW_POLICY_FILE === undefined
+      ? undefined
+      : readDecisionPolicy(env.DSH_DECISION_SHADOW_POLICY_FILE)
+    const defaultTaskTokenBudget = positiveIntegerEnvironment(env, 'DSH_DEFAULT_TASK_TOKEN_BUDGET')
+    const journalMaxRecords = positiveIntegerEnvironment(env, 'DSH_RUN_JOURNAL_MAX_RECORDS')
+    const journalMaxAgeDays = positiveIntegerEnvironment(env, 'DSH_RUN_JOURNAL_MAX_AGE_DAYS')
+    const journalMaxBytes = positiveIntegerEnvironment(env, 'DSH_RUN_JOURNAL_MAX_BYTES')
+    const journalMaxAgeMs = journalMaxAgeDays === undefined ? undefined : journalMaxAgeDays * 24 * 60 * 60 * 1_000
+    if (journalMaxAgeMs !== undefined && !Number.isSafeInteger(journalMaxAgeMs)) {
+      throw new Error('DSH_RUN_JOURNAL_MAX_AGE_DAYS is too large')
+    }
     return new GatewayManager({
       hostUrls: urls,
+      hostToken,
+      enforceTransportSecurity: true,
       ...env.DSH_HOST_LAUNCH === undefined ? {} : { launch: parseLaunchConfig(env.DSH_HOST_LAUNCH) as HostLaunchConfig },
       defaultProvider: env.DSH_WORKER_PROVIDER ?? 'deepseek-official',
       defaultModel: env.DSH_WORKER_MODEL ?? 'deepseek-v4-flash',
       defaultReasoningEffort: env.DSH_WORKER_REASONING_EFFORT ?? 'high',
+      decisionPolicy: inlinePolicy ?? filePolicy,
+      ...shadowPolicy === undefined ? {} : { shadowDecisionPolicy: shadowPolicy },
+      decisionPolicyCatalog: catalog,
+      ...defaultTaskTokenBudget === undefined ? {} : { defaultTaskTokenBudget },
+      ...env.DSH_USAGE_MONITOR_URL === undefined
+        ? {}
+        : { usageMonitor: new UsageMonitorClient(env.DSH_USAGE_MONITOR_URL) },
+      runJournal: env.DSH_RUN_JOURNAL_ENABLED === 'false'
+        ? false
+        : new FileRunJournal(env.DSH_RUN_JOURNAL_DIR ?? DEFAULT_RUN_JOURNAL_DIR, {
+            ...journalMaxRecords === undefined ? {} : { maxRecords: journalMaxRecords },
+            ...journalMaxAgeMs === undefined ? {} : { maxAgeMs: journalMaxAgeMs },
+            ...journalMaxBytes === undefined ? {} : { maxBytes: journalMaxBytes },
+          }),
     })
+  }
+
+  private policiesFor(snapshot: Parameters<typeof deriveObservation>[0]): {
+    active: DecisionPolicy
+    shadow?: DecisionPolicy
+  } {
+    const packet = parseTaskPacket(snapshot.events)
+    const pin = packet?.schemaVersion === 2 ? packet.decisionPolicy : undefined
+    if (pin === undefined) return {
+      active: this.decisionPolicy,
+      ...this.shadowDecisionPolicy === undefined ? {} : { shadow: this.shadowDecisionPolicy },
+    }
+    const active = this.decisionPolicies.get(pin.activeVersion)
+    if (active === undefined || decisionPolicyDigest(active) !== pin.activeDigest) {
+      throw new Error(`pinned decision policy ${pin.activeVersion} is unavailable or changed`)
+    }
+    if (pin.shadowVersion === undefined && pin.shadowDigest === undefined) return { active }
+    if (pin.shadowVersion === undefined || pin.shadowDigest === undefined) throw new Error('pinned shadow policy identity is incomplete')
+    const shadow = this.decisionPolicies.get(pin.shadowVersion)
+    if (shadow === undefined || decisionPolicyDigest(shadow) !== pin.shadowDigest) {
+      throw new Error(`pinned shadow decision policy ${pin.shadowVersion} is unavailable or changed`)
+    }
+    return { active, shadow }
   }
 
   connection(url = this.knownUrls[0]): HostConnection {
     if (url === undefined) throw new Error('no DSH Host URL configured')
+    if (this.config.enforceTransportSecurity === true) assertSecureHostUrl(url)
     const baseUrl = normalizedUrl(url)
     const existing = this.connections.get(baseUrl)
     if (existing !== undefined) return existing
@@ -129,277 +456,1060 @@ export class GatewayManager {
     return connection
   }
 
+  private async launchConfiguredHost(): Promise<void> {
+    const launchConfig = this.config.launch
+    if (launchConfig === undefined) throw new Error('no DSH Host launch command is configured')
+    this.launchPromise ??= (async () => {
+      await this.launchHost(launchConfig)
+      const first = this.knownUrls[0]
+      if (first !== undefined) await this.connection(first).ensureConnected(15_000)
+    })().finally(() => { this.launchPromise = undefined })
+    await this.launchPromise
+  }
+
   async startOrConnect(input: {
     hostBaseUrl?: string | undefined
     cwd?: string | undefined
     sessionId?: string | undefined
     agentPreset?: string | undefined
   }): Promise<Record<string, unknown>> {
-    const connection = this.connection(input.hostBaseUrl)
-    let description
-    try {
-      description = await connection.ensureConnected(2_000)
-    } catch (firstError) {
-      if (this.config.launch === undefined) throw firstError
-      await launchDetachedHost(this.config.launch)
-      description = await connection.ensureConnected(15_000)
+    const creating = input.sessionId === undefined
+    if (creating && input.cwd === undefined) {
+      throw new Error('cwd is required when creating a new DSH session; pass the target project absolute path')
     }
+    const requestedPreset = input.agentPreset ?? 'standard'
+    supervisedAgentPreset(requestedPreset)
+    const requestedCwd = input.cwd === undefined ? undefined : await this.resolveCwd(input.cwd)
+    const reconnectByDiscovery = input.sessionId !== undefined && input.hostBaseUrl === undefined
+    const connection = reconnectByDiscovery
+      ? await this.locate(input.sessionId as string)
+      : this.connection(input.hostBaseUrl)
+    let description
+    if (reconnectByDiscovery) {
+      description = await connection.ensureConnected()
+    } else {
+      try {
+        description = await connection.ensureConnected(2_000)
+      } catch (firstError) {
+        if (this.config.launch === undefined) throw firstError
+        await this.launchConfiguredHost()
+        description = await connection.ensureConnected(15_000)
+      }
+    }
+    const gateDescription = await connection.ensureGateReady()
     let sessionId = input.sessionId
     if (sessionId === undefined) {
+      if (requestedCwd === undefined) throw new Error('validated cwd is unavailable for new DSH session')
       const created = unwrap(await connection.api.sessions.create({
-        ...input.cwd === undefined ? {} : { cwd: input.cwd },
-        ...input.agentPreset === undefined ? {} : { agentPreset: input.agentPreset },
+        cwd: requestedCwd,
+        agentPreset: requestedPreset,
       }))
       sessionId = created.sessionId
-    } else if (!await connection.sessionExists(sessionId)) {
+    } else if (!reconnectByDiscovery && !await connection.sessionExists(sessionId)) {
       throw new Error(`session ${sessionId} does not exist on ${connection.baseUrl}`)
     }
+    this.sessionHosts.set(sessionId, connection.baseUrl)
     const snapshot = await connection.refreshSession(sessionId)
+    const effectivePreset = supervisedAgentPreset(snapshot.agentPreset)
+    if (input.sessionId !== undefined && input.agentPreset !== undefined && effectivePreset !== input.agentPreset) {
+      throw new Error(`session ${sessionId} uses agentPreset ${JSON.stringify(effectivePreset)}, not requested ${JSON.stringify(input.agentPreset)}; a non-blank DSH session cannot switch presets`)
+    }
+    if (requestedCwd !== undefined) {
+      if (snapshot.cwd === undefined) {
+        throw new Error(`session ${sessionId} has no authoritative cwd after requesting ${requestedCwd}`)
+      }
+      const authoritativeCwd = await this.resolveCwd(snapshot.cwd)
+      if (authoritativeCwd !== requestedCwd) {
+        throw new Error(`session ${sessionId} cwd ${authoritativeCwd} does not match requested cwd ${requestedCwd}`)
+      }
+    }
     return {
       schemaVersion: 1,
       hostBaseUrl: connection.baseUrl,
+      ...this.config.hostToken === undefined ? {} : {
+        browserUrl: `${connection.baseUrl}#dsh_token=${encodeURIComponent(this.config.hostToken)}`,
+      },
       hostInstanceId: description.hostInstanceId,
       hostVersion: description.version,
       protocolVersion: description.protocolVersion,
+      gateProtocolVersion: gateDescription.gateProtocolVersion,
+      gatePluginVersion: gateDescription.pluginVersion,
+      gateBuildId: gateDescription.buildId,
+      gateCapabilities: gateDescription.capabilities,
+      sessionId,
+      // Compatibility alias for v1 callers. New control calls use sessionId + runId.
       taskId: sessionId,
-      cwd: snapshot.cwd,
+      cwd: requestedCwd ?? snapshot.cwd,
+      agentPreset: effectivePreset,
+      agentPresetDisplayName: effectivePreset === 'code' ? 'PTC mode' : 'Standard mode',
       reconnected: input.sessionId !== undefined,
+      hostOwnership: 'INDEPENDENT',
+      disconnectBehavior: 'HOST_AND_SESSION_CONTINUE',
+      usageMonitorConfigured: this.usageMonitor !== undefined,
     }
   }
 
-  async locate(taskId: string): Promise<HostConnection> {
+  async locate(taskId: string, allowLaunch = true): Promise<HostConnection> {
+    const boundUrl = this.sessionHosts.get(taskId)
+    if (boundUrl !== undefined) {
+      const bound = this.connection(boundUrl)
+      try {
+        await bound.ensureConnected()
+        await bound.ensureGateReady()
+        if (await bound.sessionExists(taskId)) return bound
+        this.sessionHosts.delete(taskId)
+      } catch {
+        // A stale in-memory binding after MCP/Host restart is only a hint. Scan
+        // every configured Host before deciding the session is unavailable.
+        this.sessionHosts.delete(taskId)
+      }
+    }
+    const failures: string[] = []
+    let reachable = 0
     for (const url of this.knownUrls) {
       const connection = this.connection(url)
       try {
         await connection.ensureConnected()
-        if (await connection.sessionExists(taskId)) return connection
-      } catch {
-        // Try the next explicitly configured Host. The final error is stable.
-      }
-    }
-    throw new Error(`task/session ${taskId} was not found on any configured DSH Host`)
-  }
-
-  private async assertWriterAvailable(connection: HostConnection, taskId: string, cwd: string): Promise<void> {
-    const target = await this.resolveDomain(cwd)
-    for (const row of await connection.listSessions()) {
-      if (row.sessionId === taskId || row.cwd === undefined) continue
-      let candidate: string
-      try {
-        candidate = await this.resolveDomain(row.cwd)
+        await connection.ensureGateReady()
+        reachable++
+        if (await connection.sessionExists(taskId)) {
+          this.sessionHosts.set(taskId, connection.baseUrl)
+          return connection
+        }
       } catch (error) {
-        const code = error instanceof Error && 'code' in error
-          ? (error as NodeJS.ErrnoException).code
-          : undefined
-        // A deleted/stale cwd cannot be the current writer domain. Any other
-        // resolution failure is ambiguous, so writer admission fails closed.
-        if (code === 'ENOENT' || code === 'ENOTDIR') continue
-        throw error
-      }
-      if (candidate !== target) continue
-      const snapshot = await connection.refreshSession(row.sessionId)
-      const packet = parseTaskPacket(snapshot.events)
-      if (packet?.writerMode !== 'writer') continue
-      const status = deriveObservation(snapshot).status
-      if (status !== 'COMPLETED' && status !== 'FAILED') {
-        throw new Error(`working tree already has writer session ${row.sessionId}; use read_only or an independent worktree`)
+        failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
+    if (reachable === 0) {
+      if (allowLaunch && this.config.launch !== undefined) {
+        await this.launchConfiguredHost()
+        return this.locate(taskId, false)
+      }
+      throw new HostDiscoveryError(
+        `could not connect to any configured DSH Host while locating session ${taskId}: ${failures.join('; ')}`,
+        failures,
+      )
+    }
+    if (failures.length > 0) {
+      throw new HostDiscoveryError(
+        `partial DSH Host discovery cannot conclude that session ${taskId} is absent; ${failures.length} configured Host(s) were unavailable`,
+        failures,
+      )
+    }
+    throw new Error(`session ${taskId} was not found on any reachable configured DSH Host`)
   }
 
-  /**
-   * Run one writer admission (availability check through durable task packet) while
-   * no other admission for this GatewayManager is in flight. This closes the
-   * in-process check-then-act race: a concurrent writer admission waits until the
-   * previous packet is durable, then observes it. Distinct GatewayManager processes
-   * and distinct Hosts are not serialized.
-   */
-  private async exclusiveWriterAdmission<T>(fn: () => Promise<T>): Promise<T> {
-    let release!: () => void
-    const gate = new Promise<void>(resolve => { release = resolve })
-    const previous = this.admissionTail
-    this.admissionTail = previous.then(() => gate)
-    await previous
-    try { return await fn() } finally { release() }
-  }
-
-  async task(input: {
-    taskId: string
+  async task(input: SessionAddress & {
+    requestId?: string | undefined
     objective: string
     writerMode?: 'writer' | 'read_only' | undefined
     provider?: string | undefined
     model?: string | undefined
     reasoningEffort?: string | undefined
     context?: string | undefined
+    executionBrief?: ExecutionBriefInput | undefined
     allowedScope?: string[] | undefined
     constraints?: string[] | undefined
     acceptanceCriteria?: string[] | undefined
     verification?: string[] | undefined
     escalationConditions?: string[] | undefined
+    parentRunId?: string | undefined
+    recoveryCapsule?: RecoveryCapsule | undefined
+    baseline?: { head?: string | undefined; statusSummary: string } | undefined
+    authority?: {
+      maxDirectChildren?: number | undefined
+      preAuthorizedActions?: string[] | undefined
+      preAuthorizedDecisionCategories?: DecisionCategory[] | undefined
+    } | undefined
+    tokenBudget?: { maxTokens: number } | undefined
   }): Promise<Record<string, unknown>> {
-    const connection = await this.locate(input.taskId)
-    const snapshot = await connection.refreshSession(input.taskId)
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    const snapshot = await connection.refreshSession(sessionId)
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
-    const sessionCwd = snapshot.cwd
+    const agentPreset = supervisedAgentPreset(snapshot.agentPreset)
     const writerMode = input.writerMode ?? 'writer'
+    if (writerMode === 'writer' && this.knownUrls.length !== 1) {
+      throw new Error('writer admission requires exactly one configured DSH Host; use read_only or isolate each writer in an independent worktree and single-Host deployment')
+    }
+    const requestId = input.requestId ?? randomUUID()
+    const recoveryCapsule = input.recoveryCapsule === undefined
+      ? undefined
+      : recoveryCapsuleSchema.parse(input.recoveryCapsule)
+    if (recoveryCapsule?.uncertainEffects.truncated === true) {
+      throw new Error('truncated recoveryCapsule cannot be continued automatically; manually reconcile the omitted uncertain effects')
+    }
+    if (input.parentRunId !== undefined && recoveryCapsule === undefined) {
+      throw new Error('parentRunId requires the exact recoveryCapsule returned by dsh_recover')
+    }
+    if (recoveryCapsule !== undefined && input.parentRunId === undefined) {
+      throw new Error('recoveryCapsule requires parentRunId')
+    }
+    if (recoveryCapsule !== undefined && recoveryCapsule.parentRunId !== input.parentRunId) {
+      throw new Error(`recoveryCapsule parentRunId ${recoveryCapsule.parentRunId} does not match continuation parentRunId ${String(input.parentRunId)}`)
+    }
+    const budget = input.tokenBudget ?? (this.config.defaultTaskTokenBudget === undefined
+      ? undefined
+      : { maxTokens: this.config.defaultTaskTokenBudget })
+    const instructions = normalizeTaskInstructions({
+      writerMode,
+      allowedScope: input.allowedScope,
+      constraints: input.constraints,
+      acceptanceCriteria: input.acceptanceCriteria,
+      verification: input.verification,
+      escalationConditions: input.escalationConditions,
+      authority: input.authority,
+    })
+    const proposedExecutionBrief = normalizeExecutionBrief(input.objective, input.executionBrief)
+    let executionBrief: ExecutionBrief = proposedExecutionBrief
+    if (input.parentRunId !== undefined) {
+      const parentEntry = taskPacketEntries(snapshot.events).find(({ packet }) =>
+        packet.schemaVersion === 2 && packet.runId === input.parentRunId)
+      // Do not replace the authoritative recovery error for a stale or
+      // cross-session parent. Host admission validates that case below.
+      if (parentEntry?.packet.schemaVersion === 2) {
+        const parentBrief = parentEntry.packet.executionBrief
+          ?? normalizeExecutionBrief(parentEntry.packet.objective)
+        if (input.executionBrief !== undefined
+          && JSON.stringify(proposedExecutionBrief) !== JSON.stringify(parentBrief)) {
+          throw new Error('continuation executionBrief must match the interrupted parent run')
+        }
+        executionBrief = parentBrief
+      }
+    }
+    const requestDigest = createHash('sha256').update(JSON.stringify({
+      sessionId,
+      objective: input.objective,
+      writerMode,
+      provider: input.provider,
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      context: input.context,
+      // Preserve the pre-executionBrief digest for omitted/atomic calls so an
+      // ambiguous admission made before this upgrade remains reconcilable.
+      executionBrief: input.executionBrief === undefined ? undefined : executionBrief,
+      allowedScope: instructions.allowedScope,
+      constraints: instructions.constraints,
+      acceptanceCriteria: instructions.acceptanceCriteria,
+      verification: instructions.verification,
+      escalationConditions: instructions.escalationConditions,
+      parentRunId: input.parentRunId,
+      recoveryCapsule,
+      baseline: input.baseline,
+      authority: instructions.authority,
+      instructionProfile: TASK_INSTRUCTION_PROFILE,
+      budget,
+    })).digest('hex')
 
-    const models = unwrap(await connection.api.sessions.models({ sessionId: input.taskId as SessionId }))
+    const existingRequest = (candidate: typeof snapshot): boolean => {
+      const entry = taskPacketEntries(candidate.events).find(({ packet }) =>
+        packet.schemaVersion === 2 && packet.requestId === requestId)
+      if (entry === undefined || entry.packet.schemaVersion !== 2) return false
+      if (entry.packet.requestDigest !== requestDigest) {
+        throw new Error(`requestId ${requestId} was already used with a different task payload`)
+      }
+      return true
+    }
+    const alreadyVisible = existingRequest(snapshot)
+
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
-    unwrap(await connection.api.sessions.selectModel({
-      sessionId: input.taskId as SessionId,
-      provider: input.provider ?? this.config.defaultProvider ?? models.current.provider,
-      model: input.model ?? this.config.defaultModel ?? models.current.model,
+    let provider = input.provider ?? this.config.defaultProvider
+    let model = input.model ?? this.config.defaultModel
+    if (!alreadyVisible && (provider === undefined || model === undefined)) {
+      const models = unwrap(await connection.api.sessions.models({ sessionId: sessionId as SessionId }))
+      provider ??= models.current.provider
+      model ??= models.current.model
+    }
+    // On an idempotent retry the Host reconciles the durable request before it
+    // considers model selection, so discovery must not depend on a live model catalog.
+    provider ??= 'dsh-gate-reconcile-existing'
+    model ??= 'dsh-gate-reconcile-existing'
+    const modelSelection = {
+      provider,
+      model,
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
-    }))
+    }
 
-    const packet: TaskPacket = {
-      schemaVersion: 1,
-      taskId: input.taskId,
+    const runId = randomUUID()
+    const packet = taskPacketV2Schema.parse({
+      schemaVersion: 2,
+      instructionProfile: TASK_INSTRUCTION_PROFILE,
+      sessionId,
+      runId,
       completionToken: randomUUID(),
       objective: input.objective,
       writerMode,
+      executionBrief,
+      requestId,
+      requestDigest,
+      ...budget === undefined ? {} : { budget },
+      decisionPolicy: {
+        activeVersion: this.decisionPolicy.version,
+        activeDigest: decisionPolicyDigest(this.decisionPolicy),
+        ...this.shadowDecisionPolicy === undefined ? {} : {
+          shadowVersion: this.shadowDecisionPolicy.version,
+          shadowDigest: decisionPolicyDigest(this.shadowDecisionPolicy),
+        },
+      },
+      // Temporary v1 worker compatibility; removed after every installed worker
+      // consumes sessionId + runId directly.
+      taskId: sessionId,
+      ...input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId },
+      ...recoveryCapsule === undefined ? {} : { recoveryCapsule },
+      ...input.baseline === undefined ? {} : { baseline: input.baseline },
       ...input.context === undefined ? {} : { context: input.context },
-      ...input.allowedScope === undefined ? {} : { allowedScope: input.allowedScope },
-      ...input.constraints === undefined ? {} : { constraints: input.constraints },
-      ...input.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: input.acceptanceCriteria },
-      ...input.verification === undefined ? {} : { verification: input.verification },
-      ...input.escalationConditions === undefined ? {} : { escalationConditions: input.escalationConditions },
-    }
+      ...instructions.allowedScope === undefined ? {} : { allowedScope: instructions.allowedScope },
+      constraints: instructions.constraints,
+      acceptanceCriteria: instructions.acceptanceCriteria,
+      verification: instructions.verification,
+      escalationConditions: instructions.escalationConditions,
+      authority: instructions.authority,
+    })
     // Put the human objective first so DSH Web gives the session a meaningful
     // title instead of "<dsh-supervised-task>…". The durable packet remains in
     // the same message and parseTaskPacket deliberately accepts it anywhere.
-    const prompt = `${input.objective}\n\n`
-      + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
-      + 'Follow the dsh-supervised-worker contract. Only a successful supervisor_handoff with the matching taskId '
-      + 'and completionToken, followed by this turn ending, can complete the task. Use paths relative to the session cwd '
-      + 'for artifacts. Report repeated recovery failures with a stable worker-chosen failureSignature.'
-    const queueAndConfirm = async (): Promise<Record<string, unknown>> => {
-      unwrap(await connection.api.sessions.prompt({
-        sessionId: input.taskId as SessionId,
-        mode: 'queue',
-        content: [{ type: 'text', text: prompt }],
-      }))
-      const packetDeadline = Date.now() + 10_000
-      let refreshed = await connection.refreshSession(input.taskId)
-      while (parseTaskPacket(refreshed.events)?.completionToken !== packet.completionToken) {
-        if (Date.now() >= packetDeadline) throw new Error('task prompt was accepted but its durable task packet was not observed')
-        await connection.waitForChange(250)
-        refreshed = await connection.refreshSession(input.taskId)
-      }
+    const prompt = compileTaskPrompt(packet)
+    const admit = async (): Promise<Record<string, unknown>> => {
+      const receipt = await connection.admitTask({
+        schemaVersion: 1,
+        sessionId,
+        requestId,
+        requestDigest,
+        runId,
+        ...input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId },
+        ...recoveryCapsule === undefined ? {} : { recoveryCapsule },
+        prompt,
+        modelSelection,
+      })
+      const refreshed = await connection.refreshSession(sessionId)
+      const observedAsOfSeq = Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1)
       return {
         schemaVersion: 1,
         hostInstanceId: refreshed.hostInstanceId,
-        taskId: input.taskId,
+        sessionId,
+        taskId: sessionId,
+        requestId,
+        runId: receipt.runId,
         objective: input.objective,
         writerMode,
+        agentPreset,
+        instructionProfile: TASK_INSTRUCTION_PROFILE,
+        executionBrief: {
+          source: executionBrief.source,
+          workstreamCount: executionBrief.workstreams.length,
+          workstreamIds: executionBrief.workstreams.map(stream => stream.id),
+        },
         accepted: true,
-        asOfSeq: refreshed.events.at(-1)?.seq ?? -1,
+        reconciled: receipt.reconciled,
+        admissionBoundarySeq: receipt.admissionBoundarySeq,
+        initialWaitAfterAsOfSeq: receipt.admissionBoundarySeq,
+        observedAsOfSeq,
+        /** @deprecated Use initialWaitAfterAsOfSeq for the first wait and observedAsOfSeq for diagnostics. */
+        asOfSeq: observedAsOfSeq,
+        ...budget === undefined ? {} : { tokenBudget: budget },
+        ...recoveryCapsule === undefined ? {} : { recoveryCapsuleAccepted: true },
+        disconnectBehavior: 'HOST_CONTINUES',
       }
     }
-    if (writerMode === 'writer') {
-      return this.exclusiveWriterAdmission(async () => {
-        await this.assertWriterAvailable(connection, input.taskId, sessionCwd)
-        return queueAndConfirm()
-      })
-    }
-    return queueAndConfirm()
+    return admit()
   }
 
-  async wait(input: { taskId: string; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
+  private async childHistorySince(
+    connection: HostConnection,
+    parentSessionId: string,
+    child: { id: string; mode: 'one-shot' | 'continuable' },
+    since: number,
+  ): Promise<DshEvent[]> {
+    const events = new Map<number, DshEvent>()
+    let beforeSeq: number | undefined
+    let hasMore = true
+    while (hasMore) {
+      const page = unwrap(await connection.api.subagents.history({
+        parentSessionId: parentSessionId as SessionId,
+        childSessionId: child.id as SessionId,
+        mode: child.mode,
+        maxMessages: 200,
+        ...beforeSeq === undefined ? {} : { beforeSeq },
+      }))
+      for (const entry of page.events) events.set(entry.event.seq, entry.event as DshEvent)
+      hasMore = page.hasMore
+      const first = page.events.at(0)?.event
+      if (!hasMore || first === undefined || first.time < since) break
+      beforeSeq = first.seq
+    }
+    return [...events.values()].sort((left, right) => left.seq - right.seq)
+  }
+
+  private async inspectRunTree(
+    connection: HostConnection,
+    snapshot: TaskRuntimeState,
+    rootSessionId: string,
+    runId: string,
+  ): Promise<RunTreeConvergence> {
+    const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
+      packet.schemaVersion === 2 && packet.sessionId === rootSessionId && packet.runId === runId)
+    if (packetEntry === undefined || packetEntry.packet.schemaVersion !== 2) {
+      return { activeSessionIds: [], unsettledSessionIds: [] }
+    }
+    const rootPacket = packetEntry.packet
+    const rootBoundary = snapshot.events.find(event => event.seq === packetEntry.seq)
+    if (rootBoundary === undefined) return { activeSessionIds: [], unsettledSessionIds: [] }
+    const activeSessionIds: string[] = []
+    const unsettledSessionIds: string[] = []
+    let latestChildTerminalTime: number | undefined
+    let budgetStop: RunTreeBudgetStop | undefined
+    const visited = new Set<string>()
+
+    const visit = async (parentSessionId: string): Promise<void> => {
+      if (visited.has(parentSessionId)) return
+      visited.add(parentSessionId)
+      const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
+      for (const entry of catalog.entries) {
+        if (entry.kind === 'diagnostic') {
+          const childSnapshot = await connection.refreshSession(entry.id)
+          const activation = affiliatedChildActivation(
+            childSnapshot.events, entry.id, rootBoundary.time, rootPacket.runId,
+          )
+          if (activation === undefined) continue
+          // A catalog diagnostic means DSH could not establish the durable
+          // child identity/mode. Even an inactive row is not a proven clean
+          // settlement, so completion must fail closed.
+          unsettledSessionIds.push(entry.id)
+          budgetStop ??= hookBudgetStop(childSnapshot.events, activation.seq, rootPacket.runId)
+          await visit(entry.id)
+          continue
+        }
+        const events = await this.childHistorySince(connection, parentSessionId, entry, rootBoundary.time)
+        const activation = affiliatedChildActivation(events, entry.id, rootBoundary.time, rootPacket.runId)
+        if (activation === undefined) continue
+        if (entry.activity === 'running') {
+          activeSessionIds.push(entry.id)
+        } else {
+          const latestTurnStart = events.findLast(event => event.type === 'turn/start' && event.seq > activation.seq)
+          const terminal = events.findLast(event => event.type === 'turn/end' && event.seq > activation.seq)
+          if (terminal === undefined || (latestTurnStart !== undefined && latestTurnStart.seq > terminal.seq)) {
+            unsettledSessionIds.push(entry.id)
+          } else {
+            latestChildTerminalTime = Math.max(latestChildTerminalTime ?? terminal.time, terminal.time)
+          }
+        }
+        budgetStop ??= hookBudgetStop(events, activation.seq, rootPacket.runId)
+        if (entry.hasChildren) await visit(entry.id)
+      }
+    }
+
+    await visit(rootSessionId)
+    return {
+      activeSessionIds: activeSessionIds.slice(0, 64),
+      unsettledSessionIds: unsettledSessionIds.slice(0, 64),
+      ...latestChildTerminalTime === undefined ? {} : { latestChildTerminalTime },
+      ...budgetStop === undefined ? {} : { budgetStop },
+    }
+  }
+
+  private async exactRecoveryCapsule(
+    connection: HostConnection,
+    _snapshot: TaskRuntimeState,
+    sessionId: string,
+    parentRunId: string,
+  ): Promise<RecoveryCapsule> {
+    return connection.recoveryCapsule({ schemaVersion: 1, sessionId, parentRunId })
+  }
+
+  private async validateRecoveryContinuation(
+    connection: HostConnection,
+    snapshot: TaskRuntimeState,
+    observation: Observation,
+  ): Promise<Observation> {
+    if (observation.recovery?.kind !== 'CONTINUATION_REQUIRED') return observation
+    try {
+      const recoveryCapsule = await this.exactRecoveryCapsule(
+        connection, snapshot, observation.sessionId, observation.runId,
+      )
+      if (recoveryCapsule.uncertainEffects.truncated) {
+        const { recovery: _recovery, ...withoutRecovery } = observation
+        return {
+          ...withoutRecovery,
+          status: 'ESCALATION_REQUIRED',
+          stage: 'recovery-effects-truncated',
+          summary: `Recovery evidence contains ${String(recoveryCapsule.uncertainEffects.total)} uncertain effects but only ${String(recoveryCapsule.uncertainEffects.entries.length)} fit in the bounded capsule; manual reconciliation is required.`,
+          recoveryCapsule,
+          decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.policiesFor(snapshot).active),
+        }
+      }
+      return {
+        ...observation,
+        recoveryCapsule,
+      }
+    } catch (error) {
+      const { recovery: _recovery, recoveryCapsule: _capsule, ...withoutRecovery } = observation
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, FAILURE_MESSAGE_LIMIT)
+      return {
+        ...withoutRecovery,
+        status: 'FAILED',
+        stage: 'recovery-run-tree-reconciliation',
+        summary: 'The interrupted Root was recovered, but its affiliated run-tree evidence could not be reconciled exactly.',
+        failure: { kind: 'HOST_FAILED', message, retryable: true },
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, this.policiesFor(snapshot).active),
+      }
+    }
+  }
+
+  private async validateRunTreeCompletion(
+    connection: HostConnection,
+    snapshot: TaskRuntimeState,
+    observation: Observation,
+  ): Promise<{ snapshot: TaskRuntimeState; observation: Observation }> {
+    const initialPacket = parseTaskPacket(snapshot.events)
+    if (observation.status !== 'COMPLETED' || initialPacket?.schemaVersion !== 2) return { snapshot, observation }
+
+    // Completion is a material decision. Refresh the Root before inspecting
+    // its run tree so an already-delivered child settlement or reopened Root
+    // turn cannot race an older cached handoff into COMPLETED.
+    const refreshed = await connection.refreshSession(initialPacket.sessionId)
+    const refreshedObservation = this.observationForRun(refreshed, initialPacket.sessionId, initialPacket.runId)
+    if (refreshedObservation.status !== 'COMPLETED') {
+      return { snapshot: refreshed, observation: refreshedObservation }
+    }
+    snapshot = refreshed
+    observation = refreshedObservation
+    const packet = parseTaskPacket(snapshot.events)
+    if (packet?.schemaVersion !== 2) return { snapshot, observation }
+    let tree: RunTreeConvergence
+    try {
+      tree = await this.inspectRunTree(connection, snapshot, packet.sessionId, packet.runId)
+    } catch (error) {
+      const policies = this.policiesFor(snapshot)
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, FAILURE_MESSAGE_LIMIT)
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'FAILED',
+          stage: 'run-tree-reconciliation',
+          summary: 'The root handoff is valid, but child convergence could not be verified.',
+          failure: { kind: 'HOST_FAILED', message, retryable: true },
+          decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
+        },
+      }
+    }
+    const policies = this.policiesFor(snapshot)
+    if (tree.budgetStop !== undefined) {
+      const observedTokens = tree.budgetStop.usedTokens ?? observation.budget?.observedTokens ?? 0
+      const limitTokens = tree.budgetStop.limitTokens ?? observation.budget?.limitTokens ?? Math.max(1, observedTokens)
+      const requestRejected = tree.budgetStop.kind === 'request_rejected'
+      const remainingTokens = requestRejected
+        ? tree.budgetStop.remainingTokens ?? Math.max(0, limitTokens - observedTokens)
+        : 0
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'ESCALATION_REQUIRED',
+          stage: requestRejected ? 'token-budget-request-rejected' : 'token-budget-exhausted',
+          summary: requestRejected
+            ? `A child request could not fit within the Host-enforced run-tree token budget (${String(observedTokens)}/${String(limitTokens)} used, ${String(remainingTokens)} remaining${tree.budgetStop.requiredInputTokens === undefined ? '' : `, ${String(tree.budgetStop.requiredInputTokens)} input tokens required`}).`
+            : `A child exhausted the Host-enforced run-tree token budget (${String(observedTokens)}/${String(limitTokens)}).`,
+          budget: {
+            limitTokens,
+            observedTokens,
+            remainingTokens,
+            exhausted: !requestRejected,
+            coverage: 'run_tree',
+            enforcement: 'DSH_HOST_RUNTIME',
+            overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
+          },
+          decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
+        },
+      }
+    }
+    if (tree.activeSessionIds.length > 0) {
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'WAITING',
+          stage: 'children-running',
+          summary: `Root handoff accepted; waiting for ${String(tree.activeSessionIds.length)} affiliated child session(s) to settle.`,
+          decision: evaluateDecision({ signal: 'WAIT' }, policies.active),
+        },
+      }
+    }
+    if (tree.unsettledSessionIds.length > 0) {
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'WAITING',
+          stage: 'child-settlement-unverified',
+          summary: `${String(tree.unsettledSessionIds.length)} affiliated child session(s) are inactive without a durable terminal boundary.`,
+          decision: evaluateDecision({ signal: 'WAIT' }, policies.active),
+        },
+      }
+    }
+    if (tree.latestChildTerminalTime !== undefined
+      && (observation.handoffTime === undefined || observation.handoffTime <= tree.latestChildTerminalTime)) {
+      return {
+        snapshot,
+        observation: {
+          ...observation,
+          status: 'WAITING',
+          stage: 'root-rehandoff-required',
+          summary: 'Affiliated children settled after the accepted Root handoff; waiting for Root to integrate them and publish a new handoff plus turn end.',
+          decision: evaluateDecision({ signal: 'WAIT' }, policies.active),
+        },
+      }
+    }
+    return { snapshot, observation }
+  }
+
+  private observationForRun(
+    snapshot: Parameters<typeof deriveObservation>[0],
+    sessionId: string,
+    runId: string | undefined,
+  ): Observation {
+    const policies = this.policiesFor(snapshot)
+    const observation = deriveObservation(snapshot, policies.active, policies.shadow)
+    if (observation.sessionId !== sessionId) {
+      return {
+        ...observation,
+        sessionId,
+        taskId: sessionId,
+        status: 'FAILED',
+        stage: 'protocol',
+        summary: 'The latest durable task packet does not match this session id.',
+        failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.sessionId}`, retryable: false },
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
+      }
+    }
+    if (runId !== undefined && runId !== observation.runId) {
+      return {
+        ...observation,
+        status: 'FAILED',
+        stage: 'stale-run',
+        summary: `The requested run ${runId} is stale; the active run is ${observation.runId}.`,
+        failure: {
+          kind: 'PROTOCOL_ERROR',
+          message: `stale run ${runId}; active run is ${observation.runId}`,
+          retryable: false,
+          stale: true,
+        },
+        decision: evaluateDecision({ signal: 'TERMINAL_FAILURE' }, policies.active),
+      }
+    }
+    return observation
+  }
+
+  private async withRunJournal(
+    observation: Observation,
+    snapshot: Parameters<typeof deriveObservation>[0],
+    connection: HostConnection,
+  ): Promise<Observation> {
+    if (observation.budget !== undefined) {
+      const state = await connection.tokenBudgetState({
+        schemaVersion: 1,
+        sessionId: observation.sessionId,
+        runId: observation.runId,
+      })
+      observation = {
+        ...observation,
+        budget: {
+          limitTokens: state.limitTokens,
+          observedTokens: state.usedTokens,
+          remainingTokens: state.remainingTokens,
+          exhausted: state.exhausted,
+          coverage: state.coverage,
+          enforcement: state.enforcement,
+          overshootBound: state.overshootBound,
+          sessions: state.sessions,
+          uncachedInputTokens: state.uncachedInputTokens,
+          outputTokens: state.outputTokens,
+          cacheReadTokens: state.cacheReadTokens,
+          cacheWriteTokens: state.cacheWriteTokens,
+        },
+      }
+    }
+    if (this.usageMonitor !== undefined) {
+      observation = { ...observation, usageMonitor: await this.usageMonitor.observeSession(observation.sessionId) }
+    }
+    const journal = this.runJournal
+    const packet = parseTaskPacket(snapshot.events)
+    const boundary = taskBoundarySeq(snapshot.events)
+    const durableTurnEnd = boundary !== undefined
+      && snapshot.events.some(event => event.type === 'turn/end' && event.seq > boundary)
+    const journalableFailure = observation.status === 'FAILED'
+      && (observation.failure?.kind === 'WORKER_FAILED'
+        || observation.failure?.kind === 'MISSING_HANDOFF'
+        || (observation.failure?.kind === 'HOST_FAILED' && durableTurnEnd))
+    if (journal === undefined || packet === undefined
+      || (!isRunRecordOutcome(observation.status) || (observation.status === 'FAILED' && !journalableFailure))) return observation
+    const recordId = runRecordId(observation.sessionId, observation.runId)
+    const policies = this.policiesFor(snapshot)
+    const value: RunRecord = {
+      schemaVersion: 1,
+      recordId,
+      recordedAt: new Date().toISOString(),
+      sessionId: observation.sessionId,
+      runId: observation.runId,
+      hostInstanceId: observation.hostInstanceId,
+      objective: observation.objective,
+      outcome: observation.status,
+      stage: observation.stage,
+      summary: observation.summary,
+      workerState: observation.workerState,
+      ...packet.schemaVersion === 2 && packet.baseline !== undefined ? {
+        baseline: {
+          statusSummary: packet.baseline.statusSummary,
+          ...packet.baseline.head === undefined ? {} : { head: packet.baseline.head },
+        },
+      } : {},
+      files: observation.files.slice(0, 200),
+      verification: observation.verification.slice(0, 100),
+      decisions: supervisorDecisionHistory(snapshot, policies.active, policies.shadow),
+      ...observation.failure === undefined ? {} : { failure: observation.failure },
+      ...observation.budget === undefined ? {} : { budget: {
+        limitTokens: observation.budget.limitTokens,
+        observedTokens: observation.budget.observedTokens,
+        remainingTokens: observation.budget.remainingTokens,
+        exhausted: observation.budget.exhausted,
+        coverage: observation.budget.coverage,
+        enforcement: observation.budget.enforcement,
+      } },
+      ...observation.projectActivity === undefined ? {} : { projectActivity: observation.projectActivity },
+      artifacts: observation.artifacts,
+      truncation: {
+        files: observation.files.length > 200,
+        verification: observation.verification.length > 100,
+      },
+      provenance: {
+        boundarySeq: observation.boundarySeq,
+        asOfSeq: observation.asOfSeq,
+        generatedBy: 'dsh-gate-runtime',
+        completionProtocolVerified: observation.status === 'COMPLETED',
+        modelCallsUsed: 0,
+      },
+    }
+    try {
+      const result = await journal.record(value)
+      return { ...observation, journal: { recorded: true, recordId, created: result.created } }
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : error instanceof Error ? error.name : 'UNKNOWN'
+      return { ...observation, journal: { recorded: false, recordId, warning: `run journal write failed (${code})` } }
+    }
+  }
+
+  /** Discover supervised runs from DSH's authoritative session store after client/context loss. */
+  async runs(allowLaunch = true): Promise<Record<string, unknown>> {
+    const entries: Array<Record<string, unknown>> = []
+    const failures: string[] = []
+    const sessionErrors: Array<{ hostBaseUrl: string; sessionId: string; message: string }> = []
+    let reachable = 0
+    for (const url of this.knownUrls) {
+      const connection = this.connection(url)
+      try {
+        await connection.ensureConnected()
+        const rows = await connection.listSessions()
+        reachable++
+        for (const row of rows) {
+          try {
+            const snapshot = await connection.refreshSession(row.sessionId)
+            const packet = parseTaskPacket(snapshot.events)
+            // Child seeds contain the root packet too; only the packet's addressed
+            // session is a recoverable root run entry.
+            if (packet?.schemaVersion !== 2 || packet.sessionId !== row.sessionId) continue
+            let observation = this.observationForRun(snapshot, packet.sessionId, packet.runId)
+            const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+            observation = validated.observation
+            observation = await this.validateRecoveryContinuation(connection, validated.snapshot, observation)
+            this.sessionHosts.set(packet.sessionId, connection.baseUrl)
+            let budget
+            let budgetWarning: string | undefined
+            if (observation.budget !== undefined) {
+              try {
+                budget = await connection.tokenBudgetState({
+                  schemaVersion: 1,
+                  sessionId: observation.sessionId,
+                  runId: observation.runId,
+                })
+              } catch (error) {
+                budgetWarning = `run-tree budget state unavailable: ${error instanceof Error ? error.message : String(error)}`.slice(0, 512)
+              }
+            }
+            entries.push({
+              hostBaseUrl: connection.baseUrl,
+              hostInstanceId: observation.hostInstanceId,
+              sessionId: packet.sessionId,
+              runId: packet.runId,
+              ...packet.requestId === undefined ? {} : { requestId: packet.requestId },
+              objective: packet.objective,
+              status: observation.status,
+              workerState: observation.workerState,
+              stage: observation.stage,
+              asOfSeq: observation.asOfSeq,
+              ...budgetWarning === undefined ? {} : { budgetWarning },
+              ...packet.budget === undefined ? {} : {
+                tokenBudget: packet.budget,
+                budget: budget === undefined ? observation.budget : {
+                  limitTokens: budget.limitTokens,
+                  observedTokens: budget.usedTokens,
+                  remainingTokens: budget.remainingTokens,
+                  exhausted: budget.exhausted,
+                  coverage: budget.coverage,
+                  enforcement: budget.enforcement,
+                  overshootBound: budget.overshootBound,
+                  sessions: budget.sessions,
+                  uncachedInputTokens: budget.uncachedInputTokens,
+                  outputTokens: budget.outputTokens,
+                  cacheReadTokens: budget.cacheReadTokens,
+                  cacheWriteTokens: budget.cacheWriteTokens,
+                },
+              },
+            })
+          } catch (error) {
+            sessionErrors.push({
+              hostBaseUrl: connection.baseUrl,
+              sessionId: row.sessionId,
+              message: (error instanceof Error ? error.message : String(error)).slice(0, 512),
+            })
+          }
+        }
+      } catch (error) {
+        failures.push(`${url}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    if (reachable === 0 && allowLaunch && this.config.launch !== undefined) {
+      await this.launchConfiguredHost()
+      return this.runs(false)
+    }
+    if (reachable === 0) {
+      throw new HostDiscoveryError(`could not connect to any configured DSH Host: ${failures.join('; ')}`, failures)
+    }
+    return {
+      schemaVersion: 1,
+      authoritativeSource: 'DSH_HOST_SESSIONS',
+      entries,
+      unavailableHosts: failures.length,
+      sessionErrors,
+    }
+  }
+
+  /** Reattach to one durable run without replaying or duplicating its task prompt. */
+  async recover(input: SessionAddress & { runId: string }): Promise<Observation> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    let snapshot = await connection.refreshSession(sessionId)
+    let observation = this.observationForRun(snapshot, sessionId, input.runId)
+    const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+    snapshot = validated.snapshot
+    observation = validated.observation
+    observation = await this.validateRecoveryContinuation(connection, snapshot, observation)
+    const recovered: Observation = observation.recovery?.kind === 'CONTINUATION_REQUIRED'
+      || observation.stage === 'recovery-effects-truncated'
+      || observation.failure?.kind === 'PROTOCOL_ERROR'
+      ? observation
+      : {
+          ...observation,
+          recovery: {
+            kind: 'REATTACHED',
+            reason: 'MCP_OR_CODEX_CLIENT_RECONNECTED',
+          },
+        }
+    return this.withRunJournal(recovered, snapshot, connection)
+  }
+
+  async wait(input: SessionAddress & { runId?: string | undefined; afterAsOfSeq?: number | undefined; timeoutMs?: number | undefined }): Promise<Observation> {
     // The default is the five-minute aggregated progress cadence: ordinary event
     // churn never returns early, so the supervisor issues about one long dsh_wait
     // observation per window. Only a material boundary (terminal state, approval,
     // question, checkpoint, blocker, escalation) returns before the window expires.
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, 0), 300_000)
-    const connection = await this.locate(input.taskId)
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
     const deadline = Date.now() + timeoutMs
     let progressFromAsOfSeq = input.afterAsOfSeq
+    let nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+    let cadenceExpired = timeoutMs === 0
+    let snapshot = await connection.refreshSession(sessionId)
+    let authoritative = true
     while (true) {
-      const snapshot = await connection.refreshSession(input.taskId)
-      const observation = deriveObservation(snapshot)
-      if (observation.taskId !== input.taskId) {
-        return {
-          ...observation,
-          taskId: input.taskId,
-          status: 'FAILED',
-          stage: 'protocol',
-          summary: 'The latest durable task packet does not match this session id.',
-          failure: { kind: 'PROTOCOL_ERROR', message: `task packet names ${observation.taskId}`, retryable: false },
-        }
-      }
+      let observation = this.observationForRun(snapshot, sessionId, input.runId)
+      const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+      snapshot = validated.snapshot
+      observation = validated.observation
+      observation = await this.validateRecoveryContinuation(connection, snapshot, observation)
       if (input.afterAsOfSeq !== undefined && input.afterAsOfSeq > observation.asOfSeq) {
         throw new Error(`afterAsOfSeq ${String(input.afterAsOfSeq)} is ahead of observed asOfSeq ${String(observation.asOfSeq)}`)
       }
       progressFromAsOfSeq ??= observation.asOfSeq
       const observed = progressObservation(observation, snapshot, progressFromAsOfSeq)
-      if (observation.status !== 'WAITING') return observed
-      const remaining = deadline - Date.now()
-      if (remaining <= 0) return timeoutObservation(observed, timeoutMs)
-      await connection.waitForChange(Math.min(remaining, 1_000))
+      if (observation.decision?.timing === 'immediate') {
+        // Mux frames make boundaries visible immediately, but reconcile once
+        // before returning so missing frames or replay state cannot decide a
+        // material/terminal result from cache alone.
+        if (!authoritative) {
+          snapshot = await connection.refreshSession(sessionId)
+          authoritative = true
+          nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+          continue
+        }
+        return this.withRunJournal(observed, snapshot, connection)
+      }
+      const remaining = cadenceExpired ? 0 : deadline - Date.now()
+      if (remaining <= 0) {
+        // The cadence observation is also an externally visible boundary; make
+        // its final event/tool/token totals authoritative.
+        if (!authoritative) {
+          snapshot = await connection.refreshSession(sessionId)
+          authoritative = true
+          let finalObservation = this.observationForRun(snapshot, sessionId, input.runId)
+          const finalValidated = await this.validateRunTreeCompletion(connection, snapshot, finalObservation)
+          snapshot = finalValidated.snapshot
+          finalObservation = finalValidated.observation
+          finalObservation = await this.validateRecoveryContinuation(connection, snapshot, finalObservation)
+          const finalObserved = progressObservation(finalObservation, snapshot, progressFromAsOfSeq)
+          const result = finalObservation.decision?.timing !== 'immediate'
+            ? timeoutObservation(finalObserved, timeoutMs)
+            : finalObserved
+          return this.withRunJournal(result, snapshot, connection)
+        }
+        return this.withRunJournal(timeoutObservation(observed, timeoutMs), snapshot, connection)
+      }
+      const untilReconcile = Math.max(0, nextReconcileAt - Date.now())
+      const waitsToCadenceBoundary = remaining <= untilReconcile
+      const changed = await connection.waitForChange(sessionId, Math.min(remaining, untilReconcile))
+      if (changed) {
+        snapshot = connection.cachedSession(sessionId) ?? snapshot
+        authoritative = false
+      } else {
+        snapshot = await connection.refreshSession(sessionId)
+        authoritative = true
+        nextReconcileAt = Date.now() + WAIT_RECONCILE_INTERVAL_MS
+        // The selected timer represented the cadence boundary. Treat its
+        // normal expiry as authoritative even if Date.now() rounding reports
+        // a residual millisecond; otherwise a loaded process can issue a
+        // redundant third history refresh for the same boundary.
+        if (waitsToCadenceBoundary) cadenceExpired = true
+      }
     }
   }
 
-  async steer(taskId: string, message: string): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
+  private assertCurrentRun(snapshot: Parameters<typeof deriveObservation>[0], runId: string | undefined): Observation {
+    const policies = this.policiesFor(snapshot)
+    const observation = deriveObservation(snapshot, policies.active, policies.shadow)
+    if (runId !== undefined && observation.runId !== runId) {
+      throw new Error(`stale run ${runId}; active run is ${observation.runId}`)
+    }
+    return observation
+  }
+
+  async steer(input: SessionAddress & { runId?: string | undefined; message: string }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
     unwrap(await connection.api.sessions.prompt({
-      sessionId: taskId as SessionId,
+      sessionId: sessionId as SessionId,
       mode: 'steer',
-      content: [{ type: 'text', text: message }],
+      content: [{ type: 'text', text: input.message }],
     }))
-    return { accepted: true, taskId }
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
   }
 
-  async cancel(taskId: string): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
-    unwrap(await connection.api.sessions.cancel({ sessionId: taskId as SessionId }))
-    return { accepted: true, taskId }
+  async cancel(input: SessionAddress & { runId?: string | undefined }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
+    unwrap(await connection.api.sessions.cancel({ sessionId: sessionId as SessionId }))
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId }
   }
 
-  async answerApproval(taskId: string, outcome: 'allowed-once' | 'rejected'): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
-    await connection.refreshSession(taskId)
-    await connection.answerApproval(taskId, outcome)
-    return { accepted: true, taskId, outcome }
+  async answerApproval(input: SessionAddress & { runId?: string | undefined; rpcId: string; outcome: 'allowed-once' | 'rejected' }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
+    await connection.answerApproval(sessionId, input.rpcId, input.outcome)
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId, rpcId: input.rpcId, outcome: input.outcome }
   }
 
-  async answerQuestion(
-    taskId: string,
-    answers: { id: string; selected: string[]; custom?: string | undefined }[],
-  ): Promise<Record<string, unknown>> {
-    const connection = await this.locate(taskId)
-    await connection.refreshSession(taskId)
-    await connection.answerQuestion(taskId, answers)
-    return { accepted: true, taskId }
+  async answerQuestion(input: SessionAddress & {
+    runId?: string | undefined
+    rpcId: string
+    answers: { id: string; selected: string[]; custom?: string | undefined }[]
+  }): Promise<Record<string, unknown>> {
+    const sessionId = sessionIdOf(input)
+    const connection = await this.locate(sessionId)
+    this.assertCurrentRun(await connection.refreshSession(sessionId), input.runId)
+    await connection.answerQuestion(sessionId, input.rpcId, input.answers)
+    return { accepted: true, sessionId, taskId: sessionId, runId: input.runId, rpcId: input.rpcId }
   }
 
-  async agents(parentSessionId: string): Promise<Record<string, unknown>> {
+  async agents(input: SessionAddress & { runId?: string | undefined }): Promise<Record<string, unknown>> {
+    const parentSessionId = sessionIdOf(input)
     const connection = await this.locate(parentSessionId)
+    const snapshot = await connection.refreshSession(parentSessionId)
+    const observation = this.assertCurrentRun(snapshot, input.runId)
+    const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
+      packet.schemaVersion === 2 && packet.sessionId === parentSessionId && packet.runId === observation.runId)
+    const boundary = packetEntry === undefined ? undefined : snapshot.events.find(event => event.seq === packetEntry.seq)
+    if (packetEntry === undefined || boundary === undefined) throw new Error('current run has no durable Root boundary')
     const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
+    const entries: typeof catalog.entries = []
+    for (const entry of catalog.entries) {
+      const events = entry.kind === 'child'
+        ? await this.childHistorySince(connection, parentSessionId, entry, boundary.time)
+        : (await connection.refreshSession(entry.id)).events
+      if (affiliatedChildActivation(events, entry.id, boundary.time, observation.runId) !== undefined) entries.push(entry)
+    }
     return {
       schemaVersion: 1,
       parentSessionId,
+      sessionId: parentSessionId,
+      runId: input.runId,
       ownership: {
         manager: 'DSH_ROOT',
         childCompletionDelivery: 'HOST_TO_PARENT_AUTOMATIC',
         codexRole: 'OBSERVER',
       },
       ...catalog,
-      entries: attachChildObservations(catalog.entries, await connection.listSessions()),
+      entries: attachChildObservations(
+        entries.map(entry => entry.kind === 'child' ? boundedChildLabel(entry) : entry),
+        await connection.listSessions(),
+      ),
+      excludedNonAffiliatedEntries: catalog.entries.length - entries.length,
     }
   }
 
-  async interruptAgent(parentSessionId: string, childSessionId: string): Promise<Record<string, unknown>> {
+  async interruptAgent(input: SessionAddress & { runId?: string | undefined; childSessionId: string }): Promise<Record<string, unknown>> {
+    const parentSessionId = sessionIdOf(input)
     const connection = await this.locate(parentSessionId)
+    const snapshot = await connection.refreshSession(parentSessionId)
+    const observation = this.assertCurrentRun(snapshot, input.runId)
+    const packetEntry = taskPacketEntries(snapshot.events).findLast(({ packet }) =>
+      packet.schemaVersion === 2 && packet.sessionId === parentSessionId && packet.runId === observation.runId)
+    const boundary = packetEntry === undefined ? undefined : snapshot.events.find(event => event.seq === packetEntry.seq)
+    if (packetEntry === undefined || boundary === undefined) throw new Error('current run has no durable Root boundary')
+    const catalog = unwrap(await connection.api.subagents.list({ parentSessionId: parentSessionId as SessionId }))
+    const child = catalog.entries.find(entry => entry.id === input.childSessionId)
+    if (child === undefined || child.kind !== 'child') {
+      throw new Error(`direct child ${input.childSessionId} was not found under Root ${parentSessionId}`)
+    }
+    if (child.mode !== 'continuable') throw new Error(`direct child ${input.childSessionId} is not continuable`)
+    const events = await this.childHistorySince(connection, parentSessionId, child, boundary.time)
+    if (affiliatedChildActivation(events, child.id, boundary.time, observation.runId) === undefined) {
+      throw new Error(`direct child ${input.childSessionId} is not affiliated with current run ${observation.runId}`)
+    }
     unwrap(await connection.api.subagents.interrupt({
       parentSessionId: parentSessionId as SessionId,
-      childSessionId: childSessionId as SessionId,
+      childSessionId: input.childSessionId as SessionId,
       mode: 'continuable',
     }))
-    return { accepted: true, parentSessionId, childSessionId }
+    return { accepted: true, parentSessionId, sessionId: parentSessionId, runId: input.runId, childSessionId: input.childSessionId }
   }
 
   stopClients(): void {
     for (const connection of this.connections.values()) connection.stopClient()
     this.connections.clear()
+    this.sessionHosts.clear()
   }
 }

@@ -1,0 +1,8 @@
+{
+  "version": "2026-08-26.shadow-v1",
+  "workerRules": [
+    { "id": "shadow.sensitive", "priority": 120, "when": { "categories": ["security", "destructive_action", "credentials", "external_side_effect", "scope", "acceptance"] }, "effect": { "timing": "immediate", "audience": "human", "action": "ASK_HUMAN", "reasonCode": "SHADOW_SENSITIVE" } },
+    { "id": "shadow.blocking", "priority": 80, "when": { "blocking": true }, "effect": { "timing": "immediate", "audience": "supervisor", "action": "REVIEW_WORKER_REQUEST", "reasonCode": "SHADOW_BLOCKING" } }
+  ],
+  "workerFallback": { "timing": "cadence", "audience": "supervisor", "action": "SURFACE_PROGRESS", "reasonCode": "SHADOW_CADENCE" }
+}

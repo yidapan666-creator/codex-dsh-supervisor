@@ -27,6 +27,8 @@
     "check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@dsh-gate/decision-policy": "workspace:*",
+    "@dsh-gate/run-journal": "workspace:*",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.0.0"
   },

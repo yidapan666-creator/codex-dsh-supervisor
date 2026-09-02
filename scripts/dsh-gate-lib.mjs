@@ -10,8 +10,10 @@
 //   - all generated state (managed clone, DSH_HOME, logs, host metadata,
 //     install metadata) lives under one gitignored repository-local dir.
 
-import { dirname, join, resolve } from 'node:path'
+import { delimiter as pathDelimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
+import { DSH_GATE_BUILD_ID } from '../packages/dsh-supervisor-tools/build-identity.mjs'
 
 // ---------------------------------------------------------------------------
 // Compatibility contract constants
@@ -25,7 +27,7 @@ export const DSH_FORK_URL = 'https://github.com/yidapan666-creator/deepseek-harn
  * contract; fetching is always by SHA. To update the pin, change this
  * constant, remove the managed checkout, and re-run bootstrap.
  */
-export const DSH_PINNED_COMMIT = '7212c955438c70c9a2d168f67e85a8014b8d4488'
+export const DSH_PINNED_COMMIT = '68dd149a1834496ced7308de5a7084328855f13e'
 
 /** Informational only: the fork branch that carries the pinned commit. */
 export const DSH_FORK_BRANCH = 'codex/mcp-network-client'
@@ -73,10 +75,13 @@ export function resolvePaths(options = {}) {
     stateDir,
     dshRepo,
     dshHome,
+    corepackBinDir: join(stateDir, 'corepack-bin'),
     logsDir: join(stateDir, 'logs'),
     hostDir: join(stateDir, 'host'),
+    hostTokenFile: join(stateDir, 'host', 'auth.token'),
     installJson: join(stateDir, 'install.json'),
     hostPidFile: join(stateDir, 'host', 'host.pid'),
+    hostStartLockFile: join(stateDir, 'host', 'host.start.lock'),
     hostLogFile: join(stateDir, 'logs', 'host.log'),
     linkPath: join(root, 'packages', 'mcp-server', 'node_modules', '@deepseek-ai', 'dsh-client-connection'),
     pluginPath: join(root, 'packages', 'dsh-supervisor-tools'),
@@ -85,6 +90,42 @@ export function resolvePaths(options = {}) {
     dshConnectionLib: join(dshRepo, DSH_CONNECTION_PACKAGE, 'lib', `${NETWORK_CLIENT_SUBPATH}.js`),
     webDistIndex: join(dshRepo, 'apps', 'web', 'dist', 'index.html'),
     profileManifest: join(dshHome, 'profiles', SUPERVISOR_PROFILE, 'package.json'),
+    workerSkillSource: join(root, 'skills', 'dsh-supervised-worker', 'SKILL.md'),
+    workerSkillDestination: join(dshHome, 'skills', 'dsh-supervised-worker', 'SKILL.md'),
+  }
+}
+
+function localHostAddress(hostUrl = DEFAULT_HOST_URL) {
+  const parsed = new URL(hostUrl)
+  if (parsed.protocol !== 'http:') throw new Error(`Host launch URL must use http: ${hostUrl}`)
+  if (parsed.username !== '' || parsed.password !== '') throw new Error('Host launch URL must not contain credentials')
+  if (parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') {
+    throw new Error(`Host launch URL must be an origin without path, query, or fragment: ${hostUrl}`)
+  }
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) {
+    throw new Error(`Host launch must bind loopback, not ${parsed.hostname}`)
+  }
+  const port = parsed.port === '' ? '8080' : parsed.port
+  const hostname = parsed.hostname === '[::1]' ? '::1' : parsed.hostname
+  const keyHost = hostname === '::1' ? 'ipv6-loopback' : hostname.replace(/[^a-zA-Z0-9.-]/g, '_')
+  return {
+    hostname,
+    port,
+    canonicalUrl: `http://${hostname === '::1' ? '[::1]' : hostname}:${port}`,
+    stateKey: `http-${keyHost}-${port}`,
+  }
+}
+
+/** Isolate lifecycle ownership by Host origin so one port can never erase another port's state. */
+export function resolveHostStatePaths(paths, hostUrl = DEFAULT_HOST_URL) {
+  const address = localHostAddress(hostUrl)
+  return {
+    ...paths,
+    hostPidFile: join(paths.hostDir, `${address.stateKey}.pid`),
+    hostStartLockFile: join(paths.hostDir, `${address.stateKey}.start.lock`),
+    hostLogFile: join(paths.logsDir, `${address.stateKey}.log`),
+    legacyHostPidFile: paths.hostPidFile,
+    canonicalHostUrl: address.canonicalUrl,
   }
 }
 
@@ -94,10 +135,10 @@ export function resolvePaths(options = {}) {
 
 export const COMMANDS = ['bootstrap', 'doctor', 'host']
 
-export const HOST_ACTIONS = ['start', 'status', 'stop']
+export const HOST_ACTIONS = ['start', 'run', 'status', 'stop']
 
 export const OPTION_SPEC = new Set([
-  '--state', '--dsh-repo', '--dsh-home', '--host', '--dry-run', '--force', '--live', '--help', '--version',
+  '--state', '--dsh-repo', '--dsh-home', '--host', '--session', '--dry-run', '--force', '--live', '--help', '--version',
 ])
 
 /**
@@ -119,7 +160,7 @@ export function parseCliArgs(argv) {
     }
     const [flag, ...rest] = token.split('=')
     if (!OPTION_SPEC.has(flag)) throw new Error(`unknown option ${flag}`)
-    if (['--state', '--dsh-repo', '--dsh-home', '--host'].includes(flag)) {
+    if (['--state', '--dsh-repo', '--dsh-home', '--host', '--session'].includes(flag)) {
       const inline = rest.join('=')
       const value = inline !== '' ? inline : argv[i + 1]
       if (value === undefined || value.startsWith('-')) throw new Error(`option ${flag} needs a value`)
@@ -139,7 +180,7 @@ export function parseCliArgs(argv) {
   let hostAction
   if (command === 'host') {
     hostAction = positionals.shift()
-    if (hostAction === undefined) throw new Error('host needs an action: start | status | stop')
+    if (hostAction === undefined) throw new Error('host needs an action: start | run | status | stop')
     if (!HOST_ACTIONS.includes(hostAction)) throw new Error(`unknown host action ${hostAction}`)
   }
   if (positionals.length > 0) throw new Error(`unexpected argument ${positionals[0]}`)
@@ -155,8 +196,8 @@ export function usageText() {
     '',
     'Usage:',
     '  node scripts/dsh-gate.mjs bootstrap [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--dry-run] [--force]',
-    '  node scripts/dsh-gate.mjs doctor   [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--live] [--host URL]',
-    '  node scripts/dsh-gate.mjs host     start|status|stop [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--host URL] [--dry-run]',
+    '  node scripts/dsh-gate.mjs doctor   [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--live] [--host URL] [--session ID]',
+    '  node scripts/dsh-gate.mjs host     start|run|status|stop [--state DIR] [--dsh-repo DIR] [--dsh-home DIR] [--host URL] [--dry-run]',
     '',
     'Options:',
     '  --state DIR      state directory (default: <repo>/.dsh-state)',
@@ -167,6 +208,8 @@ export function usageText() {
     '  --dry-run        plan only: print phases/commands, change nothing',
     '  --force          re-run install/build phases even when markers say they are current',
     '  --live           doctor: also probe a live Host (protocolVersion, hostInstanceId, version)',
+    '  --session ID     doctor --live: verify the attached session has a routable provider/model (no model call)',
+    '  host run         keep the Host attached for launchd/systemd process supervision',
     '  --help, --version',
   ].join('\n')
 }
@@ -354,6 +397,24 @@ export async function resolvePnpm(io) {
   return { argv: ['pnpm'], via: 'path', version: pnpmProbe.stdout.trim() }
 }
 
+/**
+ * Put repo-aware Corepack shims ahead of caller package-manager shims before
+ * crossing into the independently pinned DSH repository. Some package
+ * managers preserve `npm_execpath`, while pnpm/action-setup puts its fixed
+ * version first via `PNPM_HOME`; either can make DSH reuse dsh-gate's pnpm
+ * instead of its own packageManager version. Call this only after creating the
+ * shim directory with `corepack enable --install-directory`.
+ */
+export function packageManagerBoundaryEnv(environment = process.env, corepackBinDir) {
+  if (typeof corepackBinDir !== 'string' || corepackBinDir === '') {
+    throw new Error('package-manager boundary needs a Corepack shim directory')
+  }
+  const isolated = { ...environment }
+  delete isolated.npm_execpath
+  isolated.PATH = [corepackBinDir, isolated.PATH].filter(value => typeof value === 'string' && value !== '').join(pathDelimiter)
+  return isolated
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap planning
 // ---------------------------------------------------------------------------
@@ -364,6 +425,9 @@ export async function resolvePnpm(io) {
  */
 export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, checkout }) {
   const phases = []
+  // A dirty development tree has no immutable content id. Rebuild workspace
+  // phases every time instead of treating HEAD alone as a valid cache key.
+  const gateTreeStable = typeof gateSha === 'string' && !gateSha.endsWith('-dirty')
 
   phases.push({
     name: 'checkout',
@@ -404,6 +468,7 @@ export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, c
   })
 
   const gateInstallCurrent = !force
+    && gateTreeStable
     && installJson?.steps?.gateInstall?.done === true
     && installJson.steps.gateInstall.gateSha === gateSha
     && await io.exists(join(paths.root, 'node_modules'))
@@ -427,6 +492,7 @@ export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, c
   })
 
   const gateBuildCurrent = !force
+    && gateTreeStable
     && installJson?.steps?.gateBuild?.done === true
     && installJson.steps.gateBuild.gateSha === gateSha
     && await io.exists(paths.mcpServerDistCli)
@@ -453,6 +519,19 @@ export async function planBootstrap({ paths, io, force = false, pnpm, gateSha, c
     skipReason: profileCurrent ? 'supervisor plugin already installed in the isolated profile (--force to redo)' : undefined,
   })
 
+  const workerSkillCurrent = !force
+    && await Promise.all([
+      io.readFile(paths.workerSkillSource).catch(() => undefined),
+      io.readFile(paths.workerSkillDestination).catch(() => undefined),
+    ]).then(([source, installed]) => source !== undefined && source === installed)
+  phases.push({
+    name: 'worker-skill',
+    description: 'install the supervised worker contract into the isolated DSH_HOME skill catalog',
+    argv: undefined,
+    action: workerSkillCurrent ? 'skip' : 'run',
+    skipReason: workerSkillCurrent ? 'DSH worker skill already matches this checkout' : undefined,
+  })
+
   phases.push({
     name: 'metadata',
     description: 'write install metadata ('.concat(paths.installJson, ')'),
@@ -476,7 +555,11 @@ export async function profileHasPlugin(paths, io) {
 // Doctor
 // ---------------------------------------------------------------------------
 
-export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
+function bearerHeaders(token, headers = {}) {
+  return token === undefined ? headers : { ...headers, authorization: `Bearer ${token}` }
+}
+
+export async function checkLiveHost({ url, io, timeoutMs = 8000, token }) {
   const body = JSON.stringify({
     type: 'client-request',
     rpcId: `dsh-gate-${Date.now().toString(36)}`,
@@ -485,7 +568,7 @@ export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
   })
   const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/host.describe`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: bearerHeaders(token, { 'content-type': 'application/json' }),
     body,
     signal: AbortSignal.timeout(timeoutMs),
   })
@@ -499,11 +582,59 @@ export async function checkLiveHost({ url, io, timeoutMs = 8000 }) {
   return result.value
 }
 
+export const EXPECTED_GATE_CAPABILITIES = [
+  'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+  'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1',
+  'bearer-auth-v1',
+]
+export const EXPECTED_GATE_PLUGIN_VERSION = '0.1.0'
+export const EXPECTED_GATE_BUILD_ID = DSH_GATE_BUILD_ID
+
+/** Prove that the live generic Host loaded a compatible dsh-gate supervisor plugin. */
+export async function checkGatePlugin({ url, io, timeoutMs = 8000, token }) {
+  const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/dsh-gate.describe`, {
+    method: 'GET', headers: bearerHeaders(token, { accept: 'application/json' }), signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const value = await response.json()
+  const capabilities = Array.isArray(value?.capabilities)
+    ? value.capabilities.filter(entry => typeof entry === 'string') : []
+  const missing = EXPECTED_GATE_CAPABILITIES.filter(capability => !capabilities.includes(capability))
+  if (value?.schemaVersion !== 1 || value?.gateProtocolVersion !== 1
+    || value?.pluginName !== '@dsh-gate/supervisor-tools'
+    || value?.pluginVersion !== EXPECTED_GATE_PLUGIN_VERSION
+    || value?.buildId !== EXPECTED_GATE_BUILD_ID
+    || value?.workerProtocolVersion !== 2 || missing.length > 0) {
+    throw new Error(`incompatible supervisor descriptor${missing.length === 0 ? '' : `; missing capabilities: ${missing.join(', ')}`}`)
+  }
+  return value
+}
+
+export async function checkSessionModels({ url, sessionId, io, timeoutMs = 8000, token }) {
+  const rpcId = `dsh-gate-models-${Date.now().toString(36)}`
+  const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/session.models`, {
+    method: 'POST',
+    headers: bearerHeaders(token, { 'content-type': 'application/json' }),
+    body: JSON.stringify({
+      type: 'client-request', rpcId, method: 'session.models', payload: { sessionId },
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const envelope = await response.json()
+  const result = envelope?.result
+  if (result === undefined || result.ok !== true) {
+    const error = result?.error
+    throw new Error(error === undefined ? 'malformed sessions.models response' : `${error.code}: ${error.message}`)
+  }
+  return result.value
+}
+
 /**
  * Run every doctor check. `io` is the real or fake io; `live` enables the
  * optional Host probe. Returns an ordered list of check results.
  */
-export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOST_URL }) {
+export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOST_URL, readinessSession, hostToken }) {
   const checks = []
   const add = (name, run) => checks.push({ name, run })
 
@@ -572,15 +703,31 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
     if (!installed) {
       return { ok: false, detail: `${SUPERVISOR_PLUGIN_NAME} is not installed in the ${SUPERVISOR_PROFILE} profile` }
     }
-    const patch = await io.exists(join(paths.pluginPath, 'cordis.patch.yml'))
-    return { ok: true, detail: `${SUPERVISOR_PLUGIN_NAME} listed in ${SUPERVISOR_PROFILE} profile bundles; plugin dist and patch present` }
+    const patchPath = join(paths.pluginPath, 'cordis.patch.yml')
+    if (!(await io.exists(patchPath))) return { ok: false, detail: `missing supervisor profile patch ${patchPath}` }
+    const patch = String(await io.readFile(patchPath))
+    const nativeDepthCaps = patch.match(/maxDepth:\s*1\b/g)?.length ?? 0
+    if (nativeDepthCaps < 2 || !patch.includes('- subagent') || !patch.includes('- subagent_fork')) {
+      return { ok: false, detail: 'supervisor profile patch is missing native Root-to-child depth caps or direct-child tool coverage' }
+    }
+    return { ok: true, detail: `${SUPERVISOR_PLUGIN_NAME} listed in ${SUPERVISOR_PROFILE} profile bundles; native depth-1 caps and both direct-child tools are configured` }
+  })
+
+  add('DSH worker skill', async () => {
+    const source = await io.readFile(paths.workerSkillSource).catch(() => undefined)
+    const installed = await io.readFile(paths.workerSkillDestination).catch(() => undefined)
+    if (source === undefined) return { ok: false, detail: `missing repository worker skill ${paths.workerSkillSource}` }
+    if (installed === undefined) return { ok: false, detail: `worker skill is not installed at ${paths.workerSkillDestination}; run 'pnpm bootstrap'` }
+    return source === installed
+      ? { ok: true, detail: 'isolated DSH_HOME worker skill matches this checkout' }
+      : { ok: false, detail: 'installed DSH worker skill is stale; run \'pnpm bootstrap\'' }
   })
 
   if (live) {
     add('live Host', async () => {
       let value
       try {
-        value = await checkLiveHost({ url: hostUrl, io })
+        value = await checkLiveHost({ url: hostUrl, io, token: hostToken })
       } catch (error) {
         return { ok: false, detail: `no live Host at ${hostUrl}: ${error instanceof Error ? error.message : String(error)}` }
       }
@@ -592,6 +739,43 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
         ? { ok: true, detail: `protocolVersion 1; hostInstanceId ${value.hostInstanceId}; version ${value.version}` }
         : { ok: false, detail: failures.join('; ') }
     })
+    add('live supervisor plugin', async () => {
+      try {
+        const value = await checkGatePlugin({ url: hostUrl, io, token: hostToken })
+        return {
+          ok: true,
+          detail: `gateProtocolVersion ${String(value.gateProtocolVersion)}; plugin ${value.pluginVersion}; build ${value.buildId}`,
+        }
+      } catch (error) {
+        return { ok: false, detail: `supervisor plugin is not ready at ${hostUrl}: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    })
+    if (readinessSession !== undefined) {
+      add('provider/model routing', async () => {
+        let value
+        try {
+          value = await checkSessionModels({ url: hostUrl, sessionId: readinessSession, io, token: hostToken })
+        } catch (error) {
+          return { ok: false, detail: `session ${readinessSession}: ${error instanceof Error ? error.message : String(error)}` }
+        }
+        const provider = value?.current?.provider
+        const model = value?.current?.model
+        const failures = Array.isArray(value?.failures) ? value.failures : []
+        if (typeof provider !== 'string' || provider === '' || typeof model !== 'string' || model === '') {
+          return { ok: false, detail: `session ${readinessSession} has no current provider/model` }
+        }
+        if (value.routable !== true) {
+          return { ok: false, detail: `${provider}/${model} is not routable: ${JSON.stringify(failures).slice(0, 512)}` }
+        }
+        const advisory = failures.length === 0
+          ? ''
+          : `; ${String(failures.length)} unrelated provider catalog warning(s) reported`
+        return {
+          ok: true,
+          detail: `${provider}/${model} is routable for session ${readinessSession}${advisory}; credentials are verified only by an explicit real task`,
+        }
+      })
+    }
   }
 
   const results = []
@@ -623,13 +807,56 @@ export function summarizeDoctor(results) {
 // Host lifecycle
 // ---------------------------------------------------------------------------
 
-export async function readHostPidFile(paths, io) {
-  const raw = await io.readFile(paths.hostPidFile).catch(() => undefined)
-  if (raw === undefined || raw.trim() === '') return undefined
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return undefined
+export async function readHostPidFile(paths, io, hostUrl = paths.canonicalHostUrl ?? DEFAULT_HOST_URL) {
+  const expectedUrl = localHostAddress(hostUrl).canonicalUrl
+  const candidates = [paths.hostPidFile]
+  if (paths.legacyHostPidFile !== undefined && paths.legacyHostPidFile !== paths.hostPidFile) {
+    candidates.push(paths.legacyHostPidFile)
+  }
+  for (const pidFile of candidates) {
+    const raw = await io.readFile(pidFile).catch(() => undefined)
+    if (raw === undefined || raw.trim() === '') continue
+    try {
+      const record = JSON.parse(raw)
+      if (!Number.isSafeInteger(record?.pid) || record.pid <= 0 || typeof record.url !== 'string') continue
+      if (localHostAddress(record.url).canonicalUrl !== expectedUrl) continue
+      return { ...record, pidFile }
+    } catch {
+      // Invalid or foreign records are never guessed to own the requested Host.
+    }
+  }
+  return undefined
+}
+
+/**
+ * Acquire the short-lived cross-process Host startup lease. The lease protects
+ * only PID/port discovery plus startup; it is unrelated to working-tree writer
+ * admission. Contenders wait for the winner to publish a ready Host and then
+ * re-run the ordinary idempotent checks. An orphan is never guessed stale.
+ */
+export async function acquireHostStartLease(paths, io, options = {}) {
+  const waitMs = options.waitMs ?? 35_000
+  const retryMs = options.retryMs ?? 100
+  const deadline = Date.now() + waitMs
+  const ownedRecord = `${process.pid} ${randomUUID()}\n`
+  while (true) {
+    try {
+      await io.writeFileExclusive(paths.hostStartLockFile, ownedRecord)
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for Host startup lease ${paths.hostStartLockFile}; confirm no host:start process is running, then remove the orphaned lease manually`)
+    }
+    await (io.sleep?.(retryMs) ?? new Promise(resolveWait => setTimeout(resolveWait, retryMs)))
+  }
+  return async () => {
+    const current = await io.readFile(paths.hostStartLockFile).catch(() => undefined)
+    if (current !== ownedRecord) {
+      throw new Error(`Host startup lease ownership changed at ${paths.hostStartLockFile}; refusing to remove it`)
+    }
+    await io.rm(paths.hostStartLockFile, { force: true })
   }
 }
 
@@ -653,16 +880,26 @@ export async function probePid(pid, io) {
   }
 }
 
+/**
+ * Decide how Host startup treats an existing PID record. Process uncertainty is
+ * never evidence of staleness: only a positive `dead` result permits deletion.
+ */
+export function hostStartPidDecision(pidState, hostReachable) {
+  if (hostReachable && (pidState === 'alive' || pidState === 'unknown')) return 'already-running'
+  if (pidState === 'alive') return 'refuse-alive-unreachable'
+  if (pidState === 'unknown') return 'refuse-unverifiable'
+  if (pidState === 'dead') return 'clear-stale'
+  throw new Error(`invalid PID state ${String(pidState)}`)
+}
+
 /** Describe a running host for status output; throws when unreachable. */
-export async function describeHost({ hostUrl, io, timeoutMs = 5000 }) {
-  const value = await checkLiveHost({ url: hostUrl, io, timeoutMs })
+export async function describeHost({ hostUrl, io, timeoutMs = 5000, token }) {
+  const value = await checkLiveHost({ url: hostUrl, io, timeoutMs, token })
   return value
 }
 
 /** Build the argv used to launch the detached Host process. */
 export function hostLaunchArgv({ dshBin, hostUrl = DEFAULT_HOST_URL }) {
-  const parsed = new URL(hostUrl)
-  const port = parsed.port === '' ? '8080' : parsed.port
-  const host = parsed.hostname === '' ? '127.0.0.1' : parsed.hostname
-  return [process.execPath, dshBin, 'web', '--host', host, '--port', port, '--no-open']
+  const { hostname, port } = localHostAddress(hostUrl)
+  return [process.execPath, dshBin, 'web', '--host', hostname, '--port', port, '--no-open']
 }

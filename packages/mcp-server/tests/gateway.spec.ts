@@ -1,35 +1,75 @@
-import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-client-connection/network-client'
 import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import { DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, attachChildObservations, resolveWriterDomain } from '../src/gateway.js'
-import { HostConnection } from '../src/host.js'
+import {
+  DEFAULT_WAIT_TIMEOUT_MS, GatewayManager, HostDiscoveryError, assertSecureHostUrl, attachChildObservations, resolveSessionCwd,
+  resolveWriterDomain, writerLeaseHeld,
+} from '../src/gateway.js'
+import { parseTaskPacket } from '../src/fold.js'
+import { EXPECTED_GATE_BUILD_ID, HostConnection } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
+import type { RunJournal, RunRecord } from '@dsh-gate/run-journal'
+import { decisionPolicyDigest, DEFAULT_DECISION_POLICY } from '@dsh-gate/decision-policy'
 
 const live: HostConnection[] = []
 afterEach(() => {
   for (const connection of live) connection.stopClient()
 })
 
-function connected(api: FakeApi): HostConnection {
-  const connection = new HostConnection('http://host', api.api)
+function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
+  const connection = new HostConnection(
+    baseUrl,
+    api.api,
+    request => api.admitTask(request),
+    request => api.tokenBudgetState(request),
+    request => api.recoveryCapsule(request),
+    async () => ({
+      schemaVersion: 1, gateProtocolVersion: 1, pluginName: '@dsh-gate/supervisor-tools',
+      pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2,
+      capabilities: [
+        'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+        'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+      ],
+    }),
+  )
   live.push(connection)
   return connection
 }
 
 function managerWith(api: FakeApi, resolve: (cwd: string) => Promise<string>): GatewayManager {
-  return new GatewayManager({ hostUrls: ['http://host'] }, {
+  api.resolveWriterDomain = resolve
+  return new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
     resolveWriterDomain: resolve,
     createConnection: baseUrl => connected(api),
   })
 }
 
 const sameDomain = async (_cwd: string): Promise<string> => '/work/tree'
+const gateReady = async () => ({
+  schemaVersion: 1 as const, gateProtocolVersion: 1 as const,
+  pluginName: '@dsh-gate/supervisor-tools' as const,
+  pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2 as const,
+  capabilities: [
+    'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
+    'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+  ],
+})
 
 const event = (type: string, seq: number, data: unknown): DshEvent => ({ type, seq, time: seq, data })
+
+function withCapsuleByteLength<T extends { byteLength: number }>(value: T): T {
+  let byteLength = 0
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const next = Buffer.byteLength(JSON.stringify({ ...value, byteLength }), 'utf8')
+    if (next === byteLength) break
+    byteLength = next
+  }
+  return { ...value, byteLength }
+}
 const packetEvent = (seq: number, writerMode: 'writer' | 'read_only' = 'writer'): DshEvent => event('user/message', seq, {
   content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify({
     schemaVersion: 1, taskId: 's2', completionToken: 'token', objective: 'ship it', writerMode,
@@ -63,7 +103,9 @@ describe('child observability', () => {
       projections: {
         asOfSeq: 42,
         values: {
-          sessionStats: { turns: 2, steps: 7 },
+          sessionStats: {
+            turns: 2, steps: 7, llmMs: 10, toolMs: 20, ttftMs: 3, ttftSteps: 1, decodeMs: 7, decodeTokens: 20,
+          },
           tokenUsage: { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 0 },
         },
       },
@@ -75,7 +117,9 @@ describe('child observability', () => {
         workerState: 'IDLE',
         telemetry: {
           asOfSeq: 42,
-          sessionStats: { turns: 2, steps: 7 },
+          sessionStats: {
+            turns: 2, steps: 7, llmMs: 10, toolMs: 20, ttftMs: 3, ttftSteps: 1, decodeMs: 7, decodeTokens: 20,
+          },
           tokenUsage: { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 0 },
         },
       },
@@ -117,7 +161,172 @@ describe('writer domain resolution', () => {
   })
 })
 
+describe('session cwd validation', () => {
+  it('permits loopback HTTP and remote HTTPS but rejects remote plaintext and credential-bearing URLs', () => {
+    expect(() => assertSecureHostUrl('http://127.0.0.1:8080')).not.toThrow()
+    expect(() => assertSecureHostUrl('http://localhost:8080')).not.toThrow()
+    expect(() => assertSecureHostUrl('https://dsh.example:8443')).not.toThrow()
+    expect(() => assertSecureHostUrl('http://192.168.1.50:8080')).toThrow(/require HTTPS/)
+    expect(() => assertSecureHostUrl('https://user:secret@dsh.example')).toThrow(/without credentials/)
+    expect(() => assertSecureHostUrl('https://dsh.example/api')).toThrow(/without credentials/)
+  })
+
+  it('accepts only an owner-private regular Host token file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-gate-host-token-'))
+    const tokenFile = join(root, 'auth.token')
+    const tokenLink = join(root, 'auth-link.token')
+    await writeFile(tokenFile, `${'t'.repeat(43)}\n`)
+    await chmod(tokenFile, 0o644)
+    expect(() => GatewayManager.fromEnvironment({
+      DSH_HOST_URL: 'http://127.0.0.1:18080', DSH_HOST_TOKEN_FILE: tokenFile,
+    })).toThrow(/owner|0600|unsafe/)
+
+    await chmod(tokenFile, 0o600)
+    const manager = GatewayManager.fromEnvironment({
+      DSH_HOST_URL: 'http://127.0.0.1:18080', DSH_HOST_TOKEN_FILE: tokenFile,
+    })
+    manager.stopClients()
+
+    await symlink(tokenFile, tokenLink)
+    expect(() => GatewayManager.fromEnvironment({
+      DSH_HOST_URL: 'http://127.0.0.1:18080', DSH_HOST_TOKEN_FILE: tokenLink,
+    })).toThrow(/regular file|symlink|unsafe/)
+  })
+
+  it('requires an absolute existing directory and resolves symlinks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-gate-session-cwd-'))
+    const project = join(root, 'project')
+    const alias = join(root, 'alias')
+    const file = join(root, 'file.txt')
+    await mkdir(project)
+    await symlink(project, alias, 'dir')
+    await writeFile(file, 'not a directory')
+
+    await expect(resolveSessionCwd('relative/project')).rejects.toThrow(/absolute path/)
+    await expect(resolveSessionCwd(join(root, 'missing'))).rejects.toThrow(/does not exist/)
+    await expect(resolveSessionCwd(file)).rejects.toThrow(/not a directory/)
+    await expect(resolveSessionCwd(alias)).resolves.toBe(await realpath(project))
+  })
+
+  it('requires cwd for creation and sends its canonical path to the Host', async () => {
+    let createdCwd: string | undefined
+    let createdPreset: string | undefined
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
+      api: {
+        sessions: {
+          create: async (input: { cwd: string; agentPreset: string }) => {
+            createdCwd = input.cwd
+            createdPreset = input.agentPreset
+            return { result: { ok: true, value: { sessionId: 's-new' } } }
+          },
+        },
+      },
+      refreshSession: async () => ({ cwd: '/canonical/project', agentPreset: 'standard' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], hostToken: 't'.repeat(32), runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd === '/alias/project' ? '/canonical/project' : cwd,
+    })
+
+    await expect(manager.startOrConnect({})).rejects.toThrow(/cwd is required/)
+    await expect(manager.startOrConnect({ cwd: '/alias/project' })).resolves.toMatchObject({
+      sessionId: 's-new', cwd: '/canonical/project', agentPreset: 'standard',
+      browserUrl: `http://host#dsh_token=${'t'.repeat(32)}`,
+    })
+    expect(createdCwd).toBe('/canonical/project')
+    expect(createdPreset).toBe('standard')
+  })
+
+  it('creates PTC sessions by the native code preset id and returns the effective mode', async () => {
+    let createdPreset: string | undefined
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
+      api: { sessions: { create: async (input: { agentPreset: string }) => {
+        createdPreset = input.agentPreset
+        return { result: { ok: true, value: { sessionId: 's-ptc' } } }
+      } } },
+      refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({ cwd: '/work', agentPreset: 'code' })).resolves.toMatchObject({
+      sessionId: 's-ptc', agentPreset: 'code', agentPresetDisplayName: 'PTC mode',
+    })
+    expect(createdPreset).toBe('code')
+  })
+
+  it('rejects presets that cannot preserve the strict supervision boundary', async () => {
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({ cwd: '/work', agentPreset: 'minimal' }))
+      .rejects.toThrow(/cannot guarantee the supervised read-only boundary/)
+    await expect(manager.startOrConnect({ cwd: '/work', agentPreset: 'cordis' }))
+      .rejects.toThrow(/modify the DSH runtime/)
+  })
+
+  it('rejects a reconnect request that names a different cwd', async () => {
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
+      sessionExists: async () => true,
+      refreshSession: async () => ({ cwd: '/existing/project', agentPreset: 'standard' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({
+      hostBaseUrl: 'http://host', sessionId: 's-existing', cwd: '/other/project',
+    })).rejects.toThrow(/does not match requested cwd/)
+  })
+
+  it('rejects reconnecting an existing session under a different requested preset', async () => {
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureGateReady: gateReady,
+      sessionExists: async () => true,
+      refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+    })
+
+    await expect(manager.startOrConnect({
+      hostBaseUrl: 'http://host', sessionId: 's-existing', agentPreset: 'standard',
+    })).rejects.toThrow(/cannot switch presets/)
+  })
+})
+
 describe('writer admission', () => {
+  it('rejects a second writer run in the same durable session while its current run owns the lease', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree', events: [packetEvent(1), event('turn/start', 2, { turn: 1 })] })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.task({ sessionId: 's1', objective: 'second writer run' }))
+      .rejects.toThrow(/already has writer session s1/)
+  })
+
   it('rejects a second writer session in the same worktree domain while the first is active', async () => {
     const api = new FakeApi()
     api.addRow('s1', { cwd: '/work/tree' })
@@ -148,6 +357,26 @@ describe('writer admission', () => {
     const manager = managerWith(api, sameDomain)
     await expect(manager.task({ taskId: 's1', objective: 'write' }))
       .resolves.toMatchObject({ taskId: 's1', writerMode: 'writer', accepted: true })
+  })
+
+  it('retains an interrupted writer lease until an exact continuation is admitted', async () => {
+    const interruptedPacket = {
+      schemaVersion: 2, sessionId: 's1', runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222', objective: 'interrupted writer',
+      writerMode: 'writer',
+    }
+    const ended = [event('user/message', 1, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
+    }), event('turn/start', 2, { turn: 1 }), event('turn/end', 3, {
+      turn: 1, reason: { kind: 'interrupted' },
+    })]
+    expect(writerLeaseHeld(ended)).toBe(true)
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree', events: ended })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.task({ sessionId: 's1', objective: 'new writer run' }))
+      .rejects.toThrow(/exact continuation/)
   })
 
   it('lets a read-only root coexist with an active writer in the same domain', async () => {
@@ -189,6 +418,37 @@ describe('writer admission', () => {
     ])
     expect(results.every(result => result.status === 'fulfilled')).toBe(true)
   })
+
+  it('fails closed for writers when more than one Host is configured', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = new GatewayManager({
+      hostUrls: ['http://host-one', 'http://host-two'], runJournal: false,
+    }, {
+      resolveWriterDomain: sameDomain,
+      createConnection: baseUrl => connected(api, baseUrl),
+    })
+
+    await expect(manager.task({ sessionId: 's1', objective: 'unsafe writer' }))
+      .rejects.toThrow(/exactly one configured DSH Host/)
+    await expect(manager.task({ sessionId: 's1', objective: 'safe review', writerMode: 'read_only' }))
+      .resolves.toMatchObject({ accepted: true, writerMode: 'read_only' })
+  })
+
+  it('passes the resolved model selection into atomic Host admission', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+
+    await manager.task({
+      sessionId: 's1', objective: 'model-bound work', writerMode: 'read_only',
+      provider: 'provider-a', model: 'model-a', reasoningEffort: 'medium',
+    })
+
+    expect(api.modelSelections).toEqual([{
+      sessionId: 's1', provider: 'provider-a', model: 'model-a', reasoningEffort: 'medium',
+    }])
+  })
 })
 
 describe('Web-visible task identity', () => {
@@ -202,6 +462,803 @@ describe('Web-visible task identity', () => {
       .map(block => block.text ?? '').join('\n')
     expect(text.startsWith('Improve progress observability\n\n')).toBe(true)
     expect(text).toContain(TASK_PACKET_START)
+  })
+
+  it('creates a distinct supervised run id for every task queued in one durable session', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    const firstPacket = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+    const second = await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+    const secondPacket = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+
+    expect(first).toMatchObject({ sessionId: 's1', runId: expect.any(String) })
+    expect(second).toMatchObject({ sessionId: 's1', runId: expect.any(String) })
+    expect(first.runId).not.toBe(second.runId)
+    expect(firstPacket).toMatchObject({
+      schemaVersion: 2, sessionId: 's1', runId: first.runId,
+      decisionPolicy: {
+        activeVersion: DEFAULT_DECISION_POLICY.version,
+        activeDigest: decisionPolicyDigest(DEFAULT_DECISION_POLICY),
+      },
+    })
+    expect(secondPacket).toMatchObject({ schemaVersion: 2, sessionId: 's1', runId: second.runId })
+  })
+
+  it('reconciles an ambiguous repeated dispatch by requestId without queueing twice', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const requestId = '33333333-3333-4333-8333-333333333333'
+    const input = {
+      sessionId: 's1', requestId, objective: 'bounded read', writerMode: 'read_only' as const,
+      tokenBudget: { maxTokens: 123_456 },
+    }
+
+    const first = await manager.task(input)
+    const eventCount = api.rows.get('s1')?.events.length
+    const second = await manager.task(input)
+
+    expect(second).toMatchObject({
+      requestId, runId: first.runId, accepted: true, reconciled: true,
+      tokenBudget: { maxTokens: 123_456 },
+    })
+    expect(api.rows.get('s1')?.events).toHaveLength(eventCount ?? 0)
+    expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
+      schemaVersion: 2, requestId, runId: first.runId, budget: { maxTokens: 123_456 },
+    })
+  })
+
+  it('serializes the same request across two MCP managers at the Host admission boundary', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const firstManager = managerWith(api, sameDomain)
+    const secondManager = managerWith(api, sameDomain)
+    const input = {
+      sessionId: 's1',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      objective: 'one durable dispatch',
+      writerMode: 'read_only' as const,
+    }
+
+    const [first, second] = await Promise.all([firstManager.task(input), secondManager.task(input)])
+
+    expect(first.runId).toBe(second.runId)
+    expect([first.reconciled, second.reconciled].sort()).toEqual([false, true])
+    expect(api.promptCalls).toBe(1)
+  })
+
+  it('reconciles after the Host committed admission but the MCP response was lost', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    api.failAfterAdmissionOnce = true
+    const firstManager = managerWith(api, sameDomain)
+    const input = {
+      sessionId: 's1',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      objective: 'survive an ambiguous response',
+      writerMode: 'read_only' as const,
+    }
+
+    await expect(firstManager.task(input)).rejects.toThrow(/response loss/)
+    firstManager.stopClients()
+    api.failModels = true
+    const secondManager = managerWith(api, sameDomain)
+
+    await expect(secondManager.task(input)).resolves.toMatchObject({
+      accepted: true,
+      reconciled: true,
+      requestId: input.requestId,
+    })
+    expect(api.promptCalls).toBe(1)
+  })
+
+  it('rejects reuse of a requestId with a changed payload', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const requestId = '33333333-3333-4333-8333-333333333333'
+    await manager.task({ sessionId: 's1', requestId, objective: 'first', writerMode: 'read_only' })
+    await expect(manager.task({ sessionId: 's1', requestId, objective: 'changed', writerMode: 'read_only' }))
+      .rejects.toThrow(/different task payload/)
+  })
+
+  it('rediscovers and reattaches to a durable run after the MCP manager restarts', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const firstManager = managerWith(api, sameDomain)
+    const run = await firstManager.task({
+      sessionId: 's1',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      objective: 'survive client restart',
+      writerMode: 'read_only',
+    })
+    firstManager.stopClients()
+
+    const secondManager = managerWith(api, sameDomain)
+    await expect(secondManager.runs()).resolves.toMatchObject({
+      authoritativeSource: 'DSH_HOST_SESSIONS',
+      entries: [{ sessionId: 's1', runId: run.runId, status: 'WAITING' }],
+    })
+    await expect(secondManager.recover({ sessionId: 's1', runId: run.runId as string })).resolves.toMatchObject({
+      sessionId: 's1', runId: run.runId, status: 'WAITING',
+      recovery: { kind: 'REATTACHED' },
+    })
+  })
+
+  it('passes the exact bounded recovery capsule into a parent-linked continuation', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const interruptedPacket = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'continue after restart',
+      writerMode: 'writer',
+      executionBrief: {
+        schemaVersion: 1,
+        source: 'CODEX_COMPILED',
+        workstreams: [{
+          id: 'RECOVER', outcome: 'Reconcile the interrupted edit', delegation: 'root',
+          doneWhen: ['The uncertain edit is reconciled before any retry.'],
+        }],
+        integration: ['Run focused verification and publish the authoritative handoff.'],
+      },
+      baseline: { head: 'abc123', statusSummary: 'M user-change.ts' },
+    }
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'maybe-edit', name: 'edit',
+        arguments: JSON.stringify({ file_path: '/work/tree/maybe.ts', replacement: 'private content' }),
+      }),
+      event('turn/end', 3, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+    expect(recovered).toMatchObject({
+      recovery: { kind: 'CONTINUATION_REQUIRED', parentRunId: interruptedRunId },
+      recoveryCapsule: {
+        parentRunId: interruptedRunId,
+        uncertainEffects: { total: 1 },
+      },
+    })
+    if (recovered.recoveryCapsule === undefined) throw new Error('expected recovery capsule')
+
+    await expect(manager.task({
+      sessionId: 's1',
+      objective: 'resume from the durable recovery evidence',
+      parentRunId: '44444444-4444-4444-8444-444444444444',
+      recoveryCapsule: recovered.recoveryCapsule,
+    })).rejects.toThrow(/does not match continuation parentRunId/)
+
+    await expect(manager.task({
+      sessionId: 's1',
+      objective: 'resume from the durable recovery evidence',
+      parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+      executionBrief: {
+        workstreams: [{ id: 'DIFFERENT', outcome: 'Change the recovery plan', delegation: 'root', doneWhen: ['Changed.'] }],
+        integration: ['Use a different integration plan.'],
+      },
+    })).rejects.toThrow(/must match the interrupted parent run/)
+
+    const continuation = await manager.task({
+      sessionId: 's1',
+      objective: 'resume from the durable recovery evidence',
+      parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+    })
+    expect(continuation).toMatchObject({ accepted: true, recoveryCapsuleAccepted: true })
+    const packet = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+    expect(packet).toMatchObject({
+      schemaVersion: 2,
+      parentRunId: interruptedRunId,
+      recoveryCapsule: {
+        parentRunId: interruptedRunId,
+        uncertainEffects: { total: 1 },
+      },
+      executionBrief: {
+        source: 'CODEX_COMPILED',
+        workstreams: [{ id: 'RECOVER' }],
+      },
+    })
+    expect(JSON.stringify(packet)).not.toContain('private content')
+  })
+
+  it('requires manual reconciliation when the uncertain-effect ledger is truncated', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const interruptedPacket = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'recover without omitting side effects',
+      writerMode: 'writer',
+    }
+    const uncertainCalls = Array.from({ length: 21 }, (_, index) => event('tool/call', index + 2, {
+      turn: 1, step: index + 1, callId: `uncertain-${String(index)}`, name: 'bash', arguments: '{}',
+    }))
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      ...uncertainCalls,
+      event('turn/end', 23, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+    expect(recovered).toMatchObject({
+      status: 'ESCALATION_REQUIRED',
+      stage: 'recovery-effects-truncated',
+      recoveryCapsule: { uncertainEffects: { total: 21, truncated: true } },
+    })
+    expect(recovered).not.toHaveProperty('recovery')
+    if (recovered.recoveryCapsule === undefined) throw new Error('expected diagnostic recovery capsule')
+    await expect(manager.task({
+      sessionId: 's1', objective: 'unsafe automatic retry', parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+    })).rejects.toThrow(/cannot be continued automatically/)
+    expect(api.promptCalls).toBe(0)
+  })
+
+  it('requires the exact Host-recomputed capsule for every continuation', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const interruptedPacket = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'continue exactly',
+      writerMode: 'writer',
+    }
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('turn/end', 2, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+    if (recovered.recoveryCapsule === undefined) throw new Error('expected recovery capsule')
+
+    await expect(manager.task({
+      sessionId: 's1', objective: 'missing capsule', parentRunId: interruptedRunId,
+    })).rejects.toThrow(/parentRunId requires the exact recoveryCapsule/)
+
+    const fabricated = withCapsuleByteLength({
+      ...recovered.recoveryCapsule,
+      objective: 'fabricated but schema-valid evidence',
+    })
+    await expect(manager.task({
+      sessionId: 's1', objective: 'fabricated capsule', parentRunId: interruptedRunId,
+      recoveryCapsule: fabricated,
+    })).rejects.toThrow(/does not match Host durable evidence/)
+    expect(api.promptCalls).toBe(0)
+  })
+
+  it('rejects stale and cross-session continuation evidence', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const packet = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'interrupted parent',
+      writerMode: 'writer',
+    }
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('turn/end', 2, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    api.addRow('s2', { cwd: '/work/other', events: [] })
+    const manager = managerWith(api, sameDomain)
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+    if (recovered.recoveryCapsule === undefined) throw new Error('expected recovery capsule')
+
+    await expect(manager.task({
+      sessionId: 's2', objective: 'cross-session continuation', parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+    })).rejects.toThrow(/is not the current durable interrupted run for session s2/)
+
+    api.setEvents('s1', [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+    ])
+    await expect(manager.task({
+      sessionId: 's1', objective: 'stale continuation', parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+    })).rejects.toThrow(/is not the current durable interrupted run for session s1/)
+  })
+
+  it('folds affiliated child evidence into the exact recovery capsule', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const packet = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'recover the complete tree',
+      writerMode: 'writer',
+      budget: { maxTokens: 10_000 },
+    }
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('assistant/message', 2, {
+        turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 20, cacheWriteTokens: 0 },
+      }),
+      event('turn/end', 3, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    api.addChild('s1', 'child-1', { events: [
+      event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'child-write', name: 'write',
+        arguments: JSON.stringify({ file_path: '/work/tree/child.ts', content: 'private source' }),
+      }),
+      event('tool/result', 3, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'child-write' }, content: [{ type: 'tool-result', isError: false }] },
+      }),
+      event('tool/call', 4, {
+        turn: 1, step: 2, callId: 'child-command', name: 'bash',
+        arguments: JSON.stringify({ command: 'private external action' }),
+      }),
+      event('assistant/message', 5, {
+        turn: 1, step: 2, usage: { inputTokens: 30, outputTokens: 7, cacheReadTokens: 40, cacheWriteTokens: 2 },
+      }),
+      event('turn/end', 6, { turn: 1, reason: { kind: 'completed' } }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+
+    expect(recovered.recoveryCapsule).toMatchObject({
+      runTree: {
+        coverage: 'complete',
+        totalSessions: 2,
+        sessions: [
+          { sessionId: 's1', activationSeq: 0, terminalSeq: 3 },
+          { sessionId: 'child-1', activationSeq: 0, terminalSeq: 6 },
+        ],
+      },
+      workspace: {
+        activity: {
+          edits: { total: 1, files: ['child.ts'] },
+          toolCalls: 2,
+          tokenUsage: {
+            uncachedInputTokens: 40,
+            outputTokens: 12,
+            cacheReadTokens: 60,
+            cacheWriteTokens: 2,
+          },
+        },
+      },
+      budget: { observedTokens: 114, remainingTokens: 9_886 },
+      uncertainEffects: {
+        total: 1,
+        entries: [{ sessionId: 'child-1', callId: 'child-command' }],
+      },
+    })
+    expect(JSON.stringify(recovered.recoveryCapsule)).not.toContain('private source')
+    expect(JSON.stringify(recovered.recoveryCapsule)).not.toContain('private external action')
+    const waited = await manager.wait({ sessionId: 's1', runId: interruptedRunId, timeoutMs: 0 })
+    expect(waited.recoveryCapsule).toEqual(recovered.recoveryCapsule)
+  })
+
+  it('fails closed when an affiliated child history has no terminal boundary', async () => {
+    const api = new FakeApi()
+    const interruptedRunId = '11111111-1111-4111-8111-111111111111'
+    const packet = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: interruptedRunId,
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'do not omit child work',
+      writerMode: 'writer',
+    }
+    api.addRow('s1', { cwd: '/work/tree', events: [
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('turn/end', 2, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    api.addChild('s1', 'child-1', { events: [
+      event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, { turn: 1, step: 1, callId: 'unknown', name: 'bash', arguments: '{}' }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+
+    const recovered = await manager.recover({ sessionId: 's1', runId: interruptedRunId })
+    expect(recovered).toMatchObject({
+      status: 'FAILED',
+      stage: 'recovery-run-tree-reconciliation',
+      failure: { kind: 'HOST_FAILED', retryable: true },
+    })
+    expect(recovered).not.toHaveProperty('recoveryCapsule')
+  })
+
+  it('does not claim REATTACHED when recover addresses a stale run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    await manager.task({ sessionId: 's1', objective: 'current run', writerMode: 'read_only' })
+
+    const observed = await manager.recover({
+      sessionId: 's1', runId: '44444444-4444-4444-8444-444444444444',
+    })
+    expect(observed).toMatchObject({
+      status: 'FAILED',
+      stage: 'stale-run',
+      failure: { kind: 'PROTOCOL_ERROR', stale: true },
+    })
+    expect(observed.recovery).toBeUndefined()
+  })
+
+  it('keeps the policy pinned by the run after a manager restart', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const firstManager = managerWith(api, sameDomain)
+    const run = await firstManager.task({ sessionId: 's1', objective: 'pinned', writerMode: 'read_only' })
+    firstManager.stopClients()
+    const newer = { ...DEFAULT_DECISION_POLICY, version: '2026-09-01.v2' }
+    const secondManager = new GatewayManager({
+      hostUrls: ['http://host'], runJournal: false, decisionPolicy: newer,
+      decisionPolicyCatalog: [DEFAULT_DECISION_POLICY, newer],
+    }, { resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl) })
+
+    expect(await secondManager.wait({ sessionId: 's1', runId: run.runId as string, timeoutMs: 0 }))
+      .toMatchObject({ decision: { policyVersion: DEFAULT_DECISION_POLICY.version } })
+  })
+
+  it('fails closed when a run pins changed policy contents', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const run = await manager.task({ sessionId: 's1', objective: 'pinned', writerMode: 'read_only' })
+    const packet = parseTaskPacket(api.rows.get('s1')?.events ?? [])
+    expect(packet?.schemaVersion).toBe(2)
+    const forged = { ...packet, decisionPolicy: {
+      ...(packet?.schemaVersion === 2 ? packet.decisionPolicy : {}), activeDigest: '0'.repeat(64),
+    } }
+    api.setEvents('s1', [event('user/message', 1, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(forged)}\n${TASK_PACKET_END}` }],
+    })])
+
+    await expect(manager.wait({ sessionId: 's1', runId: run.runId as string, timeoutMs: 0 }))
+      .rejects.toThrow(/unavailable or changed/)
+  })
+
+  it('parses the generated packet when the human objective contains packet-marker prose', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const objective = `Document why ${TASK_PACKET_START} is reserved protocol syntax`
+
+    const result = await manager.task({ sessionId: 's1', objective, writerMode: 'read_only' })
+
+    expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
+      schemaVersion: 2,
+      instructionProfile: 'engineering-v1',
+      executionBrief: { source: 'SINGLE_STREAM_FALLBACK', workstreams: [{ id: 'W1' }] },
+      sessionId: 's1',
+      runId: result.runId,
+      objective,
+    })
+    expect(JSON.stringify(api.rows.get('s1')?.events)).toContain('/dsh-supervised-worker')
+  })
+
+  it('durably carries one bounded Codex workstream graph and reports its compact receipt', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+
+    const result = await manager.task({
+      sessionId: 's1', objective: 'Harden authentication', writerMode: 'read_only',
+      executionBrief: {
+        workstreams: [
+          { id: 'AUTH', outcome: 'Inspect token lifecycle', delegation: 'child_candidate', doneWhen: ['Token behavior is documented.'] },
+          { id: 'RECOVERY', outcome: 'Verify reconnect', dependsOn: ['AUTH'], delegation: 'root', doneWhen: ['Reconnect evidence is recorded.'] },
+        ],
+        integration: ['Root reconciles the evidence and publishes one final handoff.'],
+      },
+    })
+
+    expect(result).toMatchObject({
+      executionBrief: { source: 'CODEX_COMPILED', workstreamCount: 2, workstreamIds: ['AUTH', 'RECOVERY'] },
+    })
+    expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
+      executionBrief: {
+        schemaVersion: 1, source: 'CODEX_COMPILED',
+        workstreams: [{ id: 'AUTH' }, { id: 'RECOVERY', dependsOn: ['AUTH'] }],
+      },
+    })
+  })
+
+  it('returns the exact admission boundary separately so the first wait cannot skip early work', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const admit = api.admitTask.bind(api)
+    api.admitTask = async (request) => {
+      const receipt = await admit(request)
+      const row = api.rows.get(request.sessionId)
+      if (row === undefined) throw new Error('missing admitted session')
+      row.events = [
+        ...row.events,
+        event('turn/start', receipt.asOfSeq + 1, { turn: 1 }),
+        toolCall(receipt.asOfSeq + 2, 'early-read', 'read', { file_path: 'src/early.ts' }),
+        toolResult(receipt.asOfSeq + 3, 'early-read'),
+        event('step/end', receipt.asOfSeq + 4, { turn: 1, step: 1 }),
+      ]
+      return receipt
+    }
+    const manager = managerWith(api, sameDomain)
+
+    const task = await manager.task({ sessionId: 's1', objective: 'observe early work', writerMode: 'read_only' })
+    expect(task).toMatchObject({
+      admissionBoundarySeq: expect.any(Number),
+      initialWaitAfterAsOfSeq: expect.any(Number),
+      observedAsOfSeq: expect.any(Number),
+    })
+    expect(task.initialWaitAfterAsOfSeq).toBe(task.admissionBoundarySeq)
+    expect(task.observedAsOfSeq as number).toBeGreaterThan(task.initialWaitAfterAsOfSeq as number)
+
+    await expect(manager.wait({
+      sessionId: 's1', runId: task.runId as string,
+      afterAsOfSeq: task.initialWaitAfterAsOfSeq as number, timeoutMs: 0,
+    })).resolves.toMatchObject({
+      progress: { steps: { delta: 1 }, tools: { deltaCalls: 1 } },
+    })
+  })
+
+  it('rejects a stale wait instead of observing a newer run in the same session', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    const second = await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+
+    const observed = await manager.wait({
+      sessionId: 's1', runId: first.runId as string, timeoutMs: 0,
+    })
+
+    expect(observed).toMatchObject({
+      sessionId: 's1', runId: second.runId, status: 'FAILED',
+      failure: { kind: 'PROTOCOL_ERROR', stale: true },
+    })
+  })
+
+  it('rejects stale steering before it can append a message to the newer run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    const second = await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+    const before = api.rows.get('s1')?.events.length
+
+    await expect(manager.steer({
+      sessionId: 's1', runId: first.runId as string, message: 'late guidance',
+    })).rejects.toThrow(/stale run/i)
+
+    expect(second.runId).not.toBe(first.runId)
+    expect(api.rows.get('s1')?.events).toHaveLength(before ?? 0)
+  })
+
+  it('rejects a stale cancel before it can cancel the newer run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree' })
+    const manager = managerWith(api, sameDomain)
+    const first = await manager.task({ sessionId: 's1', objective: 'first', writerMode: 'read_only' })
+    await manager.task({ sessionId: 's1', objective: 'second', writerMode: 'read_only' })
+
+    await expect(manager.cancel({ sessionId: 's1', runId: first.runId as string }))
+      .rejects.toThrow(/stale run/i)
+  })
+})
+
+describe('multi-Host reconnect', () => {
+  it('discovers an existing session on a non-default configured Host and binds later calls to it', async () => {
+    const first = new FakeApi()
+    const second = new FakeApi()
+    second.addRow('s-existing', { cwd: '/work/tree' })
+    const manager = new GatewayManager({ hostUrls: ['http://host-one', 'http://host-two'], runJournal: false }, {
+      resolveWriterDomain: sameDomain,
+      createConnection: baseUrl => connected(baseUrl === 'http://host-one' ? first : second, baseUrl),
+    })
+
+    const reconnected = await manager.startOrConnect({ sessionId: 's-existing' })
+    expect(reconnected).toMatchObject({
+      sessionId: 's-existing', hostBaseUrl: 'http://host-two', reconnected: true,
+    })
+    await manager.task({ sessionId: 's-existing', objective: 'read it', writerMode: 'read_only' })
+    expect(first.rows.has('s-existing')).toBe(false)
+    expect(second.rows.get('s-existing')?.events).toHaveLength(1)
+  })
+
+  it('fails retryably when an unavailable Host prevents a conclusive session lookup', async () => {
+    const unavailable = {
+      baseUrl: 'http://host-one',
+      ensureConnected: async () => { throw new Error('connection refused') },
+    } as unknown as HostConnection
+    const reachable = {
+      baseUrl: 'http://host-two',
+      ensureConnected: async () => ({ protocolVersion: 1 }),
+      ensureGateReady: gateReady,
+      sessionExists: async () => false,
+    } as unknown as HostConnection
+    const manager = new GatewayManager({
+      hostUrls: ['http://host-one', 'http://host-two'], runJournal: false,
+    }, {
+      createConnection: baseUrl => baseUrl === 'http://host-one' ? unavailable : reachable,
+    })
+
+    await expect(manager.startOrConnect({ sessionId: 'session-on-offline-host' }))
+      .rejects.toMatchObject<HostDiscoveryError>({ name: 'HostDiscoveryError', retryable: true })
+  })
+
+  it('keeps healthy dsh_runs entries when another session on the Host is corrupt', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/good' })
+    let connection!: HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => {
+        connection = connected(api)
+        return connection
+      },
+    })
+    await manager.task({ sessionId: 's1', objective: 'healthy run', writerMode: 'read_only' })
+    api.addRow('bad', { cwd: '/work/bad' })
+    const refresh = connection.refreshSession.bind(connection)
+    connection.refreshSession = async sessionId => {
+      if (sessionId === 'bad') throw new Error('corrupt durable history')
+      return refresh(sessionId)
+    }
+
+    const runs = await manager.runs()
+
+    expect(runs).toMatchObject({
+      entries: [{ sessionId: 's1' }],
+      sessionErrors: [{ sessionId: 'bad', message: 'corrupt durable history' }],
+      unavailableHosts: 0,
+    })
+  })
+
+  it('keeps a run discoverable when its budget projection endpoint is temporarily unavailable', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/good' })
+    let connection!: HostConnection
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => {
+        connection = connected(api)
+        return connection
+      },
+    })
+    const run = await manager.task({
+      sessionId: 's1', objective: 'budgeted run', writerMode: 'read_only', tokenBudget: { maxTokens: 100 },
+    })
+    connection.tokenBudgetState = async () => { throw new Error('budget plugin restarting') }
+
+    await expect(manager.runs()).resolves.toMatchObject({
+      entries: [{ sessionId: 's1', runId: run.runId, budgetWarning: expect.stringMatching(/plugin restarting/) }],
+      sessionErrors: [],
+    })
+  })
+
+  it('restores a replayed pending interaction after the MCP manager restarts', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/tree', events: [s1Packet(1), event('turn/start', 2, { turn: 1 })] })
+    const firstManager = managerWith(api, sameDomain)
+    await firstManager.startOrConnect({ sessionId: 's1' })
+    api.pushMux({
+      rpcId: 'approval-replayed',
+      payload: { type: 'approval/requested', sessionId: 's1', approvalId: 'a1', toolName: 'terminal' },
+    } as unknown as RpcRequest<MuxFrame>)
+    await sleep(30)
+    expect(await firstManager.wait({ sessionId: 's1', timeoutMs: 0 })).toMatchObject({
+      status: 'APPROVAL_REQUIRED', approval: { rpcId: 'approval-replayed' },
+    })
+    firstManager.stopClients()
+
+    // The Host's stable-rpc-id replay contract is represented by replaying the
+    // same envelope to the newly connected MCP client.
+    api.pushMux({
+      rpcId: 'approval-replayed',
+      payload: { type: 'approval/requested', sessionId: 's1', approvalId: 'a1', toolName: 'terminal' },
+    } as unknown as RpcRequest<MuxFrame>)
+    const secondManager = managerWith(api, sameDomain)
+    await secondManager.startOrConnect({ sessionId: 's1' })
+    await sleep(30)
+    expect(await secondManager.wait({ sessionId: 's1', timeoutMs: 0 })).toMatchObject({
+      status: 'APPROVAL_REQUIRED', approval: { rpcId: 'approval-replayed' },
+    })
+  })
+})
+
+describe('Host launch coalescing', () => {
+  it('launches only once when concurrent start_or_connect calls find the Host offline', async () => {
+    let launchRequested = false
+    let initialProbeCalls = 0
+    let launchCalls = 0
+    let signalInitialProbes!: () => void
+    let allowInitialProbesToFail!: () => void
+    let signalLaunchStarted!: () => void
+    let allowHostToBecomeReady!: () => void
+    const initialProbes = new Promise<void>(resolve => { signalInitialProbes = resolve })
+    const initialProbesMayFail = new Promise<void>(resolve => { allowInitialProbesToFail = resolve })
+    const launchStarted = new Promise<void>(resolve => { signalLaunchStarted = resolve })
+    const hostMayBecomeReady = new Promise<void>(resolve => { allowHostToBecomeReady = resolve })
+    let nextSession = 0
+    const connection = {
+      baseUrl: 'http://host',
+      ensureConnected: async () => {
+        if (!launchRequested) {
+          initialProbeCalls++
+          if (initialProbeCalls === 2) signalInitialProbes()
+          await initialProbesMayFail
+          throw new Error('Host offline')
+        }
+        await hostMayBecomeReady
+        return { protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }
+      },
+      ensureGateReady: gateReady,
+      api: {
+        sessions: {
+          create: async () => ({ result: { ok: true, value: { sessionId: `s-${++nextSession}` } } }),
+        },
+      },
+      refreshSession: async () => ({ cwd: '/work/tree', agentPreset: 'standard' }),
+    } as unknown as HostConnection
+    const manager = new GatewayManager({
+      hostUrls: ['http://host'],
+      launch: { argv: ['host-start'] },
+      runJournal: false,
+    }, {
+      createConnection: () => connection,
+      resolveSessionCwd: async cwd => cwd,
+      launchHost: async () => {
+        launchCalls++
+        launchRequested = true
+        signalLaunchStarted()
+      },
+    })
+
+    const first = manager.startOrConnect({ cwd: '/work/tree' })
+    const second = manager.startOrConnect({ cwd: '/work/tree' })
+    await initialProbes
+    allowInitialProbesToFail()
+    await launchStarted
+    await sleep(5)
+    expect(launchCalls).toBe(1)
+    allowHostToBecomeReady()
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ sessionId: 's-1', hostInstanceId: 'host-1' }),
+      expect.objectContaining({ sessionId: 's-2', hostInstanceId: 'host-1' }),
+    ])
+    expect(launchCalls).toBe(1)
   })
 })
 
@@ -236,6 +1293,47 @@ function s1CompletedEvents(): DshEvent[] {
   ]
 }
 
+const v2RunId = '11111111-1111-4111-8111-111111111111'
+const v2CompletionToken = '22222222-2222-4222-8222-222222222222'
+
+function s1V2CompletedEvents(): DshEvent[] {
+  const packet = {
+    schemaVersion: 2,
+    sessionId: 's1',
+    runId: v2RunId,
+    completionToken: v2CompletionToken,
+    objective: 'ship with children',
+    writerMode: 'writer',
+    budget: { maxTokens: 100 },
+  }
+  const handoff = {
+    sessionId: 's1',
+    runId: v2RunId,
+    completionToken: v2CompletionToken,
+    status: 'completed',
+    stage: 'done',
+    summary: 'root verified',
+    files: [],
+    verification: [],
+  }
+  return [
+    event('user/message', 1, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+    }),
+    event('turn/start', 2, { turn: 1 }),
+    toolCall(3, 'v2-handoff', 'supervisor_handoff', handoff),
+    event('tool/result', 4, {
+      turn: 1,
+      step: 1,
+      message: { source: { callId: 'v2-handoff' }, content: [{
+        type: 'tool-result',
+        content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff, artifacts: [] }) }],
+      }] },
+    }),
+    event('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
+  ]
+}
+
 describe('wait cadence', () => {
   it('defaults the wait window to the five-minute aggregated cadence', () => {
     expect(DEFAULT_WAIT_TIMEOUT_MS).toBe(300_000)
@@ -264,10 +1362,45 @@ describe('wait cadence', () => {
     expect(observed.workerState).toBe('IDLE')
     expect(observed.wait).toEqual({ reason: 'TIMEOUT', timeoutMs: 150 })
     expect(observed.progress?.projectActivity).toEqual({
+      coverage: 'complete',
       edits: { total: 1, files: ['src/a.ts'] },
-      verification: { total: 0, commands: [] },
+      verification: { total: 0, commands: [], evidence: [] },
     })
     expect(observed.progress?.steps).toEqual({ completed: 1, delta: 1 })
+    // Initial + final authoritative refresh are required. A cache-change wakeup
+    // exactly at the deadline may add one final reconciliation; this remains
+    // bounded and is not one HTTP history call per event.
+    expect(api.historyCalls).toBeGreaterThanOrEqual(2)
+    expect(api.historyCalls).toBeLessThanOrEqual(3)
+  })
+
+  it('folds mux event churn from cache without refreshing HTTP history for every event', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [s1Packet(1)] })
+    const manager = managerWith(api, sameDomain)
+    const pending = manager.wait({ taskId: 's1', timeoutMs: 180 })
+    await sleep(30)
+    for (const pushed of [
+      event('turn/start', 2, { turn: 1 }),
+      toolCall(3, 'r1', 'read', { file_path: 'src/a.ts' }),
+      toolResult(4, 'r1'),
+      event('step/end', 5, { turn: 1, step: 1 }),
+    ]) {
+      api.pushMux({
+        rpcId: `mux-${pushed.seq}`,
+        payload: { type: 'session/event', sessionId: 's1', event: pushed },
+      } as unknown as RpcRequest<MuxFrame>)
+      await sleep(15)
+    }
+
+    const observed = await pending
+    expect(observed).toMatchObject({
+      status: 'WAITING',
+      progress: { steps: { completed: 1, delta: 1 }, tools: { totalCalls: 1, deltaCalls: 1 } },
+    })
+    // One initial history fetch and one cadence-boundary reconciliation, not
+    // one fetch per mux event.
+    expect(api.historyCalls).toBe(2)
   })
 
   it('returns immediately for a terminal completed state', async () => {
@@ -279,6 +1412,309 @@ describe('wait cadence', () => {
     expect(Date.now() - started).toBeLessThan(500)
     expect(observed.status).toBe('COMPLETED')
     expect(observed.projectActivity).toMatchObject({ toolCalls: 1, steps: 0 })
+  })
+
+  it('requires a new root handoff after its affiliated child settles', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'child-1', {
+      running: true,
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING',
+      stage: 'children-running',
+      wait: { reason: 'TIMEOUT' },
+    })
+
+    api.setRunning('child-1', false)
+    api.setEvents('child-1', [
+      { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+      { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+      { ...event('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }), time: 12 },
+    ])
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING',
+      stage: 'root-rehandoff-required',
+    })
+
+    const integratedHandoff = {
+      sessionId: 's1',
+      runId: v2RunId,
+      completionToken: v2CompletionToken,
+      status: 'completed',
+      stage: 'done',
+      summary: 'root integrated child result',
+      files: [],
+      verification: [],
+    }
+    api.setEvents('s1', [
+      ...s1V2CompletedEvents(),
+      { ...event('turn/start', 6, { turn: 2 }), time: 13 },
+      { ...event('tool/call', 7, {
+        turn: 2, step: 1, callId: 'c2', name: 'supervisor_handoff', arguments: JSON.stringify(integratedHandoff),
+      }), time: 14 },
+      { ...event('tool/result', 8, {
+        turn: 2, step: 1,
+        message: { source: { callId: 'c2' }, content: [{
+          type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff: integratedHandoff, artifacts: [] }) }],
+        }] },
+      }), time: 15 },
+      { ...event('turn/end', 9, { turn: 2, reason: { kind: 'completed' } }), time: 16 },
+    ])
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'COMPLETED',
+      summary: 'root integrated child result',
+    })
+  })
+
+  it('compares child settlement with the accepted handoff rather than a later root turn end', async () => {
+    const api = new FakeApi()
+    const rootEvents = s1V2CompletedEvents().map((entry) => {
+      if (entry.type === 'tool/call') return { ...entry, time: 13 }
+      if (entry.type === 'tool/result') return { ...entry, time: 14 }
+      if (entry.type === 'turn/end') return { ...entry, time: 16 }
+      return entry
+    })
+    api.addRow('s1', { cwd: '/work', events: rootEvents })
+    api.addChild('s1', 'child-1', {
+      running: false,
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+        { ...event('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }), time: 15 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING',
+      stage: 'root-rehandoff-required',
+    })
+  })
+
+  it('uses the strict child convergence state in dsh_runs recovery discovery', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'child-1', {
+      running: true,
+      events: [{ ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 }],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.runs()).resolves.toMatchObject({
+      entries: [{ sessionId: 's1', runId: v2RunId, status: 'WAITING', stage: 'children-running' }],
+    })
+  })
+
+  it('lists and interrupts only direct children affiliated with the current run', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'historical-child', {
+      mode: 'continuable', events: [{ ...event('user/message', 0, { content: [{ type: 'text', text: 'old work' }] }), time: 0 }],
+    })
+    api.addChild('s1', 'current-child', {
+      mode: 'continuable', events: [{ ...event('user/message', 0, { content: [{ type: 'text', text: 'current work' }] }), time: 10 }],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.agents({ sessionId: 's1', runId: v2RunId })).resolves.toMatchObject({
+      entries: [{ id: 'current-child' }],
+      excludedNonAffiliatedEntries: 1,
+    })
+    await expect(manager.interruptAgent({
+      sessionId: 's1', runId: v2RunId, childSessionId: 'historical-child',
+    })).rejects.toThrow(/not affiliated with current run/)
+    expect(api.interruptCalls).toBe(0)
+    await expect(manager.interruptAgent({
+      sessionId: 's1', runId: v2RunId, childSessionId: 'current-child',
+    })).resolves.toMatchObject({ accepted: true, childSessionId: 'current-child' })
+    expect(api.interruptCalls).toBe(1)
+  })
+
+  it('fails closed on an affiliated diagnostic child but ignores a historical diagnostic', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addDiagnostic('s1', 'old-corrupt', {
+      events: [{ ...event('user/message', 0, { content: [{ type: 'text', text: 'old work' }] }), time: 0 }],
+    })
+    api.addDiagnostic('s1', 'current-corrupt', {
+      events: [{ ...event('user/message', 0, { content: [{ type: 'text', text: 'current work' }] }), time: 10 }],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING', stage: 'child-settlement-unverified',
+    })
+    await expect(manager.agents({ sessionId: 's1', runId: v2RunId })).resolves.toMatchObject({
+      entries: [{ kind: 'diagnostic', id: 'current-corrupt' }],
+      excludedNonAffiliatedEntries: 1,
+    })
+  })
+
+  it('does not infer child settlement from inactive status alone', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'child-1', {
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'WAITING',
+      stage: 'child-settlement-unverified',
+    })
+  })
+
+  it('lets a durable child budget stop override an earlier completed root handoff', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    api.addChild('s1', 'child-1', {
+      events: [
+        { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 },
+        { ...event('turn/start', 1, { turn: 1 }), time: 11 },
+        { ...event('turn/end', 2, {
+          turn: 1,
+          reason: {
+            kind: 'aborted',
+            reason: { kind: 'hook', reason: `dsh-gate:token-budget-exhausted;runId=${v2RunId};used=150;limit=100` },
+          },
+        }), time: 12 },
+      ],
+    })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'ESCALATION_REQUIRED',
+      stage: 'token-budget-exhausted',
+      budget: { observedTokens: 150, limitTokens: 100, exhausted: true, coverage: 'run_tree' },
+    })
+  })
+
+  it('does not journal COMPLETED before an affiliated child converges', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1V2CompletedEvents() })
+    const childPrompt = { ...event('user/message', 0, { content: [{ type: 'text', text: 'delegated work' }] }), time: 10 }
+    api.addChild('s1', 'child-1', { running: true, events: [childPrompt] })
+    const records: RunRecord[] = []
+    const journal: RunJournal = {
+      async record(value) { records.push(value); return { recordId: value.recordId, created: true } },
+      async get() { return undefined },
+      async list() { return records },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+
+    expect((await manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).status).toBe('WAITING')
+    expect(records).toHaveLength(0)
+
+    api.setRunning('child-1', false)
+    api.setEvents('child-1', [
+      childPrompt,
+      { ...event('turn/end', 1, { turn: 1, reason: { kind: 'completed' } }), time: 12 },
+    ])
+    expect((await manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).status).toBe('WAITING')
+    expect(records).toHaveLength(0)
+
+    const handoff = {
+      sessionId: 's1', runId: v2RunId, completionToken: v2CompletionToken,
+      status: 'completed', stage: 'done', summary: 'root integrated child result', files: [], verification: [],
+    }
+    api.setEvents('s1', [
+      ...s1V2CompletedEvents(),
+      { ...event('turn/start', 6, { turn: 2 }), time: 13 },
+      { ...event('tool/call', 7, {
+        turn: 2, step: 1, callId: 'journal-handoff', name: 'supervisor_handoff', arguments: JSON.stringify(handoff),
+      }), time: 14 },
+      { ...event('tool/result', 8, {
+        turn: 2, step: 1,
+        message: { source: { callId: 'journal-handoff' }, content: [{
+          type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff, artifacts: [] }) }],
+        }] },
+      }), time: 15 },
+      { ...event('turn/end', 9, { turn: 2, reason: { kind: 'completed' } }), time: 16 },
+    ])
+    expect((await manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).status).toBe('COMPLETED')
+    expect(records).toHaveLength(1)
+    expect(records[0]?.outcome).toBe('COMPLETED')
+  })
+
+  it('records a terminal run once from runtime facts without another model call', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1CompletedEvents() })
+    const records: RunRecord[] = []
+    const journal: RunJournal = {
+      async record(value) {
+        const created = records.length === 0
+        if (created) records.push(value)
+        return { recordId: value.recordId, created }
+      },
+      async get(runId) { return records.find(record => record.runId === runId) },
+      async list() { return records },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+    const first = await manager.wait({ taskId: 's1', timeoutMs: 0 })
+    const second = await manager.wait({ taskId: 's1', timeoutMs: 0 })
+
+    expect(first.journal).toMatchObject({ recorded: true, created: true })
+    expect(second.journal).toMatchObject({ recorded: true, created: false })
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({
+      outcome: 'COMPLETED', summary: 'verified',
+      provenance: { completionProtocolVerified: true, modelCallsUsed: 0 },
+    })
+  })
+
+  it('preserves the terminal outcome when journal persistence fails', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: s1CompletedEvents() })
+    const journal: RunJournal = {
+      async record() { throw new Error('disk unavailable') },
+      async get() { return undefined },
+      async list() { return [] },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+    expect(await manager.wait({ taskId: 's1', timeoutMs: 0 })).toMatchObject({
+      status: 'COMPLETED',
+      journal: { recorded: false, warning: 'run journal write failed (Error)' },
+    })
+  })
+
+  it('journals a durable Host interruption but not a transient Host query failure', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [
+      s1Packet(1),
+      event('turn/start', 2, { turn: 1 }),
+      event('turn/end', 3, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const records: RunRecord[] = []
+    const journal: RunJournal = {
+      async record(value) { records.push(value); return { recordId: value.recordId, created: true } },
+      async get() { return undefined },
+      async list() { return records },
+    }
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: journal }, {
+      resolveWriterDomain: sameDomain, createConnection: baseUrl => connected(api, baseUrl),
+    })
+
+    await expect(manager.wait({ sessionId: 's1', timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'FAILED', failure: { kind: 'HOST_FAILED' }, journal: { recorded: true },
+    })
+    expect(records).toHaveLength(1)
+    expect(records[0]?.failure?.kind).toBe('HOST_FAILED')
   })
 
   it('returns immediately for a pending approval', async () => {

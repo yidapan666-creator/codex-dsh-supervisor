@@ -5,8 +5,22 @@
     provider: deepseek-official
     model: deepseek-v4-flash
 
+# DSH's native absolute depth gate: Root depth 0 may create direct children;
+# child depth 1 cannot create grandchildren through either delegation tool.
+- id: tool-subagent
+  config:
+    maxDepth: 1
+
+- id: tool-subagent-fork
+  config:
+    maxDepth: 1
+
 - insert:
     - id: dsh-gate-supervisor-tools
       name: '@dsh-gate/supervisor-tools'
       config:
         maxReportedFailuresPerSignature: 2
+        maxReservedOutputTokensPerRequest: 8192
+        directChildToolNames:
+          - subagent
+          - subagent_fork

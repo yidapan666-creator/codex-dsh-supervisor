@@ -2,12 +2,17 @@
 
 Date: 2026-08-20 (design review; implementation carried out later)
 
+> Historical identity note: examples below that equate `taskId` with `sessionId`
+> describe the v1 design. The implemented v2 contract in `docs/protocol.md` and
+> `docs/supervision-protocol-v2.md` uses a durable `sessionId` plus a unique
+> per-execution `runId`; those current documents are authoritative.
+
 Decision status: adopted with deviations — this document is the historical design review. The implementation
 in this repository follows the architecture below (a small MCP translation surface, one independent DSH Web
 Host, durable supervisor handoffs, and a bounded failure budget) with the deviations recorded in the README
 and `docs/protocol.md`: the MCP surface is named `dsh-gate`, the task packet carries `writerMode` instead of
 the proposed `accessMode`, and the DSH-core patch from section M is consumed as the public fork pin
-`7212c955438c70c9a2d168f67e85a8014b8d4488` (see `source-provenance.md` and `DEPLOYMENT.md`) rather than a
+`68dd149a1834496ced7308de5a7084328855f13e` (see `source-provenance.md` and `DEPLOYMENT.md`) rather than a
 local patch or an upstream merge.
 
 Target workspace: the repository root (this checkout)
@@ -16,7 +21,7 @@ Target workspace: the repository root (this checkout)
 
 Build a local TypeScript stdio MCP server, not a new orchestration framework. Codex remains the supervisor; one independently-lived DSH Web Host owns any number of root sessions; each DSH root owns its children. The MCP process translates nine coarse operations into DSH's existing typed Web API and keeps no authoritative database. MCP exit or restart must never imply DSH Host shutdown.
 
-Most of the required runtime already exists in DSH: session creation, durable history, event streams, steering, queueing, cancellation, approvals, questions, model selection, token projections, child lifecycle, child continuation/interrupt, workflows, and Ralph. The only defensible DSH-core change is a small public network-client/compatibility seam. The only genuinely new worker-runtime behavior is a small out-of-tree plugin that produces bounded, durable supervisor handoffs and mechanically enforces the recovery budget for worker-reported failures.
+Most of the required runtime already exists in DSH: session creation, durable history, event streams, steering, queueing, cancellation, approvals, questions, model selection, token projections, child lifecycle, child continuation/interrupt, workflows, and Ralph. The only defensible DSH-core change is a small public network-client/compatibility seam. The genuinely new worker-runtime behavior stays in a small out-of-tree plugin: bounded durable supervisor handoffs, mechanical recovery limits for worker-reported failures, run-tree token request reservations, and task-packet direct-child authority enforcement. It composes DSH's public hooks and persistence facts rather than modifying those core services.
 
 Do not use DSH's subprocess SDK JSON-RPC protocol, terminal scraping, Codex App Server, or a second persistence layer. Do not import any external project's process manager, worktree manager, scheduler, or database.
 

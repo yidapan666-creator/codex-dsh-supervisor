@@ -5,8 +5,27 @@
     provider: deepseek-official
     model: deepseek-v4-flash
 
+# Use DSH's native absolute depth control instead of a second lock manager.
+- id: tool-subagent
+  config:
+    maxDepth: 1
+
+- id: tool-subagent-fork
+  config:
+    maxDepth: 1
+
+# Require the same deployment secret on generic HTTP RPC and WebSocket paths.
+# Browser clients read it from the URL fragment; MCP uses a bearer header.
+- id: connection
+  config:
+    authToken: !!js process.env.DSH_HOST_TOKEN
+
 - insert:
     - id: dsh-gate-supervisor-tools
       name: '@dsh-gate/supervisor-tools'
       config:
         maxReportedFailuresPerSignature: 2
+        maxReservedOutputTokensPerRequest: 8192
+        directChildToolNames:
+          - subagent
+          - subagent_fork

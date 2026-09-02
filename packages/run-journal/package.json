@@ -1,0 +1,13 @@
+{
+  "name": "@dsh-gate/run-journal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Token-free durable DSH run records for audit and future retrieval",
+  "license": "MIT",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  }
+}

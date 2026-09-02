@@ -1,0 +1,11 @@
+{
+  "version": "2026-08-26.v1",
+  "workerRules": [
+    { "id": "worker.explicit_human", "priority": 130, "when": { "requiresHuman": true }, "effect": { "timing": "immediate", "audience": "human", "action": "ASK_HUMAN", "reasonCode": "WORKER_REQUIRES_HUMAN" } },
+    { "id": "worker.sensitive", "priority": 120, "when": { "categories": ["security", "destructive_action", "credentials", "external_side_effect", "scope", "acceptance"] }, "effect": { "timing": "immediate", "audience": "human", "action": "ASK_HUMAN", "reasonCode": "SENSITIVE_OR_SCOPE_DECISION" } },
+    { "id": "worker.pre_authorized", "priority": 100, "when": { "explicitlyPreAuthorized": true }, "effect": { "timing": "cadence", "audience": "none", "action": "CONTINUE_WAIT", "reasonCode": "PRE_AUTHORIZED" } },
+    { "id": "worker.high_impact", "priority": 90, "when": { "impacts": ["high"] }, "effect": { "timing": "immediate", "audience": "human", "action": "ASK_HUMAN", "reasonCode": "HIGH_IMPACT_DECISION" } },
+    { "id": "worker.blocking", "priority": 80, "when": { "blocking": true }, "effect": { "timing": "immediate", "audience": "supervisor", "action": "REVIEW_WORKER_REQUEST", "reasonCode": "BLOCKING_WORKER_DECISION" } }
+  ],
+  "workerFallback": { "timing": "cadence", "audience": "supervisor", "action": "SURFACE_PROGRESS", "reasonCode": "NON_BLOCKING_WORKER_DECISION" }
+}

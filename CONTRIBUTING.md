@@ -9,7 +9,7 @@ pnpm bootstrap   # pinned DSH fork checkout, install, build, link, plugin instal
 pnpm verify      # typecheck + tests + build
 ```
 
-`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, which is not published. The bootstrap fetches the pinned public fork commit (`7212c955438c70c9a2d168f67e85a8014b8d4488` — see `DEPLOYMENT.md` for the contract and update policy), builds it, and reuses `scripts/link-local-dsh.mjs` to link the seam into `packages/mcp-server/node_modules`. A development checkout already at the pinned commit can be used directly:
+`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, which is not published. The bootstrap fetches the pinned public fork commit (`68dd149a1834496ced7308de5a7084328855f13e` — see `DEPLOYMENT.md` for the contract and update policy), builds it, and reuses `scripts/link-local-dsh.mjs` to link the seam into `packages/mcp-server/node_modules`. A development checkout already at the pinned commit can be used directly:
 
 ```sh
 node scripts/dsh-gate.mjs bootstrap --dsh-repo /path/to/verified/deepseek-harness
@@ -17,9 +17,9 @@ node scripts/dsh-gate.mjs bootstrap --dsh-repo /path/to/verified/deepseek-harnes
 
 The bootstrap/doctor/Host workflow is documented in `DEPLOYMENT.md`; its focused tests live in `scripts/tests/`.
 
-## Continuous integration (not enabled yet)
+## Continuous integration
 
-No CI workflow is committed. A standard Node runner can now make a clean checkout green with `pnpm bootstrap && pnpm verify` — bootstrap needs network access to the fork and the npm registry, and it must not be pointed at a pre-seeded state. Add a workflow when a maintainer confirms CI can reach those endpoints.
+The GitHub Actions workflow runs on pull requests and pushes to `main` with Node 24 and pnpm 11.19.0. It executes `pnpm bootstrap` from a clean checkout, then `pnpm verify`; bootstrap needs network access to the pinned public DSH fork commit and the npm registry and never uses pre-seeded state.
 
 ## Handoff and long reports
 
@@ -36,6 +36,7 @@ No CI workflow is committed. A standard Node runner can now make a clean checkou
 - Tests live next to the code under `packages/*/tests` and run with Vitest.
 - Add a focused regression test alongside any risky behavior change; the suite is intentionally fast.
 - Do not weaken protocol semantics to make a test pass: typed failures, observation cursors, valid-handoff-plus-turn-end completion, and root ownership of children are invariants.
+- Host-runtime changes under `packages/dsh-supervisor-tools/src` or its Cordis patch require `pnpm build-id:update`. Build and typecheck fail while the content-derived identity is stale, so a running old Host cannot satisfy a newly built MCP by reusing the package version string.
 
 ## Review workflow
 

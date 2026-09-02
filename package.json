@@ -13,13 +13,17 @@
     "build": "pnpm -r build",
     "check": "pnpm -r check",
     "test": "vitest run",
+    "build-id:update": "node scripts/update-build-identity.mjs --write",
+    "build-id:check": "node scripts/update-build-identity.mjs --check",
     "link:dsh": "node scripts/link-local-dsh.mjs",
     "bootstrap": "node scripts/dsh-gate.mjs bootstrap",
     "doctor": "node scripts/dsh-gate.mjs doctor",
+    "policy:explain": "node packages/decision-policy/dist/cli.js explain",
+    "skill:install": "node scripts/install-codex-skill.mjs",
     "host:start": "node scripts/dsh-gate.mjs host start",
     "host:status": "node scripts/dsh-gate.mjs host status",
     "host:stop": "node scripts/dsh-gate.mjs host stop",
-    "verify": "pnpm check && pnpm test && pnpm build"
+    "verify": "pnpm build && pnpm check && pnpm test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

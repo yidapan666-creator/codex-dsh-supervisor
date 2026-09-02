@@ -18,11 +18,19 @@ importers:
         specifier: ^4.0.0
         version: 4.1.11(@types/node@24.13.3)(vite@8.2.1(@types/node@24.13.3))
 
+  packages/decision-policy: {}
+
   packages/dsh-supervisor-tools:
     dependencies:
       '@deepseek-ai/cordis':
         specifier: '>=4 <5'
         version: 4.0.1(@deepseek-ai/cordis-plugin-include@1.0.6)(@deepseek-ai/cordis-plugin-loader@1.0.2)
+      '@deepseek-ai/dsh-host-apiproxy':
+        specifier: '>=0.1.0-rc.8 <1'
+        version: 0.1.0-rc.8(9db0ce01d61fac03da5d751375c48981)
+      '@deepseek-ai/dsh-host-webserver':
+        specifier: '>=0.1.0-rc.8 <1'
+        version: 0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1))
       '@deepseek-ai/dsh-system-prompt':
         specifier: '>=0.1.0-rc.8 <1'
         version: 0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1))(@deepseek-ai/dsh-llm@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-attachment@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-brand@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)))(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)))(@deepseek-ai/dsh-brand@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)))(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1))(@deepseek-ai/dsh-timeout@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1))))(@deepseek-ai/dsh-scope@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)))
@@ -38,12 +46,26 @@ importers:
       '@deepseek-ai/dsh-client-connection':
         specifier: '>=0.1.0-rc.8 <1'
         version: 0.1.0-rc.8(fe206655156830a934a8c1ad4c553629)
+      '@dsh-gate/decision-policy':
+        specifier: workspace:*
+        version: link:../decision-policy
+      '@dsh-gate/run-journal':
+        specifier: workspace:*
+        version: link:../run-journal
       '@modelcontextprotocol/server':
         specifier: ^2.0.0
         version: 2.0.0
       zod:
         specifier: ^4.0.0
         version: 4.4.3
+
+  packages/rag-context:
+    dependencies:
+      '@dsh-gate/run-journal':
+        specifier: workspace:*
+        version: link:../run-journal
+
+  packages/run-journal: {}
 
 packages:
 
