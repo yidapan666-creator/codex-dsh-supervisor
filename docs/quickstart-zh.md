@@ -1,5 +1,36 @@
 # dsh-gate 中文快速上手
 
+## 三种部署方式
+
+普通用户推荐一键安装：
+
+```sh
+npx @yidapan666-creator/dsh-gate setup
+```
+
+它会下载与当前系统匹配、带 SHA-256 校验的 GitHub Release，安装 Codex
+skill，写入一个有明确边界且可升级的 MCP 配置块，启动独立 Host，再执行
+live doctor。裸 npm 名称 `dsh-gate` 已被无关项目占用，因此官方包使用你的
+scope；安装后的命令仍然叫 `dsh-gate`。
+
+离线或需要先审计制品时：
+
+```sh
+npm exec --offline --yes \
+  --package ./yidapan666-creator-dsh-gate-0.1.0.tgz -- \
+  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.0-darwin-arm64-offline.tar.gz
+```
+
+离线时需要同时下载 installer `.tgz`、对应平台 runtime
+`*-offline.tar.gz` 以及两个 `.sha256`；命令只从本地 `.tgz` 启动安装器，
+不会访问 npm registry。也可以先全局安装 CLI。生命周期命令若没有全局
+CLI，就继续使用 `npx @yidapan666-creator/dsh-gate upgrade|uninstall`。
+
+开发者仍可使用源码部署：`pnpm bootstrap`、`pnpm host:start`、
+`pnpm run doctor --live`。升级执行安装器的 `upgrade`；卸载默认保留 session
+状态，只有显式传入 `uninstall --purge` 才删除状态。完整说明见
+[`distribution.md`](distribution.md)。
+
 你不需要手动调用 `dsh_start_or_connect`、`dsh_task` 或 `dsh_wait`。安装并重启 Codex 后，直接用自然语言要求 Codex“使用 DSH”即可；`codex-dsh-supervisor` skill 负责执行下面的监督流程。
 
 ## 你有哪两个选项

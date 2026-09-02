@@ -11,7 +11,27 @@ The workspace contains:
 - `@dsh-gate/run-journal`: atomic, model-free terminal run records used as the durable source for future retrieval;
 - two narrow operator skills, example Codex/DSH configuration, and a deterministic bootstrap/doctor/Host workflow.
 
-## Deploy, verify, and start
+## Choose a deployment path
+
+Normal users can install the matching checksummed GitHub Release, configure
+Codex, install the skill, start the independent Host, and run live doctor with:
+
+```sh
+npx @yidapan666-creator/dsh-gate setup
+```
+
+For an offline or reviewed-artifact installation:
+
+```sh
+npm exec --offline --yes \
+  --package ./yidapan666-creator-dsh-gate-0.1.0.tgz -- \
+  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.0-darwin-arm64-offline.tar.gz
+```
+
+See [distribution and lifecycle options](docs/distribution.md) for `upgrade`,
+`uninstall`, retained session state, and release construction.
+
+## Source deployment
 
 ```sh
 pnpm bootstrap      # fetch the pinned DSH fork commit, build & link the exact
@@ -92,9 +112,16 @@ At a durable run terminal state, the gateway writes one atomic JSON record under
 
 ## Release status
 
-The source is licensed under MIT and prepared for public hosting at `yidapan666-creator/dsh-gate`: the DSH dependency is a public fork commit pinned by SHA, the working tree contains no machine-specific paths or secrets, and `pnpm verify` passes with the bootstrap-managed link. Publication as **npm packages is a separate, still-blocked decision**: the workspace packages keep `"private": true`, and a clean package install cannot build or run until the upstream DSH network-client seam is published (the fork pin works for source deployments, not for registry consumers).
+The runtime workspace packages remain private implementation details; only the
+thin `@yidapan666-creator/dsh-gate` installer is publishable. It downloads
+immutable GitHub Release bundles carrying the exact public-fork seam, so users
+do not depend on an unpublished upstream network-client package. npm
+publication uses trusted provenance when the repository owner enables
+`NPM_PUBLISH_ENABLED` and configures this workflow as the trusted publisher.
 
-The remaining upstream limitation is npm publication: the workspace packages stay private until the generic `@deepseek-ai/dsh-client-connection/network-client` exports are published upstream. The public fork pin at `68dd149a1834496ced7308de5a7084328855f13e` makes source deployments reproducible today; it is not an upstream merge and no merge is claimed.
+The public fork pin at `68dd149a1834496ced7308de5a7084328855f13e`
+makes both source and Release deployments reproducible; it is not claimed as an
+upstream merge.
 
 Source installation, build, tests, packaging checks, and the protocol contract are covered by the documented verification workflow.
 

@@ -23,6 +23,9 @@
     "host:start": "node scripts/dsh-gate.mjs host start",
     "host:status": "node scripts/dsh-gate.mjs host status",
     "host:stop": "node scripts/dsh-gate.mjs host stop",
+    "dist:bundle:online": "node scripts/build-release-bundle.mjs --kind online",
+    "dist:bundle:offline": "node scripts/build-release-bundle.mjs --kind offline",
+    "dist:pack:npm": "pnpm --filter @yidapan666-creator/dsh-gate pack --pack-destination dist/npm",
     "verify": "pnpm build && pnpm check && pnpm test"
   },
   "devDependencies": {

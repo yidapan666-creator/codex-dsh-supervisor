@@ -20,6 +20,8 @@ importers:
 
   packages/decision-policy: {}
 
+  packages/distribution: {}
+
   packages/dsh-supervisor-tools:
     dependencies:
       '@deepseek-ai/cordis':

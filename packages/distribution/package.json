@@ -1,0 +1,31 @@
+{
+  "name": "@yidapan666-creator/dsh-gate",
+  "version": "0.1.0",
+  "description": "Installer and lifecycle CLI for the dsh-gate Codex supervision bridge",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "dsh-gate": "bin/dsh-gate.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git",
+    "directory": "packages/distribution"
+  },
+  "scripts": {
+    "build": "node --check bin/dsh-gate.mjs && node --check lib/installer.mjs",
+    "check": "node --check bin/dsh-gate.mjs && node --check lib/installer.mjs"
+  }
+}

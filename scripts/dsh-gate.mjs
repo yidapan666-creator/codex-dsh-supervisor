@@ -8,6 +8,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { lstat, mkdir, readFile, readlink, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -124,7 +125,16 @@ async function runCommand(phase, command, options = {}) {
 
 function currentGateSha() {
   const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: paths.root, encoding: 'utf8' })
-  if (head.status !== 0) return undefined
+  if (head.status !== 0) {
+    try {
+      const manifest = JSON.parse(readFileSync(join(paths.root, '.dsh-distribution.json'), 'utf8'))
+      return typeof manifest.gateCommit === 'string' && manifest.gateCommit !== ''
+        ? `release:${manifest.gateCommit}`
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
   const status = spawnSync('git', ['status', '--porcelain'], { cwd: paths.root, encoding: 'utf8' })
   return status.status === 0 && status.stdout.trim() !== ''
     ? `${head.stdout.trim()}-dirty`

@@ -5,6 +5,10 @@ into a running deployment: one deterministic bootstrap, one doctor, and one
 explicit Host start. It is written for both human operators and AI operators —
 every command below is copy-pasteable and none of them improvise source edits.
 
+End users should normally follow [`docs/distribution.md`](docs/distribution.md)
+for the Release installer, offline bundle, upgrade, and uninstall flows. This
+document remains the source-checkout contract reused by the release builder.
+
 ## What the deployment is
 
 ```

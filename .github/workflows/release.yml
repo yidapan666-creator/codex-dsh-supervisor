@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing version/tag without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        kind: [online, offline]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: corepack enable
+      - run: corepack pnpm install --frozen-lockfile
+      - run: corepack pnpm bootstrap
+      - run: corepack pnpm verify
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build release bundle
+        run: node scripts/build-release-bundle.mjs --kind "${{ matrix.kind }}" --version "${{ steps.version.outputs.value }}"
+      - name: Pack the exact installer used by the E2E
+        run: corepack pnpm dist:pack:npm
+      - name: Clean-machine install E2E
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "${{ matrix.kind }}" == "offline" ]]; then
+            suffix="-offline"
+            export COREPACK_ENABLE_NETWORK=0
+            export npm_config_offline=true
+          fi
+          asset="dist/dsh-gate-runtime-${{ steps.version.outputs.value }}-$(node -p 'process.platform')-$(node -p 'process.arch')${suffix}.tar.gz"
+          digest="$(cut -d ' ' -f 1 "${asset}.sha256")"
+          installer="$(find dist/npm -name '*.tgz' -print -quit)"
+          npm_args=(exec --yes --package "$installer" -- dsh-gate)
+          if [[ "${{ matrix.kind }}" == "offline" ]]; then
+            npm_args=(exec --yes --offline --package "$installer" -- dsh-gate)
+          fi
+          npm_config_cache="$RUNNER_TEMP/npm-cache" npm "${npm_args[@]}" setup \
+              --bundle "$asset" --sha256 "$digest" \
+              --install-dir "$RUNNER_TEMP/dsh-gate-install" \
+              --codex-home "$RUNNER_TEMP/codex-home" \
+              --skills-dir "$RUNNER_TEMP/codex-skills" --no-start
+          npm_config_cache="$RUNNER_TEMP/npm-cache" npm "${npm_args[@]}" uninstall \
+              --install-dir "$RUNNER_TEMP/dsh-gate-install" \
+              --codex-home "$RUNNER_TEMP/codex-home" \
+              --skills-dir "$RUNNER_TEMP/codex-skills" --purge
+      - uses: actions/upload-artifact@v6
+        with:
+          name: runtime-${{ matrix.os }}-${{ matrix.kind }}
+          path: |
+            dist/dsh-gate-runtime-*.tar.gz
+            dist/dsh-gate-runtime-*.tar.gz.sha256
+          retention-days: 5
+
+  npm-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: corepack enable
+      - run: corepack pnpm install --frozen-lockfile
+      - run: corepack pnpm --filter @yidapan666-creator/dsh-gate pack --pack-destination dist/npm
+      - name: Checksum npm installer tarball
+        shell: bash
+        run: |
+          installer="$(find dist/npm -name '*.tgz' -print -quit)"
+          digest="$(sha256sum "$installer" | cut -d ' ' -f 1)"
+          printf '%s  %s\n' "$digest" "$(basename "$installer")" > "${installer}.sha256"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: npm-package
+          path: |
+            dist/npm/*.tgz
+            dist/npm/*.tgz.sha256
+          retention-days: 5
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, npm-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist/artifacts
+          merge-multiple: true
+      - name: Create GitHub Release and upload immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" dist/artifacts/*.tar.gz dist/artifacts/*.tgz dist/artifacts/*.sha256 --repo "${GITHUB_REPOSITORY}"
+      - name: Publish npm installer with provenance
+        if: vars.NPM_PUBLISH_ENABLED == 'true'
+        run: npm publish dist/artifacts/*.tgz --access public --provenance
