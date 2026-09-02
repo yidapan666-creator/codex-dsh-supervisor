@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { spawnSync } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const BUNDLE_SCHEMA_VERSION = 1
 export const MANAGED_BEGIN = '# BEGIN dsh-gate managed block'
@@ -351,6 +351,15 @@ function invokeHost(runtimeDir, stateDir, hostUrl, action) {
   run(process.execPath, [join(runtimeDir, 'scripts', 'dsh-gate.mjs'), 'host', action, ...runtimeCommon(stateDir), '--host', hostUrl])
 }
 
+function smokeRuntime(runtimeDir, stateDir) {
+  run(process.execPath, [join(stateDir, 'dsh', 'apps', 'cli', 'lib', 'bin.js'), '--version'], {
+    capture: true,
+    env: { ...process.env, DSH_HOME: join(stateDir, 'dsh-home') },
+  })
+  const mcpEntry = pathToFileURL(join(runtimeDir, 'packages', 'mcp-server', 'dist', 'index.js')).href
+  run(process.execPath, ['--input-type=module', '--eval', `await import(${JSON.stringify(mcpEntry)})`], { capture: true })
+}
+
 async function restoreCodexConfig(path, source) {
   if (source === undefined) await rm(path, { force: true })
   else await atomicWrite(path, source)
@@ -482,6 +491,7 @@ async function prepareRuntime(command, options) {
     await writeSeed({ stateDir: paths.stateDir, runtimeDir, manifest })
     const common = runtimeCommon(paths.stateDir)
     if (manifest.kind === 'online') run(process.execPath, [join(runtimeDir, 'scripts', 'dsh-gate.mjs'), 'bootstrap', ...common])
+    smokeRuntime(runtimeDir, paths.stateDir)
     run(process.execPath, [join(runtimeDir, 'scripts', 'dsh-gate.mjs'), 'doctor', ...common])
     if (options.start) {
       startedNewHost = true

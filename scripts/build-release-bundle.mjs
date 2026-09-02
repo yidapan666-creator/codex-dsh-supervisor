@@ -73,7 +73,7 @@ async function copyDshBuildOutputs(source, destination) {
       }
     }
   }
-  for (const buildRoot of ['apps', 'packages', 'native']) await visit(buildRoot)
+  for (const buildRoot of ['apps', 'packages', 'native', 'vendor']) await visit(buildRoot)
   await cp(join(source, 'apps', 'web', 'dist'), join(destination, 'apps', 'web', 'dist'), { recursive: true, dereference: false, verbatimSymlinks: true })
 }
 
@@ -91,7 +91,7 @@ async function copyDshDependencies(source, destination) {
     }
   }
   await cp(join(source, 'node_modules'), join(destination, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true })
-  for (const dependencyRoot of ['apps', 'packages', 'native', 'examples']) await visit(dependencyRoot)
+  for (const dependencyRoot of ['apps', 'packages', 'native', 'examples', 'python', 'vendor', 'website']) await visit(dependencyRoot)
 }
 
 async function copyDshPayload(source, destination, kind) {
