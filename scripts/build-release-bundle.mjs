@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { arch, platform, tmpdir } from 'node:os'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { DSH_FORK_URL, DSH_PINNED_COMMIT } from './dsh-gate-lib.mjs'
@@ -60,21 +60,47 @@ async function copyWorkspaceDependencies(destination) {
   }
 }
 
+async function copyDshBuildOutputs(source, destination) {
+  const visit = async relativeDirectory => {
+    const directory = join(source, relativeDirectory)
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory() || ['.git', '.sessions', '.dsh-build', 'node_modules'].includes(entry.name)) continue
+      const relativePath = join(relativeDirectory, entry.name)
+      if (entry.name === 'lib') {
+        await cp(join(source, relativePath), join(destination, relativePath), { recursive: true, dereference: false, verbatimSymlinks: true })
+      } else {
+        await visit(relativePath)
+      }
+    }
+  }
+  for (const buildRoot of ['apps', 'packages', 'native']) await visit(buildRoot)
+  await cp(join(source, 'apps', 'web', 'dist'), join(destination, 'apps', 'web', 'dist'), { recursive: true, dereference: false, verbatimSymlinks: true })
+}
+
+async function copyDshDependencies(source, destination) {
+  const visit = async relativeDirectory => {
+    const directory = join(source, relativeDirectory)
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory() || ['.git', '.sessions', '.dsh-build'].includes(entry.name)) continue
+      const relativePath = join(relativeDirectory, entry.name)
+      if (entry.name === 'node_modules') {
+        await cp(join(source, relativePath), join(destination, relativePath), { recursive: true, dereference: false, verbatimSymlinks: true })
+      } else {
+        await visit(relativePath)
+      }
+    }
+  }
+  await cp(join(source, 'node_modules'), join(destination, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true })
+  for (const dependencyRoot of ['apps', 'packages', 'native', 'examples']) await visit(dependencyRoot)
+}
+
 async function copyDshPayload(source, destination, kind) {
   capture('git', ['clone', '--no-hardlinks', '--no-checkout', source, destination])
   capture('git', ['checkout', '--detach', DSH_PINNED_COMMIT], destination)
   capture('git', ['remote', 'set-url', 'origin', DSH_FORK_URL], destination)
-  for (const entry of await readdir(source, { withFileTypes: true })) {
-    if (entry.name === '.git') continue
-    const from = join(source, entry.name)
-    const to = join(destination, entry.name)
-    await cp(from, to, {
-      recursive: true,
-      dereference: false,
-      verbatimSymlinks: true,
-      filter: candidate => kind === 'offline' || !relative(source, candidate).split(sep).includes('node_modules'),
-    })
-  }
+  await rm(join(destination, '.git', 'logs'), { recursive: true, force: true })
+  await copyDshBuildOutputs(source, destination)
+  if (kind === 'offline') await copyDshDependencies(source, destination)
   if (capture('git', ['status', '--porcelain'], destination) !== '') throw new Error('sanitized DSH payload is not clean')
 }
 
