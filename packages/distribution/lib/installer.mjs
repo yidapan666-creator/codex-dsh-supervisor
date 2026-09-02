@@ -285,7 +285,7 @@ async function writeSeed({ stateDir, runtimeDir, manifest }) {
 async function materializeProfileTemplate(payload, stateDir, runtimeDir) {
   const source = join(payload, 'profile')
   const dshHome = join(stateDir, 'dsh-home')
-  if (!(await exists(dshHome))) await cp(source, dshHome, { recursive: true, dereference: false })
+  if (!(await exists(dshHome))) await cp(source, dshHome, { recursive: true, dereference: false, verbatimSymlinks: true })
   const profile = join(dshHome, 'profiles', 'web')
   const manifestPath = join(profile, 'package.json')
   const profileManifest = JSON.parse(await readFile(manifestPath, 'utf8'))
@@ -404,14 +404,14 @@ async function prepareRuntime(command, options) {
     previousOwned = isOwnedInstallation(previous, paths)
     previousConfig = await readFile(configPath, 'utf8').catch(error => error?.code === 'ENOENT' ? undefined : Promise.reject(error))
     hadSkill = await exists(skillPath)
-    if (hadSkill) await cp(skillPath, skillBackup, { recursive: true, dereference: false })
+    if (hadSkill) await cp(skillPath, skillBackup, { recursive: true, dereference: false, verbatimSymlinks: true })
     hadDshHome = await exists(dshHome)
     hadProfileManifest = await exists(profileManifestPath)
     hadProfileLink = await exists(profileLinkPath)
     hadWorkerSkill = await exists(workerSkillPath)
     hadHostToken = await exists(join(paths.stateDir, 'host', 'auth.token'))
     if (hadProfileManifest) await cp(profileManifestPath, profileManifestBackup, { dereference: false })
-    if (hadProfileLink) await cp(profileLinkPath, profileLinkBackup, { recursive: true, dereference: false })
+    if (hadProfileLink) await cp(profileLinkPath, profileLinkBackup, { recursive: true, dereference: false, verbatimSymlinks: true })
     if (hadWorkerSkill) await cp(workerSkillPath, workerSkillBackup, { dereference: false })
     previousInstallMarker = await readFile(installMarkerPath, 'utf8').catch(error => error?.code === 'ENOENT' ? undefined : Promise.reject(error))
 
@@ -515,7 +515,7 @@ async function prepareRuntime(command, options) {
       if (touchedCurrent) await restoreCodexConfig(currentPath, previousCurrent)
       if (touchedSkill) {
         await rm(skillPath, { recursive: true, force: true })
-        if (hadSkill) await cp(skillBackup, skillPath, { recursive: true, dereference: false })
+        if (hadSkill) await cp(skillBackup, skillPath, { recursive: true, dereference: false, verbatimSymlinks: true })
       }
       if (installedDsh) {
         await rm(join(paths.stateDir, 'dsh'), { recursive: true, force: true })
@@ -531,7 +531,7 @@ async function prepareRuntime(command, options) {
         await rm(profileLinkPath, { recursive: true, force: true })
         if (hadProfileLink) {
           await mkdir(dirname(profileLinkPath), { recursive: true })
-          await cp(profileLinkBackup, profileLinkPath, { recursive: true, dereference: false })
+          await cp(profileLinkBackup, profileLinkPath, { recursive: true, dereference: false, verbatimSymlinks: true })
         }
         if (hadWorkerSkill) await cp(workerSkillBackup, workerSkillPath, { force: true })
         else await rm(workerSkillPath, { force: true })

@@ -39,7 +39,7 @@ async function copyTrackedRuntime(destination) {
   for (const file of files) {
     const target = join(destination, file)
     await mkdir(dirname(target), { recursive: true })
-    await cp(join(root, file), target, { recursive: true, dereference: false })
+    await cp(join(root, file), target, { recursive: true, dereference: false, verbatimSymlinks: true })
   }
   const packages = await readdir(join(root, 'packages'), { withFileTypes: true })
   for (const entry of packages) {
@@ -50,12 +50,12 @@ async function copyTrackedRuntime(destination) {
 }
 
 async function copyWorkspaceDependencies(destination) {
-  await cp(join(root, 'node_modules'), join(destination, 'node_modules'), { recursive: true, dereference: false })
+  await cp(join(root, 'node_modules'), join(destination, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true })
   for (const entry of await readdir(join(root, 'packages'), { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const source = join(root, 'packages', entry.name, 'node_modules')
     if (await exists(source)) {
-      await cp(source, join(destination, 'packages', entry.name, 'node_modules'), { recursive: true, dereference: false })
+      await cp(source, join(destination, 'packages', entry.name, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true })
     }
   }
 }
@@ -71,6 +71,7 @@ async function copyDshPayload(source, destination, kind) {
     await cp(from, to, {
       recursive: true,
       dereference: false,
+      verbatimSymlinks: true,
       filter: candidate => kind === 'offline' || !relative(source, candidate).split(sep).includes('node_modules'),
     })
   }
@@ -126,7 +127,7 @@ async function main() {
       if (!(await exists(source))) throw new Error(`missing sanitized profile input ${source}`)
       const target = join(profileTarget, file)
       await mkdir(dirname(target), { recursive: true })
-      await cp(source, target, { dereference: false })
+      await cp(source, target, { dereference: false, verbatimSymlinks: true })
     }
     const manifest = {
       schemaVersion: 1,
