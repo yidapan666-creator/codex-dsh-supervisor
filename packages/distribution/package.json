@@ -1,6 +1,6 @@
 {
   "name": "@yidapan666-creator/dsh-gate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Installer and lifecycle CLI for the dsh-gate Codex supervision bridge",
   "license": "MIT",
   "type": "module",

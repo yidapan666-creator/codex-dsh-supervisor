@@ -104,6 +104,51 @@ async function copyDshPayload(source, destination, kind) {
   if (capture('git', ['status', '--porcelain'], destination) !== '') throw new Error('sanitized DSH payload is not clean')
 }
 
+export async function writeSanitizedProfile(destination) {
+  const profile = join(destination, 'profiles', 'web')
+  await mkdir(profile, { recursive: true })
+  await writeFile(join(profile, 'cordis.yml'), [
+    '# dsh profile root — an empty entry list. The tree is composed as patches:',
+    "# each bundle in package.json's dsh.profile.bundles, then cordis.patch.yml, then any",
+    '# --patch overlays. Edit cordis.patch.yml, not this file.',
+    '[]',
+    '',
+  ].join('\n'))
+  await writeFile(join(profile, 'cordis.patch.yml'), [
+    '# Your patch layer for this dsh profile, applied after every bundle layer:',
+    '# a top-level YAML array of loader patch entries (id-targeted config',
+    '# overrides, disables, and insert lists; `!!js` expressions allowed).',
+    '[]',
+    '',
+  ].join('\n'))
+  await writeFile(join(profile, 'package.json'), `${JSON.stringify({
+    name: 'dsh-profile-web',
+    private: true,
+    dependencies: {},
+    dsh: {
+      profile: {
+        bundles: [
+          '@deepseek-ai/dsh-base',
+          '@deepseek-ai/dsh-web-app',
+          '@dsh-gate/supervisor-tools',
+        ],
+      },
+    },
+  }, null, 2)}\n`)
+  await writeFile(join(profile, 'pnpm-workspace.yaml'), [
+    'packages:',
+    '  - .',
+    '',
+    'nodeLinker: hoisted',
+    'autoInstallPeers: false',
+    '',
+  ].join('\n'))
+
+  const workerTarget = join(destination, 'skills', 'dsh-supervised-worker', 'SKILL.md')
+  await mkdir(dirname(workerTarget), { recursive: true })
+  await cp(join(root, 'skills', 'dsh-supervised-worker', 'SKILL.md'), workerTarget)
+}
+
 async function sha256(path) {
   const hash = createHash('sha256')
   for await (const chunk of createReadStream(path)) hash.update(chunk)
@@ -139,22 +184,8 @@ async function main() {
       await rm(join(runtime, 'packages', 'mcp-server', 'node_modules', '@deepseek-ai', 'dsh-client-connection'), { recursive: true, force: true })
     }
     await copyDshPayload(dshRepo, bundledDsh, options.kind)
-    const profileSource = join(root, '.dsh-state', 'dsh-home')
     const profileTarget = join(payload, 'profile')
-    for (const file of [
-      'profiles/web/cordis.patch.yml',
-      'profiles/web/cordis.yml',
-      'profiles/web/package.json',
-      'profiles/web/pnpm-lock.yaml',
-      'profiles/web/pnpm-workspace.yaml',
-      'skills/dsh-supervised-worker/SKILL.md',
-    ]) {
-      const source = join(profileSource, file)
-      if (!(await exists(source))) throw new Error(`missing sanitized profile input ${source}`)
-      const target = join(profileTarget, file)
-      await mkdir(dirname(target), { recursive: true })
-      await cp(source, target, { dereference: false, verbatimSymlinks: true })
-    }
+    await writeSanitizedProfile(profileTarget)
     const manifest = {
       schemaVersion: 1,
       product: 'dsh-gate',
@@ -181,7 +212,9 @@ async function main() {
   }
 }
 
-main().catch(error => {
-  process.stderr.write(`[dsh-gate] release bundle failed: ${error instanceof Error ? error.message : String(error)}\n`)
-  process.exitCode = 1
-})
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    process.stderr.write(`[dsh-gate] release bundle failed: ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+  })
+}

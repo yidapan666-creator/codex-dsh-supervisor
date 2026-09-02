@@ -17,8 +17,8 @@ scope；安装后的命令仍然叫 `dsh-gate`。
 
 ```sh
 npm exec --offline --yes \
-  --package ./yidapan666-creator-dsh-gate-0.1.0.tgz -- \
-  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.0-darwin-arm64-offline.tar.gz
+  --package ./yidapan666-creator-dsh-gate-0.1.1.tgz -- \
+  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.1-darwin-arm64-offline.tar.gz
 ```
 
 离线时需要同时下载 installer `.tgz`、对应平台 runtime
