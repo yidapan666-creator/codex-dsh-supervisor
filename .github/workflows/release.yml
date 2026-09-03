@@ -90,7 +90,7 @@ jobs:
           package-manager-cache: false
       - run: corepack enable
       - run: corepack pnpm install --frozen-lockfile
-      - run: corepack pnpm --filter @yidapan666-creator/dsh-gate pack --pack-destination dist/npm
+      - run: corepack pnpm --filter @yidapan666/dsh-gate pack --pack-destination dist/npm
       - name: Checksum npm installer tarball
         shell: bash
         run: |

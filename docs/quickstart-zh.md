@@ -5,7 +5,7 @@
 普通用户推荐一键安装：
 
 ```sh
-npx @yidapan666-creator/dsh-gate setup
+npx @yidapan666/dsh-gate setup
 ```
 
 它会下载与当前系统匹配、带 SHA-256 校验的 GitHub Release，安装 Codex
@@ -17,14 +17,14 @@ scope；安装后的命令仍然叫 `dsh-gate`。
 
 ```sh
 npm exec --offline --yes \
-  --package ./yidapan666-creator-dsh-gate-0.1.1.tgz -- \
-  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.1-darwin-arm64-offline.tar.gz
+  --package ./yidapan666-dsh-gate-0.1.2.tgz -- \
+  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.2-darwin-arm64-offline.tar.gz
 ```
 
 离线时需要同时下载 installer `.tgz`、对应平台 runtime
 `*-offline.tar.gz` 以及两个 `.sha256`；命令只从本地 `.tgz` 启动安装器，
 不会访问 npm registry。也可以先全局安装 CLI。生命周期命令若没有全局
-CLI，就继续使用 `npx @yidapan666-creator/dsh-gate upgrade|uninstall`。
+CLI，就继续使用 `npx @yidapan666/dsh-gate upgrade|uninstall`。
 
 开发者仍可使用源码部署：`pnpm bootstrap`、`pnpm host:start`、
 `pnpm run doctor --live`。升级执行安装器的 `upgrade`；卸载默认保留 session

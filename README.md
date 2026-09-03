@@ -17,15 +17,15 @@ Normal users can install the matching checksummed GitHub Release, configure
 Codex, install the skill, start the independent Host, and run live doctor with:
 
 ```sh
-npx @yidapan666-creator/dsh-gate setup
+npx @yidapan666/dsh-gate setup
 ```
 
 For an offline or reviewed-artifact installation:
 
 ```sh
 npm exec --offline --yes \
-  --package ./yidapan666-creator-dsh-gate-0.1.1.tgz -- \
-  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.1-darwin-arm64-offline.tar.gz
+  --package ./yidapan666-dsh-gate-0.1.2.tgz -- \
+  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.2-darwin-arm64-offline.tar.gz
 ```
 
 See [distribution and lifecycle options](docs/distribution.md) for `upgrade`,
@@ -113,7 +113,7 @@ At a durable run terminal state, the gateway writes one atomic JSON record under
 ## Release status
 
 The runtime workspace packages remain private implementation details; only the
-thin `@yidapan666-creator/dsh-gate` installer is publishable. It downloads
+thin `@yidapan666/dsh-gate` installer is publishable. It downloads
 immutable GitHub Release bundles carrying the exact public-fork seam, so users
 do not depend on an unpublished upstream network-client package. npm
 publication uses trusted provenance when the repository owner enables

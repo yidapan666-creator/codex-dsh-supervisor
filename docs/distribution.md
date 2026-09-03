@@ -5,22 +5,23 @@ doctor, Host lifecycle, supervisor plugin, and exact DSH commit.
 
 | Path | Command | Network during setup | Intended user |
 | --- | --- | --- | --- |
-| Release installer | `npx @yidapan666-creator/dsh-gate setup` | npm + GitHub Release | Normal users |
+| Release installer | `npx @yidapan666/dsh-gate setup` | npm + GitHub Release | Normal users |
 | Offline kit | local installer `.tgz` + runtime bundle + checksums | None | Air-gapped or reviewed installs |
 | Source checkout | `pnpm bootstrap` | GitHub + npm | Contributors and auditors |
 
 The unrelated unscoped npm name `dsh-gate` is already owned by another
-publisher. The official package is therefore `@yidapan666-creator/dsh-gate`;
+publisher. The official package is therefore `@yidapan666/dsh-gate`, matching
+the npm account that owns the package;
 its installed executable is still `dsh-gate`.
 
 ## Release installer
 
 ```sh
-npx @yidapan666-creator/dsh-gate setup
+npx @yidapan666/dsh-gate setup
 ```
 
 You may instead install the command once with
-`npm install --global @yidapan666-creator/dsh-gate`; lifecycle examples below
+`npm install --global @yidapan666/dsh-gate`; lifecycle examples below
 use `npx` so a global install is never required.
 
 Defaults:
@@ -52,7 +53,7 @@ dsh-gate setup --dry-run
 
 Transfer these three release assets together:
 
-- `yidapan666-creator-dsh-gate-0.1.1.tgz` (the dependency-free installer);
+- `yidapan666-dsh-gate-0.1.2.tgz` (the dependency-free installer);
 - the matching platform-specific `*-offline.tar.gz` runtime;
 - both adjacent `.sha256` files.
 
@@ -61,9 +62,9 @@ This command enables npm's offline mode and never contacts the registry:
 
 ```sh
 npm exec --offline --yes \
-  --package ./yidapan666-creator-dsh-gate-0.1.1.tgz -- \
+  --package ./yidapan666-dsh-gate-0.1.2.tgz -- \
   dsh-gate setup \
-  --bundle ./dsh-gate-runtime-0.1.1-linux-x64-offline.tar.gz
+  --bundle ./dsh-gate-runtime-0.1.2-linux-x64-offline.tar.gz
 ```
 
 Offline bundles include built DSH artifacts and the platform dependency tree.
@@ -74,10 +75,10 @@ history, or storage records.
 ## Upgrade and uninstall
 
 ```sh
-npx @yidapan666-creator/dsh-gate upgrade
-npx @yidapan666-creator/dsh-gate upgrade --bundle FILE --sha256 HEX
-npx @yidapan666-creator/dsh-gate uninstall
-npx @yidapan666-creator/dsh-gate uninstall --purge
+npx @yidapan666/dsh-gate upgrade
+npx @yidapan666/dsh-gate upgrade --bundle FILE --sha256 HEX
+npx @yidapan666/dsh-gate uninstall
+npx @yidapan666/dsh-gate uninstall --purge
 ```
 
 Runtime versions are staged while `state/` remains stable, so sessions,
