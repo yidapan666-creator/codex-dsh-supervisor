@@ -1,4 +1,8 @@
-# dsh-gate 中文快速上手
+# Codex DSH Supervisor 中文快速上手
+
+公开产品和 GitHub 仓库名称是 **Codex DSH Supervisor**。已经发布的 npm 包、
+CLI 命令、MCP/插件包名、协议端点和状态目录继续使用 `dsh-gate`，以保证现有
+安装与会话不被改名破坏。
 
 ## 三种部署方式
 
@@ -35,14 +39,14 @@ CLI，就继续使用 `npx @yidapan666/dsh-gate upgrade|uninstall`。
 
 ## 你有哪两个选项
 
-DSH 原生有四种 preset，但 dsh-gate 的严格监督链路只开放两种：
+DSH 原生有四种 preset，但 Codex DSH Supervisor 的严格监督链路只开放两种：
 
 | 用户名称 | MCP 参数 | 适合什么任务 | 建议 |
 | --- | --- | --- | --- |
 | Standard | `standard` | 普通编码、修 bug、交互式调试、代码 Review | 默认选择 |
 | PTC | `code` | 大范围仓库探索、许多独立读取/搜索、适合批处理的工具序列 | 明确需要时使用 |
 
-Minimal 没有经过严格只读边界认证；Creator 拥有修改 DSH runtime 和 preset 的能力。因此，dsh-gate 会拒绝这两种模式和未经认证的自定义 preset。
+Minimal 没有经过严格只读边界认证；Creator 拥有修改 DSH runtime 和 preset 的能力。因此，监督器会拒绝这两种模式和未经认证的自定义 preset。
 
 模式属于 DSH session（Root），创建后固定。后续在同一个 Root 继续任务，会保持原模式；若确实需要换模式，应创建另一个 Root。
 

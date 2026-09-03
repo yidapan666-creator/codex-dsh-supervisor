@@ -1,11 +1,11 @@
 {
-  "name": "dsh-gate-workspace",
+  "name": "codex-dsh-supervisor-workspace",
   "private": true,
-  "description": "A thin, durable Codex supervisor bridge for DeepSeek Harness",
+  "description": "Codex DSH Supervisor — a durable supervision bridge for DeepSeek Harness",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git"
+    "url": "git+https://github.com/yidapan666-creator/codex-dsh-supervisor.git"
   },
   "type": "module",
   "packageManager": "pnpm@11.19.0",

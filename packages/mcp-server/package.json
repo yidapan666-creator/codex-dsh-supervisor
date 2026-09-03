@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git",
+    "url": "git+https://github.com/yidapan666-creator/codex-dsh-supervisor.git",
     "directory": "packages/mcp-server"
   },
   "type": "module",

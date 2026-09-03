@@ -1,7 +1,9 @@
 # Distribution and installation
 
-dsh-gate supports three acquisition paths. All converge on the same bootstrap,
-doctor, Host lifecycle, supervisor plugin, and exact DSH commit.
+Codex DSH Supervisor supports three acquisition paths. The published package
+and installed command retain their `dsh-gate` names for compatibility. All
+paths converge on the same bootstrap, doctor, Host lifecycle, supervisor plugin,
+and exact DSH commit.
 
 | Path | Command | Network during setup | Intended user |
 | --- | --- | --- | --- |

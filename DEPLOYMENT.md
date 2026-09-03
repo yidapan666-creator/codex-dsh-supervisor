@@ -1,9 +1,12 @@
-# Deploying dsh-gate
+# Deploying Codex DSH Supervisor
 
-This guide is the single source of truth for turning a fresh `dsh-gate` checkout
+This guide is the single source of truth for turning a fresh Codex DSH Supervisor checkout
 into a running deployment: one deterministic bootstrap, one doctor, and one
 explicit Host start. It is written for both human operators and AI operators —
 every command below is copy-pasteable and none of them improvise source edits.
+
+The installed package, CLI, MCP/plugin identifiers, endpoints, and state paths
+continue to use `dsh-gate` for backward compatibility.
 
 End users should normally follow [`docs/distribution.md`](docs/distribution.md)
 for the Release installer, offline bundle, upgrade, and uninstall flows. This
@@ -13,7 +16,7 @@ document remains the source-checkout contract reused by the release builder.
 
 ```
 ┌────────────────────────────┐      HTTP/WS        ┌──────────────────────────────┐
-│ dsh-gate MCP server        │ ──────────────────► │ DSH Web Host (independent)  │
+│ Supervisor MCP server      │ ──────────────────► │ DSH Web Host (independent)  │
 │ (Codex side, stdio)        │  /api/* + events    │ node <checkout>/apps/cli/... │
 └────────────────────────────┘                     └──────────────────────────────┘
         ▲                                                      │ owns

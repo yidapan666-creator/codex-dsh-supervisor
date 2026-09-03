@@ -2,11 +2,11 @@
   "name": "@dsh-gate/supervisor-tools",
   "version": "0.1.0",
   "private": true,
-  "description": "DSH-side handoff, artifact, and bounded recovery tools for dsh-gate",
+  "description": "DSH-side handoff, artifact, and bounded recovery tools for Codex DSH Supervisor",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git",
+    "url": "git+https://github.com/yidapan666-creator/codex-dsh-supervisor.git",
     "directory": "packages/dsh-supervisor-tools"
   },
   "type": "module",

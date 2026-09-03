@@ -1,7 +1,7 @@
 {
   "name": "@yidapan666/dsh-gate",
   "version": "0.1.2",
-  "description": "Installer and lifecycle CLI for the dsh-gate Codex supervision bridge",
+  "description": "Installer and lifecycle CLI for Codex DSH Supervisor",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -21,7 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yidapan666-creator/dsh-gate.git",
+    "url": "git+https://github.com/yidapan666-creator/codex-dsh-supervisor.git",
     "directory": "packages/distribution"
   },
   "scripts": {

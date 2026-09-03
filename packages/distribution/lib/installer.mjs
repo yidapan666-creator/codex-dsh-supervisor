@@ -13,7 +13,7 @@ export const MANAGED_BEGIN = '# BEGIN dsh-gate managed block'
 export const MANAGED_END = '# END dsh-gate managed block'
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_VERSION = JSON.parse(await readFile(join(PACKAGE_ROOT, 'package.json'), 'utf8')).version
-const RELEASE_BASE = 'https://github.com/yidapan666-creator/dsh-gate/releases/download'
+const RELEASE_BASE = 'https://github.com/yidapan666-creator/codex-dsh-supervisor/releases/download'
 
 export function usageText() {
   return [

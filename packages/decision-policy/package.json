@@ -2,7 +2,7 @@
   "name": "@dsh-gate/decision-policy",
   "version": "0.1.0",
   "private": true,
-  "description": "Explainable supervision decision policy for dsh-gate",
+  "description": "Explainable supervision decision policy for Codex DSH Supervisor",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",

@@ -1,6 +1,9 @@
 # @yidapan666/dsh-gate
 
-Product installer for [dsh-gate](https://github.com/yidapan666-creator/dsh-gate).
+Compatibility package and lifecycle CLI for [Codex DSH Supervisor](https://github.com/yidapan666-creator/codex-dsh-supervisor).
+
+The npm package and installed `dsh-gate` command keep their existing names so
+current installations and automation continue to work.
 
 ```sh
 npx @yidapan666/dsh-gate setup

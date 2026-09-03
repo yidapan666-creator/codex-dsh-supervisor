@@ -1,11 +1,15 @@
-# dsh-gate
+# Codex DSH Supervisor
 
-`dsh-gate` lets Codex supervise long-running DeepSeek Harness sessions through MCP while keeping the DSH Host and sessions independent of the MCP process.
+**Codex DSH Supervisor** lets Codex supervise long-running DeepSeek Harness sessions through MCP while keeping the DSH Host and sessions independent of the MCP process.
+
+The published npm package, CLI command, MCP/plugin package names, wire endpoints,
+and state directories retain their existing `dsh-gate` identifiers for backward
+compatibility. The product and repository name are **Codex DSH Supervisor**.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-gate-workflow-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/dsh-gate-workflow-light.svg">
-  <img alt="dsh-gate workflow: Codex supervises a durable DSH Root through the gateway, receives five-minute progress observations, and reconnects to the same Host and session after a restart." src="docs/assets/dsh-gate-workflow-light.svg">
+  <img alt="Codex DSH Supervisor workflow: Codex supervises a durable DSH Root through the gateway, receives five-minute progress observations, and reconnects to the same Host and session after a restart." src="docs/assets/dsh-gate-workflow-light.svg">
 </picture>
 
 The workspace contains:
@@ -61,7 +65,7 @@ Then copy `config/codex-mcp.example.toml` into the matching Codex config and rep
 
 ## Use it from Codex
 
-You normally invoke dsh-gate in natural language rather than calling its MCP tools yourself. For example:
+You normally invoke Codex DSH Supervisor in natural language rather than calling its MCP tools yourself. For example:
 
 > Use DSH in `/absolute/path/to/project` to fix the failing authentication tests. Use Standard mode, allow at most 3 direct child agents, enforce a 60000-token task budget, open DSH Web, and report aggregated progress every five minutes.
 

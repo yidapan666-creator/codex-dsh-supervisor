@@ -1,6 +1,6 @@
-# Contributing to dsh-gate
+# Contributing to Codex DSH Supervisor
 
-`dsh-gate` is an experimental workspace: a small MCP translation surface over DeepSeek Harness (DSH) plus a DSH-side plugin for durable supervisor handoffs. Before contributing, read the README (including the release-status blockers) and `docs/protocol.md`; the protocol contract is the compatibility boundary that must not drift.
+Codex DSH Supervisor is an experimental workspace: a small MCP translation surface over DeepSeek Harness (DSH) plus a DSH-side plugin for durable supervisor handoffs. Its existing `dsh-gate` package, command, protocol, and state identifiers are compatibility surfaces and must not be renamed casually. Before contributing, read the README and `docs/protocol.md`; the protocol contract is the compatibility boundary that must not drift.
 
 ## Development setup
 

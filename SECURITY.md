@@ -1,6 +1,6 @@
 # Security
 
-`dsh-gate` is experimental, unreleased code that lets a supervisor drive DeepSeek Harness sessions over MCP. Treat it accordingly: do not run it against untrusted tasks or untrusted Hosts without review.
+Codex DSH Supervisor is experimental software that lets a supervisor drive DeepSeek Harness sessions over MCP. Treat it accordingly: do not run it against untrusted tasks or untrusted Hosts without review. Existing `dsh-gate` identifiers remain compatibility surfaces.
 
 ## Security posture
 
@@ -13,4 +13,6 @@
 
 ## Reporting
 
-There is no public reporting channel yet: the repository has no public URL and no maintainer contact has been published. Until one exists, treat any suspected vulnerability as a reason not to deploy the code, and report it through whatever private channel the maintainers provide once the repository goes public.
+Use the repository's **Security** tab to report a vulnerability privately when
+private reporting is available. Otherwise, do not publish secrets or exploit
+details: open a minimal issue asking the maintainer for a private contact path.

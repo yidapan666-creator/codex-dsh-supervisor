@@ -1,6 +1,6 @@
-# dsh-gate protocol
+# Codex DSH Supervisor protocol
 
-`dsh-gate` is a stateless MCP-facing supervisor over an independently owned DSH Host. The Host owns agents, sessions, persistence, and its process lifetime. MCP owns only network connections and in-memory observations; exiting MCP calls `ConnectionController.stop()` and never signals or kills the Host.
+Codex DSH Supervisor is a stateless MCP-facing supervisor over an independently owned DSH Host. The Host owns agents, sessions, persistence, and its process lifetime. MCP owns only network connections and in-memory observations; exiting MCP calls `ConnectionController.stop()` and never signals or kills the Host. Existing `dsh-gate` wire and package identifiers remain stable compatibility surfaces.
 
 Creating a session requires an absolute target-project `cwd`. MCP resolves it
 to a real path, verifies that it exists and is a directory, and passes that

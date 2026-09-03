@@ -1,6 +1,7 @@
-# Codex MCP example configuration for dsh-gate.
+# Codex MCP example configuration for Codex DSH Supervisor.
+# The installed MCP and CLI retain their dsh-gate compatibility identifiers.
 #
-# Before using: run `pnpm bootstrap` once inside the dsh-gate checkout (see
+# Before using: run `pnpm bootstrap` once inside the project checkout (see
 # DEPLOYMENT.md). It fetches the pinned DSH fork commit, builds and links the
 # exact network client, installs the supervisor plugin into the isolated
 # project-local DSH home (`.dsh-state/`), and never starts the DSH Host.
