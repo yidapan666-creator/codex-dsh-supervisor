@@ -2,6 +2,12 @@
 
 `dsh-gate` lets Codex supervise long-running DeepSeek Harness sessions through MCP while keeping the DSH Host and sessions independent of the MCP process.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-gate-workflow-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/dsh-gate-workflow-light.svg">
+  <img alt="dsh-gate workflow: Codex supervises a durable DSH Root through the gateway, receives five-minute progress observations, and reconnects to the same Host and session after a restart." src="docs/assets/dsh-gate-workflow-light.svg">
+</picture>
+
 The workspace contains:
 
 - `@dsh-gate/mcp-server`: eleven MCP tools over DSH's public network client and reconnect controller;

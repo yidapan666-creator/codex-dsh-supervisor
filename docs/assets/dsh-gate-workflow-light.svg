@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">dsh-gate durable supervision workflow</title>
+  <desc id="desc">A user gives Codex a task. Codex compiles and supervises it through dsh-gate. An independent DSH Host owns the Root, child agents, and worktree. Progress returns to Codex every five minutes. Restarted Codex or MCP reconnects to the same Host and session.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8c959f"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0969da"/>
+    </marker>
+    <style>
+      .canvas { fill: #ffffff; }
+      .title { fill: #1f2328; font: 600 28px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .subtitle { fill: #59636e; font: 400 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #1f2328; font: 600 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { fill: #59636e; font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #59636e; font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .arrow { fill: none; stroke: #8c959f; stroke-width: 2; marker-end: url(#arrow); }
+      .arrow-dashed { fill: none; stroke: #8c959f; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+      .feedback { fill: none; stroke: #0969da; stroke-width: 2.5; marker-end: url(#arrow-blue); }
+      .user { fill: #f6f8fa; stroke: #d0d7de; }
+      .codex { fill: #ddf4ff; stroke: #54aeff; }
+      .gate { fill: #fbefff; stroke: #bf87ff; }
+      .host { fill: #dafbe1; stroke: #4ac26b; }
+      .inner { fill: #ffffff; stroke: #8c959f; }
+      .complete { fill: #dafbe1; stroke: #4ac26b; }
+      .recover { fill: #fff8c5; stroke: #d4a72c; }
+      .check { fill: #1a7f37; font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .lane { fill: #59636e; font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .08em; }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1200" height="620" rx="18"/>
+  <text class="title" x="24" y="46">dsh-gate · durable supervision loop</text>
+  <text class="subtitle" x="24" y="74">One prompt enters. One DSH Root owns execution. Codex observes, recovers, and reports.</text>
+
+  <text class="lane" x="24" y="105">PRIMARY FLOW</text>
+
+  <rect class="user" x="24" y="124" width="210" height="146" rx="14"/>
+  <text class="label" x="48" y="160">User</text>
+  <text class="body" x="48" y="191">Natural-language task</text>
+  <text class="body" x="48" y="216">Project · scope · budget</text>
+
+  <path class="arrow" d="M234 197 H286"/>
+
+  <rect class="codex" x="300" y="124" width="230" height="146" rx="14"/>
+  <text class="label" x="324" y="160">Codex · Supervisor</text>
+  <text class="body" x="324" y="191">Compile one task packet</text>
+  <text class="body" x="324" y="216">Observe · decide · report</text>
+
+  <path class="arrow" d="M530 197 H586"/>
+
+  <rect class="gate" x="600" y="124" width="230" height="146" rx="14"/>
+  <text class="label" x="624" y="160">dsh-gate · Boundary</text>
+  <text class="body" x="624" y="191">sessionId + runId</text>
+  <text class="body" x="624" y="216">Authority · budget · recovery</text>
+
+  <path class="arrow" d="M830 197 H886"/>
+
+  <rect class="host" x="900" y="124" width="276" height="146" rx="14"/>
+  <text class="label" x="924" y="158">Independent DSH Host</text>
+  <text class="body" x="924" y="183">Durable session and execution owner</text>
+  <rect class="inner" x="924" y="202" width="228" height="44" rx="8"/>
+  <text class="small" x="1038" y="229" text-anchor="middle">Root · ≤5 children · Worktree</text>
+
+  <path class="feedback" d="M1038 284 C1038 358 415 358 415 284"/>
+  <text class="small" x="726" y="337" text-anchor="middle">5-minute heartbeat · steps · tools · tokens · files · verification</text>
+
+  <rect class="complete" x="600" y="382" width="576" height="78" rx="14"/>
+  <text class="label" x="624" y="414">COMPLETED only when all three are true</text>
+  <text class="check" x="624" y="442">✓ valid supervisor handoff</text>
+  <text class="check" x="820" y="442">✓ matching turn end</text>
+  <text class="check" x="986" y="442">✓ all children settled</text>
+
+  <text class="lane" x="24" y="492">RECONNECT PATH</text>
+
+  <rect class="recover" x="24" y="508" width="222" height="70" rx="12"/>
+  <text class="label" x="46" y="536">Codex / MCP restarts</text>
+  <text class="body" x="46" y="558">DSH keeps running</text>
+
+  <path class="arrow-dashed" d="M246 543 H304"/>
+
+  <rect class="gate" x="318" y="508" width="270" height="70" rx="12"/>
+  <text class="label" x="340" y="536">Reconnect, do not replay</text>
+  <text class="body" x="340" y="558">Recover sessionId + runId</text>
+
+  <path class="arrow-dashed" d="M588 543 H646"/>
+
+  <rect class="host" x="660" y="508" width="516" height="70" rx="12"/>
+  <text class="label" x="682" y="536">Same Host · same session · same Root</text>
+  <text class="body" x="682" y="558">Resume from observation cursor; preserve uncertain-effect evidence</text>
+
+  <text class="subtitle" x="24" y="606">DSH owns execution. Codex owns supervision. dsh-gate enforces the contract between them.</text>
+</svg>
