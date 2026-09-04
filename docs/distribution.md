@@ -75,7 +75,7 @@ dsh-gate setup --dry-run
 
 Transfer these three release assets together:
 
-- `yidapan666-dsh-gate-0.1.2.tgz` (the dependency-free installer);
+- `yidapan666-dsh-gate-0.1.3.tgz` (the dependency-free installer);
 - the matching platform-specific `*-offline.tar.gz` runtime;
 - both adjacent `.sha256` files.
 
@@ -84,9 +84,9 @@ This command enables npm's offline mode and never contacts the registry:
 
 ```sh
 npm exec --offline --yes \
-  --package ./yidapan666-dsh-gate-0.1.2.tgz -- \
+  --package ./yidapan666-dsh-gate-0.1.3.tgz -- \
   dsh-gate setup \
-  --bundle ./dsh-gate-runtime-0.1.2-linux-x64-offline.tar.gz
+  --bundle ./dsh-gate-runtime-0.1.3-linux-x64-offline.tar.gz
 ```
 
 Offline bundles include built DSH artifacts and the platform dependency tree.

@@ -48,8 +48,8 @@ For an offline or reviewed-artifact installation:
 
 ```sh
 npm exec --offline --yes \
-  --package ./yidapan666-dsh-gate-0.1.2.tgz -- \
-  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.2-darwin-arm64-offline.tar.gz
+  --package ./yidapan666-dsh-gate-0.1.3.tgz -- \
+  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.3-darwin-arm64-offline.tar.gz
 ```
 
 See [distribution and lifecycle options](docs/distribution.md) for `upgrade`,
