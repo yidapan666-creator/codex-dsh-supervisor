@@ -121,5 +121,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
           gh release upload "${GITHUB_REF_NAME}" dist/artifacts/*.tar.gz dist/artifacts/*.tgz dist/artifacts/*.sha256 --repo "${GITHUB_REPOSITORY}"
       - name: Publish npm installer with provenance
-        if: vars.NPM_PUBLISH_ENABLED == 'true'
         run: npm publish dist/artifacts/*.tgz --access public --provenance

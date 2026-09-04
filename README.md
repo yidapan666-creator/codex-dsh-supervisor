@@ -140,8 +140,9 @@ The runtime workspace packages remain private implementation details; only the
 thin `@yidapan666/dsh-gate` installer is publishable. It downloads
 immutable GitHub Release bundles carrying the exact public-fork seam, so users
 do not depend on an unpublished upstream network-client package. npm
-publication uses trusted provenance when the repository owner enables
-`NPM_PUBLISH_ENABLED` and configures this workflow as the trusted publisher.
+publication uses the package's OIDC Trusted Publisher binding for this exact
+repository and `release.yml`. The workflow publishes only after every release
+build and clean-install E2E passes, and only for a pushed `v*` tag.
 
 The public fork pin at `68dd149a1834496ced7308de5a7084328855f13e`
 makes both source and Release deployments reproducible; it is not claimed as an

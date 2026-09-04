@@ -127,5 +127,6 @@ pnpm dist:pack:npm
 runs isolated install/uninstall E2E against both acquisition modes through the
 packed npm CLI. The offline lane disables npm/Corepack network access. A `v*`
 tag uploads immutable runtimes, the installer tarball, and all checksums. npm
-publishing remains disabled unless `NPM_PUBLISH_ENABLED` is `true` and npm
-trusts this exact GitHub workflow; publication then includes npm provenance.
+publishing then uses the package's OIDC Trusted Publisher binding for this exact
+repository and `release.yml`; no long-lived npm token is stored in GitHub, and
+publication includes npm provenance.
