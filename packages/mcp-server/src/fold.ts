@@ -316,19 +316,57 @@ function mutatingFilePath(name: string, argsText: string, workspaceCwd: string |
   return typeof raw === 'string' ? projectRelativePath(workspaceCwd, raw) : undefined
 }
 
-function verificationCommandLabel(name: string, argsText: string): string | undefined {
-  if (name !== 'bash') return undefined
+function verificationCommandLabels(name: string, argsText: string): string[] {
+  if (name !== 'bash') return []
   let args: Record<string, unknown>
-  try { args = JSON.parse(argsText) as Record<string, unknown> } catch { return undefined }
+  try { args = JSON.parse(argsText) as Record<string, unknown> } catch { return [] }
   const command = args.command
-  if (typeof command !== 'string') return undefined
-  const tokens = command.trim().split(/\s+/)
-  const first = tokens[0]?.toLowerCase()
-  if (first === undefined || !VERIFICATION_TOKENS.has(first)) return undefined
-  // Never copy a full shell command into model context. Keep only the known
-  // verification executable and, when present, one generic action verb.
-  const action = tokens.slice(1).map(token => token.toLowerCase()).find(token => VERIFICATION_ACTIONS.has(token))
-  return cleanLabel(action === undefined ? first : `${first} ${action}`, MAX_COMMAND_LABEL)
+  if (typeof command !== 'string') return []
+  const labels = new Set<string>()
+  // Only inspect commands separated by success-dependent `&&`/newlines. We do
+  // not infer per-command outcomes across `||`, pipes, or arbitrary shell syntax.
+  for (const segment of command.split(/&&|\n/)) {
+    if (/\|\||(?<!\|)\|(?!\|)/.test(segment)) continue
+    const tokens = segment.trim().split(/\s+/)
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? '')) tokens.shift()
+    const first = tokens[0]?.toLowerCase()
+    if (first === undefined) continue
+    let label: string | undefined
+    if (first === 'test') {
+      const flag = tokens[1]?.toLowerCase()
+      label = flag === '-e' || flag === '-f' || flag === '-s' ? `test ${flag}` : 'test'
+    } else if (first === 'git' && tokens[1]?.toLowerCase() === 'diff' && tokens.includes('--check')) {
+      label = 'git diff --check'
+    } else if (VERIFICATION_TOKENS.has(first)) {
+      const action = tokens.slice(1).map(token => token.toLowerCase()).find(token => VERIFICATION_ACTIONS.has(token))
+      label = action === undefined ? first : `${first} ${action}`
+    }
+    const cleaned = label === undefined ? undefined : cleanLabel(label, MAX_COMMAND_LABEL)
+    if (cleaned !== undefined) labels.add(cleaned)
+  }
+  return [...labels]
+}
+
+function workspaceChangesFromResult(event: DshEvent | undefined): {
+  total: number
+  files: string[]
+  truncated: boolean
+} | undefined {
+  if (event === undefined) return undefined
+  const output = parsedResult(event) as { workspaceChanges?: unknown } | undefined
+  if (typeof output?.workspaceChanges !== 'object' || output.workspaceChanges === null) return undefined
+  const raw = output.workspaceChanges as Record<string, unknown>
+  if (raw.source !== 'HOST_GIT_BASELINE' || !Number.isInteger(raw.total) || (raw.total as number) < 0
+    || !Array.isArray(raw.files) || typeof raw.truncated !== 'boolean') return undefined
+  const files: string[] = []
+  let truncated = raw.truncated
+  for (const value of raw.files) {
+    if (typeof value !== 'string') { truncated = true; continue }
+    const path = projectRelativePath(undefined, value)
+    if (path === undefined) { truncated = true; continue }
+    files.push(path)
+  }
+  return { total: raw.total as number, files, truncated }
 }
 
 /** First correlated runtime outcome for each call id, indexed once per scope. */
@@ -411,6 +449,7 @@ export function projectActivityIn(
   const verificationCommands = new Set<string>()
   const verificationEvidence = new Map<string, 'passed' | 'failed' | 'pending'>()
   let coverage: 'complete' | 'partial' = 'complete'
+  let authoritativeEditTotal = 0
   let steps = 0
   let toolCalls = 0
   const toolCallsByName: Record<string, number> = {}
@@ -435,15 +474,25 @@ export function projectActivityIn(
       const path = mutatingFilePath(name, call.argumentsText, workspaceCwd)
       if (path !== undefined) editFiles.add(path)
     }
-    const command = verificationCommandLabel(name, call.argumentsText)
-    if (command !== undefined) {
+    for (const command of verificationCommandLabels(name, call.argumentsText)) {
       verificationCommands.add(command)
       verificationEvidence.set(command, outcome ?? 'pending')
+    }
+    if (name === 'supervisor_progress' || name === 'supervisor_handoff') {
+      const evidence = workspaceChangesFromResult(toolResultFor(events, call.callId, toSeq + 1))
+      if (evidence !== undefined) {
+        authoritativeEditTotal = Math.max(authoritativeEditTotal, evidence.total)
+        for (const path of evidence.files) editFiles.add(path)
+        if (evidence.truncated) coverage = 'partial'
+      }
     }
   }
   return {
     coverage,
-    edits: { total: editFiles.size, files: [...editFiles].slice(0, MAX_ACTIVITY_FILES) },
+    edits: {
+      total: Math.max(editFiles.size, authoritativeEditTotal),
+      files: [...editFiles].sort().slice(0, MAX_ACTIVITY_FILES),
+    },
     verification: {
       total: verificationCommands.size,
       commands: [...verificationCommands].slice(0, MAX_ACTIVITY_COMMANDS),

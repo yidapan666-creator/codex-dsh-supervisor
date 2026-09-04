@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   HANDOFF_FILES_LIMIT, HANDOFF_PATH_LIMIT, HANDOFF_SUMMARY_LIMIT, SUPERVISOR_PROGRESS_MIN_INTERVAL_MS,
-  handoffIdentityError, handoffPayloadError, handoffSummaryError, progressIdentityError, progressPayloadError,
+  boundedWorkspaceChanges, handoffIdentityError, handoffPayloadError, handoffSummaryError,
+  progressIdentityError, progressPayloadError,
   supervisorProgressDecision,
   type HandoffPayloadArgs,
 } from '../src/index.js'
@@ -55,6 +56,32 @@ describe('handoff payload limits', () => {
       args.verification = [{ command: 'pnpm test', outcome, summary: 'not passing' }]
       expect(handoffPayloadError(args)).toMatch(/status completed cannot include verification outcome/)
     }
+  })
+})
+
+describe('Host Git workspace-change evidence', () => {
+  it('keeps a bounded sample while preserving the authoritative total', () => {
+    const changedPaths = Array.from({ length: 20 }, (_, index) => `src/generated-${String(index)}.ts`)
+    expect(boundedWorkspaceChanges({
+      headBefore: 'a', headAfter: 'a', changedPaths, outOfScopePaths: [],
+    })).toEqual({
+      source: 'HOST_GIT_BASELINE',
+      total: 20,
+      files: changedPaths.slice(0, 16),
+      truncated: true,
+    })
+  })
+
+  it('does not surface a truncated path as if it were authoritative', () => {
+    const longPath = `src/${'x'.repeat(HANDOFF_PATH_LIMIT + 1)}`
+    expect(boundedWorkspaceChanges({
+      headBefore: 'a', headAfter: 'a', changedPaths: ['src/ok.ts', longPath], outOfScopePaths: [],
+    })).toEqual({
+      source: 'HOST_GIT_BASELINE',
+      total: 2,
+      files: ['src/ok.ts'],
+      truncated: true,
+    })
   })
 })
 

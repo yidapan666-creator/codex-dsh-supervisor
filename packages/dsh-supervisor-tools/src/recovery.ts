@@ -266,12 +266,68 @@ function tokenDelta(events: readonly RecoveryEvent[], fromSeq: number, toSeq: nu
   }
 }
 
+function verificationCommandLabels(command: string): string[] {
+  const labels = new Set<string>()
+  for (const segment of command.split(/&&|\n/)) {
+    if (/\|\||(?<!\|)\|(?!\|)/.test(segment)) continue
+    const tokens = segment.trim().split(/\s+/)
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? '')) tokens.shift()
+    const first = tokens[0]?.toLowerCase()
+    if (first === undefined) continue
+    let label: string | undefined
+    if (first === 'test') {
+      const flag = tokens[1]?.toLowerCase()
+      label = flag === '-e' || flag === '-f' || flag === '-s' ? `test ${flag}` : 'test'
+    } else if (first === 'git' && tokens[1]?.toLowerCase() === 'diff' && tokens.includes('--check')) {
+      label = 'git diff --check'
+    } else if (VERIFICATION_TOKENS.has(first)) {
+      const action = tokens.slice(1).map(token => token.toLowerCase())
+        .find(token => VERIFICATION_ACTIONS.has(token))
+      label = action === undefined ? first : `${first} ${action}`
+    }
+    const cleaned = label === undefined ? undefined : cleanLabel(label, 60)
+    if (cleaned !== undefined) labels.add(cleaned)
+  }
+  return [...labels]
+}
+
+function workspaceChangesFromResult(event: RecoveryEvent | undefined): {
+  total: number
+  files: string[]
+  truncated: boolean
+} | undefined {
+  if (event === undefined) return undefined
+  try {
+    const parsed = JSON.parse(eventText(event)) as { workspaceChanges?: unknown }
+    if (typeof parsed.workspaceChanges !== 'object' || parsed.workspaceChanges === null) return undefined
+    const raw = parsed.workspaceChanges as Record<string, unknown>
+    if (raw.source !== 'HOST_GIT_BASELINE' || !Number.isInteger(raw.total) || (raw.total as number) < 0
+      || !Array.isArray(raw.files) || typeof raw.truncated !== 'boolean') return undefined
+    const files = raw.files.filter((path): path is string => typeof path === 'string')
+      .map(path => projectRelativePath(undefined, path)).filter((path): path is string => path !== undefined)
+    return {
+      total: raw.total as number,
+      files,
+      truncated: raw.truncated || files.length < raw.files.length,
+    }
+  } catch {
+    return undefined
+  }
+}
+
 function projectActivity(scope: RecoveryScope): ProjectActivity {
   const outcomes = callOutcomes(scope.events, scope.activationSeq, scope.terminalSeq)
+  const results = new Map<string, RecoveryEvent>()
+  for (const event of scope.events) {
+    if (event.seq < scope.activationSeq || event.seq > scope.terminalSeq || event.type !== 'tool/result') continue
+    const callId = (event.data as { message?: { source?: { callId?: unknown } } }).message?.source?.callId
+    if (typeof callId === 'string') results.set(callId, event)
+  }
   const files = new Set<string>()
   const verification = new Map<string, 'passed' | 'failed' | 'pending'>()
   const toolCallsByName: Record<string, number> = {}
   let coverage: 'complete' | 'partial' = 'complete'
+  let authoritativeEditTotal = 0
   let steps = 0
   let toolCalls = 0
   for (const event of scope.events) {
@@ -304,20 +360,22 @@ function projectActivity(scope: RecoveryScope): ProjectActivity {
       try {
         const command = (JSON.parse(data.arguments) as Record<string, unknown>).command
         if (typeof command === 'string') {
-          const tokens = command.trim().split(/\s+/)
-          const first = tokens[0]?.toLowerCase()
-          if (first !== undefined && VERIFICATION_TOKENS.has(first)) {
-            const action = tokens.slice(1).map(token => token.toLowerCase())
-              .find(token => VERIFICATION_ACTIONS.has(token))
-            verification.set((action === undefined ? first : `${first} ${action}`).slice(0, 60), outcome ?? 'pending')
-          }
+          for (const label of verificationCommandLabels(command)) verification.set(label, outcome ?? 'pending')
         }
       } catch { coverage = 'partial' }
+    }
+    if ((name === 'supervisor_progress' || name === 'supervisor_handoff') && typeof data.callId === 'string') {
+      const evidence = workspaceChangesFromResult(results.get(data.callId))
+      if (evidence !== undefined) {
+        authoritativeEditTotal = Math.max(authoritativeEditTotal, evidence.total)
+        for (const path of evidence.files) files.add(path)
+        if (evidence.truncated) coverage = 'partial'
+      }
     }
   }
   return {
     coverage,
-    edits: { total: files.size, files: [...files].sort().slice(0, 8) },
+    edits: { total: Math.max(files.size, authoritativeEditTotal), files: [...files].sort().slice(0, 8) },
     verification: {
       total: verification.size,
       evidence: [...verification.entries()].sort(([left], [right]) => left.localeCompare(right)).slice(0, 4)
@@ -398,10 +456,12 @@ function mergedActivity(scopes: readonly RecoveryScope[]): ProjectActivity {
   const toolCallsByName: Record<string, number> = {}
   const tokens = { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
   let coverage: 'complete' | 'partial' = 'complete'
+  let editsTotal = 0
   let steps = 0
   let toolCalls = 0
   for (const activity of activities) {
     if (activity.coverage === 'partial') coverage = 'partial'
+    editsTotal += activity.edits.total
     for (const file of activity.edits.files) files.add(file)
     for (const entry of activity.verification.evidence) {
       const rank = { passed: 0, pending: 1, failed: 2 } as const
@@ -422,7 +482,7 @@ function mergedActivity(scopes: readonly RecoveryScope[]): ProjectActivity {
   if (toolNames.length < Object.keys(toolCallsByName).length) coverage = 'partial'
   return {
     coverage,
-    edits: { total: files.size, files: [...files].sort().slice(0, 8) },
+    edits: { total: Math.max(files.size, editsTotal), files: [...files].sort().slice(0, 8) },
     verification: {
       total: verification.size,
       evidence: [...verification.entries()].sort(([left], [right]) => left.localeCompare(right)).slice(0, 4)

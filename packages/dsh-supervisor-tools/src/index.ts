@@ -10,7 +10,7 @@ import {
   type BudgetReservationLedger,
   type DurableBudgetReservation,
 } from './reservation-ledger.js'
-import { FileGitBaselineStore } from './git-baseline.js'
+import { FileGitBaselineStore, type GitBaselineVerification } from './git-baseline.js'
 import { authorizeSupervisorRequest, requiredHostToken } from './host-auth.js'
 import { DSH_GATE_COMPILED_BUILD_ID } from './build-identity.js'
 import {
@@ -120,7 +120,40 @@ export const REPORTED_FAILURE_SUMMARY_LIMIT = 1_024
 export const REPORTED_FAILURE_HYPOTHESIS_LIMIT = 512
 /** Ordinary semantic progress records are accepted at most once per minute. */
 export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
+export const WORKSPACE_CHANGES_FILES_LIMIT = 16
+export const WORKSPACE_CHANGE_PATH_LIMIT = 200
 export const TOKEN_BUDGET_STATE_PATH = '/api/dsh-gate.budget-state'
+
+export interface WorkspaceChangesEvidence {
+  source: 'HOST_GIT_BASELINE'
+  total: number
+  files: string[]
+  truncated: boolean
+}
+
+/** Bound Host-authoritative task-era Git changes before they enter model or supervisor context. */
+export function boundedWorkspaceChanges(verification: GitBaselineVerification): WorkspaceChangesEvidence {
+  const files = verification.changedPaths
+    .filter(path => path.length <= WORKSPACE_CHANGE_PATH_LIMIT)
+    .slice(0, WORKSPACE_CHANGES_FILES_LIMIT)
+  return {
+    source: 'HOST_GIT_BASELINE',
+    total: verification.changedPaths.length,
+    files,
+    truncated: files.length < verification.changedPaths.length,
+  }
+}
+
+const workspaceChangesOutput = () => ({
+  type: 'object' as const,
+  additionalProperties: false as const,
+  properties: {
+    source: { type: 'string' as const, required: true as const, enum: ['HOST_GIT_BASELINE'] },
+    total: { type: 'integer' as const, required: true as const },
+    files: { type: 'array' as const, required: true as const, items: { type: 'string' as const } },
+    truncated: { type: 'boolean' as const, required: true as const },
+  },
+})
 
 /** Plugin-owned readiness endpoint; proves the generic Host loaded the expected supervisor runtime. */
 export function registerSupervisorDescriptorRoute(
@@ -1479,11 +1512,12 @@ export function apply(ctx: Context, config: Config = {}): void {
           accepted: { type: 'boolean', required: true },
           reason: { type: 'string', enum: ['duplicate', 'rate_limited'] },
           progress: { type: 'json' },
+          workspaceChanges: workspaceChangesOutput(),
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    execute(args, exec) {
+    async execute(args, exec) {
       if (exec.agent === undefined) throw new Error('supervisor_progress requires an agent-owned session')
       const events = exec.agent.session.events
       const payloadError = progressPayloadError(args)
@@ -1491,7 +1525,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       const identityError = progressIdentityError(events, args)
       if (identityError !== undefined) throw new Error(identityError)
       const decision = supervisorProgressDecision(events, args)
-      if (!decision.accepted) return Promise.resolve({ accepted: false as const, reason: decision.reason })
+      if (!decision.accepted) return { accepted: false as const, reason: decision.reason }
       const progress = {
         ...args.taskId === undefined ? {} : { taskId: args.taskId },
         ...args.sessionId === undefined ? {} : { sessionId: args.sessionId },
@@ -1504,7 +1538,22 @@ export function apply(ctx: Context, config: Config = {}): void {
         needsSupervisor: args.needsSupervisor,
         ...args.decision === undefined ? {} : { decision: args.decision },
       }
-      return Promise.resolve({ accepted: true as const, progress })
+      const identity = latestTaskIdentity(events)
+      let workspaceChanges: WorkspaceChangesEvidence | undefined
+      if (identity?.writerMode === 'writer' && identity.runId !== undefined) {
+        const cwd = exec.agent.session.header.cwd
+        if (cwd === undefined) throw new Error('supervisor_progress writer session has no authoritative cwd')
+        workspaceChanges = boundedWorkspaceChanges(await gitBaselines.verify({
+          sessionId: identity.sessionId,
+          runId: identity.runId,
+          cwd,
+        }))
+      }
+      return {
+        accepted: true as const,
+        progress,
+        ...workspaceChanges === undefined ? {} : { workspaceChanges },
+      }
     },
   }))
 
@@ -1611,6 +1660,7 @@ export function apply(ctx: Context, config: Config = {}): void {
               },
             },
           },
+          workspaceChanges: workspaceChangesOutput(),
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -1654,7 +1704,12 @@ export function apply(ctx: Context, config: Config = {}): void {
         ...args.attemptedHypotheses === undefined ? {} : { attemptedHypotheses: args.attemptedHypotheses },
       }
       exec.concludeTurn()
-      return { accepted: true as const, handoff, artifacts }
+      return {
+        accepted: true as const,
+        handoff,
+        artifacts,
+        ...gitValidation === undefined ? {} : { workspaceChanges: boundedWorkspaceChanges(gitValidation) },
+      }
     },
   }))
 }

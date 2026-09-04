@@ -27,7 +27,10 @@ const codeResult = (seq: number, subCallId: string, name: string, args: object, 
     content: [{ type: 'text', text: JSON.stringify(value) }],
   })
 
-function handoffEvents(includeTurnEnd = true): DshEvent[] {
+function handoffEvents(
+  includeTurnEnd = true,
+  workspaceChanges?: { source: 'HOST_GIT_BASELINE'; total: number; files: string[]; truncated: boolean },
+): DshEvent[] {
   const args = {
     taskId: 's1', completionToken: 'token', status: 'completed', stage: 'done', summary: 'verified', files: ['a.ts'], verification: [],
   }
@@ -37,7 +40,9 @@ function handoffEvents(includeTurnEnd = true): DshEvent[] {
     event('tool/call', 2, { turn: 1, step: 1, callId: 'c1', name: 'supervisor_handoff', arguments: JSON.stringify(args) }),
     event('tool/result', 3, {
       turn: 1, step: 1,
-      message: { source: { callId: 'c1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, artifacts: [] }) }] }] },
+      message: { source: { callId: 'c1' }, content: [{ type: 'tool-result', content: [{
+        type: 'text', text: JSON.stringify({ accepted: true, artifacts: [], ...workspaceChanges === undefined ? {} : { workspaceChanges } }),
+      }] }] },
     }),
   ]
   if (includeTurnEnd) events.push(event('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }))
@@ -72,6 +77,19 @@ describe('authoritative completion fold', () => {
     expect(complete).toMatchObject({
       status: 'COMPLETED', acceptanceStatus: 'UNVERIFIED',
       boundarySeq: 4, handoffSeq: 3, handoffTime: 3, asOfSeq: 4, taskId: 's1',
+    })
+  })
+
+  it('folds Host Git-baseline evidence into terminal project activity', () => {
+    const observed = deriveObservation(state(handoffEvents(true, {
+      source: 'HOST_GIT_BASELINE',
+      total: 2,
+      files: ['generated/by-shell.ts', 'src/edited.ts'],
+      truncated: false,
+    })))
+
+    expect(observed.projectActivity).toMatchObject({
+      edits: { total: 2, files: ['generated/by-shell.ts', 'src/edited.ts'] },
     })
   })
 
@@ -598,6 +616,25 @@ describe('project activity summarization', () => {
     expect(activity.toolCallsByName).toEqual({ edit: 3, write: 1, bash: 3, read: 1 })
     expect(activity.coverage).toBe('partial')
     expect(activity.tokenUsage).toEqual({ uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })
+  })
+
+  it('recognizes bounded verification commands inside an && shell chain', () => {
+    const events = [
+      toolCall(1, 'v1', 'bash', {
+        command: 'echo checking && test -s generated/report.md && git diff --check -- generated/report.md && pnpm verify',
+      }),
+      toolResult(2, 'v1'),
+    ]
+
+    expect(projectActivityIn(events, 1, 2).verification).toEqual({
+      total: 3,
+      commands: ['test -s', 'git diff --check', 'pnpm verify'],
+      evidence: [
+        { command: 'test -s', outcome: 'passed' },
+        { command: 'git diff --check', outcome: 'passed' },
+        { command: 'pnpm verify', outcome: 'passed' },
+      ],
+    })
   })
 
   it('counts str_replace_editor mutations but not views as edits', () => {
