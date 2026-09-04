@@ -30,6 +30,20 @@ Codex, install the skill, start the independent Host, and run live doctor with:
 npx @yidapan666/dsh-gate setup
 ```
 
+`npx` is the simplest path: it downloads and runs the current published CLI
+without permanently installing it. `npm install --global @yidapan666/dsh-gate`
+is optional and only saves the command locally; a global installation stays at
+its installed version until it is upgraded.
+
+Published installers intentionally follow versioned releases, not the moving
+`main` branch. The npm CLI downloads the GitHub runtime with the same version;
+the offline kit contains that same version and its checksums. A source checkout
+uses whatever commit is checked out, so clone `main` for current development or
+check out a `vX.Y.Z` tag to reproduce a published release. Therefore all three
+paths provide the same product and workflow, but they contain byte-for-byte
+matching code only when they target the same release version. See the
+[version-channel table](docs/distribution.md#which-version-do-i-get).
+
 For an offline or reviewed-artifact installation:
 
 ```sh

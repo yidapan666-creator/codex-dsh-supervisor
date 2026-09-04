@@ -11,6 +11,24 @@ and exact DSH commit.
 | Offline kit | local installer `.tgz` + runtime bundle + checksums | None | Air-gapped or reviewed installs |
 | Source checkout | `pnpm bootstrap` | GitHub + npm | Contributors and auditors |
 
+## Which version do I get?
+
+The three paths expose the same product, bootstrap, Host, skill, and MCP flow,
+but a published release does not automatically change whenever `main` changes.
+
+| Installation command | Version selected | Update behavior |
+| --- | --- | --- |
+| `npx @yidapan666/dsh-gate setup` | Current npm package, then the same-numbered GitHub Release runtime | A later invocation resolves the current published package |
+| `npm install --global @yidapan666/dsh-gate` | Package version installed globally | Remains pinned until `npm update --global @yidapan666/dsh-gate` |
+| Offline kit | Version written in the installer and runtime filenames | Changes only when another complete, matching kit is supplied |
+| Source checkout | Exact checked-out Git commit | `main` follows development; `vX.Y.Z` reproduces that release |
+
+For identical released content, use one version across npm, GitHub Release, and
+the offline filenames. `dsh-gate --version` prints the CLI version. The runtime
+manifest also records its release version and exact gate/DSH commits. New commits
+on `main` become available to release-based installations only after a new tag,
+GitHub Release bundle, and npm package are published.
+
 The unrelated unscoped npm name `dsh-gate` is already owned by another
 publisher. The official package is therefore `@yidapan666/dsh-gate`, matching
 the npm account that owns the package;
@@ -24,7 +42,9 @@ npx @yidapan666/dsh-gate setup
 
 You may instead install the command once with
 `npm install --global @yidapan666/dsh-gate`; lifecycle examples below
-use `npx` so a global install is never required.
+use `npx` so a global install is never required. For users, neither route is
+complicated: `npx` is one command with no permanent CLI installation, while the
+global npm route trades a one-time install for an explicit update step.
 
 Defaults:
 
