@@ -1,0 +1,30 @@
+#!/bin/sh
+
+# Repository-local, opt-in automatic push. Activation and scope live in the
+# repository's local Git config, so merely cloning this file changes nothing.
+enabled=$(git config --bool --get dsh.autoPush 2>/dev/null || printf 'false')
+[ "$enabled" = "true" ] || exit 0
+
+branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || exit 0
+allowed_branches=$(git config --get-all dsh.autoPushBranch 2>/dev/null || printf 'main')
+case "
+$allowed_branches
+" in
+  *"
+$branch
+"*) ;;
+  *) exit 0 ;;
+esac
+
+# Never publish an intermediate history-rewrite state.
+git_dir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+[ -d "$git_dir/rebase-merge" ] && exit 0
+[ -d "$git_dir/rebase-apply" ] && exit 0
+
+remote=$(git config --get dsh.autoPushRemote 2>/dev/null || printf 'origin')
+printf 'Auto-pushing %s to %s/%s...\n' "$branch" "$remote" "$branch"
+if ! git push "$remote" "HEAD:refs/heads/$branch"; then
+  printf 'Automatic push failed; the commit is safe locally and can be pushed later.\n' >&2
+fi
+
+exit 0
