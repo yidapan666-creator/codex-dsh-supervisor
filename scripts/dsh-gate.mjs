@@ -33,6 +33,7 @@ import {
   probePid,
   hostStartPidDecision,
   describeHost,
+  probeHostOrigin,
   checkGatePlugin,
   DSH_FORK_URL,
   DSH_FORK_BRANCH,
@@ -379,10 +380,17 @@ async function runHost({ paths, options, hostAction }) {
         const value = await describeHost({ hostUrl, io, timeoutMs: 2000, token: hostToken })
         const owned = record === undefined ? 'no dsh-gate pidfile' : `pidfile pid ${record.pid} is stale`
         log(`${owned}, but a Host is serving ${hostUrl}: hostInstanceId ${value.hostInstanceId}, cwd ${value.cwd} — it is not managed by dsh-gate (stop it yourself)`)
-      } catch {
-        log(record === undefined
-          ? `no host pidfile at ${hostPaths.hostPidFile} — the Host is not managed by dsh-gate, and nothing is serving ${hostUrl}`
-          : `pidfile says pid ${record.pid} but no such process — stale record; run '${lifecycleCommand('start')}'`)
+      } catch (describeError) {
+        try {
+          const probe = await probeHostOrigin({ hostUrl, io, timeoutMs: 2000 })
+          const ownership = record === undefined ? 'no dsh-gate pidfile' : `pidfile pid ${record.pid} is stale`
+          const reason = describeError instanceof Error ? describeError.message : String(describeError)
+          log(`${ownership}, but an HTTP service is serving ${hostUrl} (HTTP ${probe.status}); authenticated Host inspection failed (${reason}). This is likely a different Host or credential — do not treat it as empty or start over it.`)
+        } catch {
+          log(record === undefined
+            ? `no host pidfile at ${hostPaths.hostPidFile} — the Host is not managed by dsh-gate, and nothing is serving ${hostUrl}`
+            : `pidfile says pid ${record.pid} but no such process — stale record; run '${lifecycleCommand('start')}'`)
+        }
       }
     } else {
       try {

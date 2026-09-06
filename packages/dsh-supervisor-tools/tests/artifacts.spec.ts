@@ -36,7 +36,22 @@ describe('artifact admission', () => {
     await writeFile(join(outside, 'secret.txt'), 'secret')
     await symlink(outside, join(root, 'linked-dir'))
     await expect(admitArtifact(root, 'linked-dir/secret.txt'))
-      .rejects.toThrow(/resolves outside the session cwd/)
+      .rejects.toThrow(/symbolic link/)
+  })
+
+  it('rejects non-canonical traversal segments even when they normalize inside the cwd', async () => {
+    const root = await tempRoot()
+    await mkdir(join(root, 'dir'))
+    await writeFile(join(root, 'report.txt'), 'report')
+    await expect(admitArtifact(root, 'dir/../report.txt')).rejects.toThrow(/\.\./)
+  })
+
+  it('rejects an intermediate symlink even when it resolves inside the cwd', async () => {
+    const root = await tempRoot()
+    await mkdir(join(root, 'real-dir'))
+    await writeFile(join(root, 'real-dir', 'report.txt'), 'report')
+    await symlink(join(root, 'real-dir'), join(root, 'alias'))
+    await expect(admitArtifact(root, 'alias/report.txt')).rejects.toThrow(/symbolic link/)
   })
 
   it('fails closed when the session has no cwd', async () => {

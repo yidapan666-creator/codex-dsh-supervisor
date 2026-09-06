@@ -97,10 +97,23 @@ describe('Host token budget fold', () => {
       usedTokens: 150,
       remainingTokens: 0,
       exhausted: true,
+      status: 'EXHAUSTED',
+      overshootTokens: 0,
       sessions: 2,
       uncachedInputTokens: 90,
       outputTokens: 60,
     })
+  })
+
+  it('distinguishes active, exactly exhausted, and provider-usage overshoot states', () => {
+    const stateFor = (used: number) => liveTokenBudgetState([{
+      header: { id: 'root' },
+      events: [packetEvent(0, 100), usage(1, 110, 1, 1, used, 0)],
+    }], 'root', runId, 100)
+
+    expect(stateFor(99)).toMatchObject({ status: 'ACTIVE', exhausted: false, overshootTokens: 0 })
+    expect(stateFor(100)).toMatchObject({ status: 'EXHAUSTED', exhausted: true, overshootTokens: 0 })
+    expect(stateFor(125)).toMatchObject({ status: 'OVERSHOT', exhausted: true, overshootTokens: 25 })
   })
 
   it('affiliates fresh spawn descendants from durable lineage and accepted work boundaries', () => {

@@ -353,6 +353,8 @@ export const observationSchema = z.object({
     observedTokens: z.number().int().nonnegative(),
     remainingTokens: z.number().int().nonnegative(),
     exhausted: z.boolean(),
+    status: z.enum(['ACTIVE', 'EXHAUSTED', 'REQUEST_REJECTED', 'OVERSHOT']),
+    overshootTokens: z.number().int().nonnegative(),
     coverage: z.enum(['root_session', 'run_tree']),
     enforcement: z.literal('DSH_HOST_RUNTIME'),
     overshootBound: z.literal('IN_FLIGHT_MODEL_RESPONSES'),
@@ -407,13 +409,16 @@ export const EXECUTION_BRIEF_MAX_BYTES = 16_384
 export const EXECUTION_BRIEF_MAX_WORKSTREAMS = 5
 
 const workstreamSchema = z.object({
-  id: z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/),
-  outcome: z.string().min(1).max(512),
+  id: z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/)
+    .describe('Uppercase short id: 1-16 characters matching /^[A-Z][A-Z0-9_-]{0,15}$/. Example: AUTH.'),
+  outcome: z.string().min(1).max(512).describe('Observable outcome owned by this workstream.'),
   scopeHints: z.array(z.string().min(1).max(256)).max(12).optional(),
   evidenceToGather: z.array(z.string().min(1).max(512)).max(8).optional(),
   dependsOn: z.array(z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/)).max(4).optional(),
-  delegation: z.enum(['root', 'child_candidate']),
-  doneWhen: z.array(z.string().min(1).max(512)).min(1).max(8),
+  delegation: z.enum(['root', 'child_candidate'])
+    .describe('Planning hint only; Root owns the decision to delegate.'),
+  doneWhen: z.array(z.string().min(1).max(512)).min(1).max(8)
+    .describe('One to eight observable completion conditions.'),
 }).strict()
 
 interface ExecutionBriefFields {
@@ -474,6 +479,41 @@ export const executionBriefSchema = z.object({
 }).strict().superRefine(validateExecutionBrief)
 export type ExecutionBriefInput = z.infer<typeof executionBriefInputSchema>
 export type ExecutionBrief = z.infer<typeof executionBriefSchema>
+
+/** Public success receipt returned after Host-side atomic task admission. */
+export const taskAdmissionReceiptSchema = z.object({
+  schemaVersion: z.literal(1),
+  hostInstanceId: z.string().min(1).max(512),
+  sessionId: z.string().min(1).max(512),
+  /** Temporary compatibility alias; equal to sessionId. */
+  taskId: z.string().min(1).max(512),
+  requestId: z.string().uuid(),
+  runId: z.string().uuid(),
+  objective: z.string().min(1).max(8_192),
+  writerMode: z.enum(['writer', 'read_only']),
+  agentPreset: z.enum(['standard', 'code']),
+  instructionProfile: z.literal('engineering-v1'),
+  executionBrief: z.object({
+    source: z.enum(['CODEX_COMPILED', 'SINGLE_STREAM_FALLBACK']),
+    workstreamCount: z.number().int().min(1).max(EXECUTION_BRIEF_MAX_WORKSTREAMS),
+    workstreamIds: z.array(z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/))
+      .min(1).max(EXECUTION_BRIEF_MAX_WORKSTREAMS),
+  }).strict(),
+  accepted: z.literal(true),
+  /** True when requestId idempotency returned the pre-existing durable admission. */
+  reconciled: z.boolean(),
+  admissionBoundarySeq: z.number().int().min(-1),
+  /** Exact lower-bound cursor for the first dsh_wait call. */
+  initialWaitAfterAsOfSeq: z.number().int().min(-1),
+  /** Diagnostic latest event observed while producing this receipt. */
+  observedAsOfSeq: z.number().int().min(-1),
+  /** @deprecated Use initialWaitAfterAsOfSeq for first wait and observedAsOfSeq for diagnostics. */
+  asOfSeq: z.number().int().min(-1),
+  tokenBudget: z.object({ maxTokens: z.number().int().positive() }).strict().optional(),
+  recoveryCapsuleAccepted: z.literal(true).optional(),
+  disconnectBehavior: z.literal('HOST_CONTINUES'),
+}).strict()
+export type TaskAdmissionReceipt = z.infer<typeof taskAdmissionReceiptSchema>
 
 export const taskPacketV1Schema = z.object({
   schemaVersion: z.literal(1),

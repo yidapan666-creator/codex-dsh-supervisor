@@ -26,6 +26,7 @@ import {
   packageManagerBoundaryEnv,
   parseCliArgs,
   planBootstrap,
+  probeHostOrigin,
   redactOutput,
   remoteMatchesFork,
   resolvePaths,
@@ -239,7 +240,7 @@ describe('remoteMatchesFork', () => {
 
 describe('isPlaceholderVersion', () => {
   it('accepts a real release version', () => {
-    expect(isPlaceholderVersion('0.1.0-rc.8')).toBe(false)
+    expect(isPlaceholderVersion('0.1.1-rc.2')).toBe(false)
   })
 
   it('rejects empty, sentinel, and template versions', () => {
@@ -483,7 +484,7 @@ describe('runDoctor', () => {
   }
 
   it('passes every check on a healthy deployment', async () => {
-    const { paths, io } = goodEnv({ live: true, hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.0-rc.8' } })
+    const { paths, io } = goodEnv({ live: true, hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.1-rc.2' } })
     const results = await runDoctor({ paths, io, live: true, hostUrl: DEFAULT_HOST_URL })
     for (const result of results) expect(result.ok, result.name).toBe(true)
     const summary = summarizeDoctor(results)
@@ -529,10 +530,19 @@ describe('runDoctor', () => {
     expect(results.find(r => r.name === 'live Host').ok).toBe(false)
   })
 
+  it('rejects a live Host with an unpinned future product version', async () => {
+    const { paths, io } = goodEnv({ live: true, hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '999.0.0' } })
+    const results = await runDoctor({ paths, io, live: true })
+    expect(results.find(r => r.name === 'live Host')).toMatchObject({
+      ok: false,
+      detail: expect.stringMatching(/999\.0\.0/),
+    })
+  })
+
   it('rejects a live Host whose supervisor plugin is stale or incomplete', async () => {
     const { paths, io } = goodEnv({
       live: true,
-      hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.0-rc.8' },
+      hostValue: { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.1-rc.2' },
       gateValue: {
         schemaVersion: 1, gateProtocolVersion: 1, pluginName: '@dsh-gate/supervisor-tools',
         pluginVersion: 'old', buildId: 'old', workerProtocolVersion: 2, capabilities: [],
@@ -558,7 +568,7 @@ describe('runDoctor', () => {
           }
         : ({ type: 'server-response', rpcId: 'x', result: { ok: true, value:
           url.endsWith('/api/host.describe')
-          ? { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.0-rc.8' }
+          ? { protocolVersion: 1, hostInstanceId: 'inst-1', version: '0.1.1-rc.2' }
           : {
               current: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
               routable: true,
@@ -597,7 +607,7 @@ describe('checkLiveHost', () => {
         expect(init.method).toBe('POST')
         const body = JSON.parse(init.body)
         expect(body.method).toBe('host.describe')
-        return { ok: true, json: async () => ({ result: { ok: true, value: { protocolVersion: 1, hostInstanceId: 'i', version: '0.1.0-rc.8' } } }) }
+        return { ok: true, json: async () => ({ result: { ok: true, value: { protocolVersion: 1, hostInstanceId: 'i', version: '0.1.1-rc.2' } } }) }
       },
     })
     const value = await checkLiveHost({ url: DEFAULT_HOST_URL, io })
@@ -625,6 +635,26 @@ describe('checkLiveHost', () => {
   it('throws with the business error when the Host rejects the RPC', async () => {
     const io = makeFakeIo({ fetch: async () => ({ ok: true, json: async () => ({ result: { ok: false, error: { code: 'E_NO_HOST', message: 'nope' } } }) }) })
     await expect(checkLiveHost({ url: DEFAULT_HOST_URL, io })).rejects.toThrow(/E_NO_HOST: nope/)
+  })
+})
+
+describe('probeHostOrigin', () => {
+  it('treats an authentication response as a reachable occupied origin', async () => {
+    const io = makeFakeIo({
+      fetch: async (url, init) => {
+        expect(url).toBe(`${DEFAULT_HOST_URL}/`)
+        expect(init).toMatchObject({ method: 'GET', redirect: 'manual' })
+        expect(init.headers).toBeUndefined()
+        return { status: 401 }
+      },
+    })
+
+    await expect(probeHostOrigin({ hostUrl: DEFAULT_HOST_URL, io })).resolves.toEqual({ status: 401 })
+  })
+
+  it('keeps connection failures distinct from an empty Host', async () => {
+    const io = makeFakeIo({ fetch: async () => { throw new Error('ECONNREFUSED') } })
+    await expect(probeHostOrigin({ hostUrl: DEFAULT_HOST_URL, io })).rejects.toThrow(/ECONNREFUSED/)
   })
 })
 

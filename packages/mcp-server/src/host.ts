@@ -11,7 +11,20 @@ import {
   type SessionSummary,
 } from '@deepseek-ai/dsh-client-connection/network-client'
 import { taskBoundarySeq } from './fold.js'
-import { DSH_GATE_BUILD_ID } from '../../dsh-supervisor-tools/build-identity.mjs'
+import {
+  EXPECTED_DSH_HOST_VERSION,
+  EXPECTED_GATE_BUILD_ID,
+  EXPECTED_GATE_CAPABILITIES,
+  EXPECTED_GATE_PLUGIN_VERSION,
+  dshHostCompatibilityError,
+  gateDescriptorCompatibilityError,
+} from '../../dsh-supervisor-tools/compatibility.mjs'
+export {
+  EXPECTED_DSH_HOST_VERSION,
+  EXPECTED_GATE_BUILD_ID,
+  EXPECTED_GATE_CAPABILITIES,
+  EXPECTED_GATE_PLUGIN_VERSION,
+} from '../../dsh-supervisor-tools/compatibility.mjs'
 import type {
   DshEvent, PendingApproval, PendingQuestion, RecoveryCapsule, TaskRuntimeState, WorkerState,
 } from './contracts.js'
@@ -102,6 +115,8 @@ export interface TokenBudgetStateReceipt {
   usedTokens: number
   remainingTokens: number
   exhausted: boolean
+  status: 'ACTIVE' | 'EXHAUSTED' | 'OVERSHOT'
+  overshootTokens: number
   sessions: number
   uncachedInputTokens: number
   outputTokens: number
@@ -113,14 +128,6 @@ export interface TokenBudgetStateReceipt {
 }
 
 export type TokenBudgetStateTransport = (request: TokenBudgetStateRequest) => Promise<TokenBudgetStateReceipt>
-
-export const EXPECTED_GATE_CAPABILITIES = [
-  'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
-  'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1',
-  'bearer-auth-v1',
-] as const
-export const EXPECTED_GATE_PLUGIN_VERSION = '0.1.0'
-export const EXPECTED_GATE_BUILD_ID = DSH_GATE_BUILD_ID
 
 export interface GateDescriptor {
   schemaVersion: 1
@@ -152,14 +159,8 @@ async function fetchGateDescriptor(baseUrl: string, token?: string): Promise<Gat
   const value = await response.json() as Record<string, unknown>
   const capabilities = Array.isArray(value.capabilities)
     ? value.capabilities.filter((entry): entry is string => typeof entry === 'string') : []
-  const missing = EXPECTED_GATE_CAPABILITIES.filter(capability => !capabilities.includes(capability))
-  if (value.schemaVersion !== 1 || value.gateProtocolVersion !== 1
-    || value.pluginName !== '@dsh-gate/supervisor-tools'
-    || value.pluginVersion !== EXPECTED_GATE_PLUGIN_VERSION
-    || value.buildId !== EXPECTED_GATE_BUILD_ID
-    || value.workerProtocolVersion !== 2 || missing.length > 0) {
-    throw new ProtocolContractError(`incompatible dsh-gate supervisor plugin${missing.length === 0 ? '' : `; missing capabilities: ${missing.join(', ')}`}`)
-  }
+  const compatibilityError = gateDescriptorCompatibilityError({ ...value, capabilities })
+  if (compatibilityError !== undefined) throw new ProtocolContractError(compatibilityError)
   return { ...value, capabilities } as GateDescriptor
 }
 
@@ -274,6 +275,8 @@ function tokenBudgetStateReceipt(value: unknown, request: TokenBudgetStateReques
     || typeof receipt.usedTokens !== 'number' || !Number.isSafeInteger(receipt.usedTokens) || receipt.usedTokens < 0
     || typeof receipt.remainingTokens !== 'number' || !Number.isSafeInteger(receipt.remainingTokens) || receipt.remainingTokens < 0
     || typeof receipt.exhausted !== 'boolean'
+    || !['ACTIVE', 'EXHAUSTED', 'OVERSHOT'].includes(String(receipt.status))
+    || typeof receipt.overshootTokens !== 'number' || !Number.isSafeInteger(receipt.overshootTokens) || receipt.overshootTokens < 0
     || typeof receipt.sessions !== 'number' || !Number.isSafeInteger(receipt.sessions) || receipt.sessions < 0
     || receipt.coverage !== 'run_tree'
     || receipt.enforcement !== 'DSH_HOST_RUNTIME'
@@ -287,9 +290,13 @@ function tokenBudgetStateReceipt(value: unknown, request: TokenBudgetStateReques
   }
   const bucketTotal = Number(receipt.uncachedInputTokens) + Number(receipt.outputTokens)
     + Number(receipt.cacheReadTokens) + Number(receipt.cacheWriteTokens)
+  const overshootTokens = Math.max(0, bucketTotal - Number(receipt.limitTokens))
+  const status = overshootTokens > 0 ? 'OVERSHOT' : bucketTotal === Number(receipt.limitTokens) ? 'EXHAUSTED' : 'ACTIVE'
   if (receipt.usedTokens !== bucketTotal
     || receipt.remainingTokens !== Math.max(0, Number(receipt.limitTokens) - bucketTotal)
-    || receipt.exhausted !== (bucketTotal >= Number(receipt.limitTokens))) {
+    || receipt.exhausted !== (bucketTotal >= Number(receipt.limitTokens))
+    || receipt.status !== status
+    || receipt.overshootTokens !== overshootTokens) {
     throw new ProtocolContractError('inconsistent dsh-gate token budget state receipt')
   }
   return receipt as unknown as TokenBudgetStateReceipt
@@ -477,9 +484,7 @@ export class HostConnection {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
         this.description = description
-        this.protocolError = description.protocolVersion === 1
-          ? undefined
-          : `unsupported DSH Host protocol version ${String(description.protocolVersion)} (expected 1)`
+        this.protocolError = dshHostCompatibilityError(description)
         this.publishAll()
       },
       onStateChange: (state) => {

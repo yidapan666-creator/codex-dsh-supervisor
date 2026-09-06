@@ -1,2 +1,2 @@
 /** Generated from the Host-runtime source set; update with `pnpm build-id:update`. */
-export const DSH_GATE_COMPILED_BUILD_ID = 'sha256:b50a2bc68b3610f46d8314e1c7c6e335a92bf510484734211401dab024028233'
+export const DSH_GATE_COMPILED_BUILD_ID = 'sha256:26dc0cda33e37b40e08cb08440c505cb8a22e73aa4d72051f997bb004e3b67be'

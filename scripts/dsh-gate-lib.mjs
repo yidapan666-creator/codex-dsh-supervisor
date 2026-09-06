@@ -13,7 +13,20 @@
 import { delimiter as pathDelimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
-import { DSH_GATE_BUILD_ID } from '../packages/dsh-supervisor-tools/build-identity.mjs'
+import {
+  EXPECTED_DSH_HOST_VERSION,
+  EXPECTED_GATE_BUILD_ID,
+  EXPECTED_GATE_CAPABILITIES,
+  EXPECTED_GATE_PLUGIN_VERSION,
+  dshHostCompatibilityError,
+  gateDescriptorCompatibilityError,
+} from '../packages/dsh-supervisor-tools/compatibility.mjs'
+export {
+  EXPECTED_DSH_HOST_VERSION,
+  EXPECTED_GATE_BUILD_ID,
+  EXPECTED_GATE_CAPABILITIES,
+  EXPECTED_GATE_PLUGIN_VERSION,
+} from '../packages/dsh-supervisor-tools/compatibility.mjs'
 
 // ---------------------------------------------------------------------------
 // Compatibility contract constants
@@ -582,14 +595,6 @@ export async function checkLiveHost({ url, io, timeoutMs = 8000, token }) {
   return result.value
 }
 
-export const EXPECTED_GATE_CAPABILITIES = [
-  'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
-  'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1',
-  'bearer-auth-v1',
-]
-export const EXPECTED_GATE_PLUGIN_VERSION = '0.1.0'
-export const EXPECTED_GATE_BUILD_ID = DSH_GATE_BUILD_ID
-
 /** Prove that the live generic Host loaded a compatible dsh-gate supervisor plugin. */
 export async function checkGatePlugin({ url, io, timeoutMs = 8000, token }) {
   const response = await io.fetch(`${url.replace(/\/+$/, '')}/api/dsh-gate.describe`, {
@@ -599,14 +604,8 @@ export async function checkGatePlugin({ url, io, timeoutMs = 8000, token }) {
   const value = await response.json()
   const capabilities = Array.isArray(value?.capabilities)
     ? value.capabilities.filter(entry => typeof entry === 'string') : []
-  const missing = EXPECTED_GATE_CAPABILITIES.filter(capability => !capabilities.includes(capability))
-  if (value?.schemaVersion !== 1 || value?.gateProtocolVersion !== 1
-    || value?.pluginName !== '@dsh-gate/supervisor-tools'
-    || value?.pluginVersion !== EXPECTED_GATE_PLUGIN_VERSION
-    || value?.buildId !== EXPECTED_GATE_BUILD_ID
-    || value?.workerProtocolVersion !== 2 || missing.length > 0) {
-    throw new Error(`incompatible supervisor descriptor${missing.length === 0 ? '' : `; missing capabilities: ${missing.join(', ')}`}`)
-  }
+  const compatibilityError = gateDescriptorCompatibilityError({ ...value, capabilities })
+  if (compatibilityError !== undefined) throw new Error(compatibilityError)
   return value
 }
 
@@ -731,13 +730,10 @@ export async function runDoctor({ paths, io, live = false, hostUrl = DEFAULT_HOS
       } catch (error) {
         return { ok: false, detail: `no live Host at ${hostUrl}: ${error instanceof Error ? error.message : String(error)}` }
       }
-      const failures = []
-      if (value.protocolVersion !== 1) failures.push(`protocolVersion ${String(value.protocolVersion)} (expected 1)`)
-      if (typeof value.hostInstanceId !== 'string' || value.hostInstanceId === '') failures.push('hostInstanceId missing')
-      if (isPlaceholderVersion(value.version)) failures.push(`version ${JSON.stringify(value.version)} is a placeholder`)
-      return failures.length === 0
+      const compatibilityError = dshHostCompatibilityError(value)
+      return compatibilityError === undefined
         ? { ok: true, detail: `protocolVersion 1; hostInstanceId ${value.hostInstanceId}; version ${value.version}` }
-        : { ok: false, detail: failures.join('; ') }
+        : { ok: false, detail: compatibilityError }
     })
     add('live supervisor plugin', async () => {
       try {
@@ -896,6 +892,21 @@ export function hostStartPidDecision(pidState, hostReachable) {
 export async function describeHost({ hostUrl, io, timeoutMs = 5000, token }) {
   const value = await checkLiveHost({ url: hostUrl, io, timeoutMs, token })
   return value
+}
+
+/**
+ * Prove that an HTTP service owns the configured Host origin without assuming
+ * that this deployment's bearer credential is valid for it. Any HTTP response
+ * counts as reachable; authentication failures are deliberately distinct from
+ * connection failures so a foreign/older DSH Host cannot be reported as absent.
+ */
+export async function probeHostOrigin({ hostUrl, io, timeoutMs = 2000 }) {
+  const response = await io.fetch(`${hostUrl.replace(/\/+$/, '')}/`, {
+    method: 'GET',
+    redirect: 'manual',
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  return { status: response.status }
 }
 
 /** Build the argv used to launch the detached Host process. */

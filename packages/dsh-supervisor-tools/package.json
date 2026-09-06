@@ -25,6 +25,8 @@
   "files": [
     "dist",
     "cordis.patch.yml",
+    "compatibility.mjs",
+    "compatibility.d.mts",
     "build-identity.mjs",
     "build-identity.d.mts"
   ],

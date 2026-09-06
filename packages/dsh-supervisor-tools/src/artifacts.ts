@@ -37,6 +37,28 @@ function isContained(root: string, target: string): boolean {
   return suffix === '' || (!suffix.startsWith('..') && !isAbsolute(suffix))
 }
 
+function artifactPathSegments(artifactPath: string): string[] {
+  if (artifactPath.includes('\u0000')) throw new Error('artifact path must not contain NUL')
+  if (artifactPath.includes('\\')) throw new Error(`artifact path must use forward slashes: ${artifactPath}`)
+  const segments = artifactPath.split('/')
+  if (segments.includes('..')) throw new Error(`artifact path must not contain .. segments: ${artifactPath}`)
+  return segments.filter(segment => segment !== '' && segment !== '.')
+}
+
+async function assertNoSymbolicPathComponents(
+  workspace: string,
+  segments: readonly string[],
+  artifactPath: string,
+): Promise<void> {
+  let current = workspace
+  for (const segment of segments) {
+    current = resolve(current, segment)
+    if ((await lstat(current)).isSymbolicLink()) {
+      throw new Error(`artifact path must not contain a symbolic link: ${artifactPath}`)
+    }
+  }
+}
+
 /**
  * Validate and hash one worker-reported artifact inside its session cwd.
  *
@@ -54,13 +76,17 @@ export async function admitArtifact(
   if (workspaceCwd === undefined) throw new Error('artifact admission requires a session cwd')
   if (isAbsolute(artifactPath)) throw new Error(`artifact path must be relative: ${artifactPath}`)
   if (artifactPath.trim() === '') throw new Error('artifact path must not be blank')
+  const segments = artifactPathSegments(artifactPath)
+  if (segments.length === 0) throw new Error('artifact path must name a file')
 
   const workspace = await realpath(workspaceCwd)
   const lexicalTarget = resolve(workspace, artifactPath)
   if (!isContained(workspace, lexicalTarget)) {
     throw new Error(`artifact path escapes the session cwd: ${artifactPath}`)
   }
-  // Conservative policy: the reported artifact path itself must not be a symlink.
+  // Conservative policy: no reported path component may be a symlink, even if
+  // it resolves to another location inside the workspace.
+  await assertNoSymbolicPathComponents(workspace, segments, artifactPath)
   const lexicalEntry = await lstat(lexicalTarget)
   if (lexicalEntry.isSymbolicLink()) throw new Error(`artifact must not be a symbolic link: ${artifactPath}`)
   const resolvedTarget = await realpath(lexicalTarget)
@@ -79,6 +105,7 @@ export async function admitArtifact(
     // held by the fd. This closes the intermediate-directory swap window that
     // O_NOFOLLOW alone cannot cover: either the post-open realpath escapes, or
     // its dev/ino differs from the already-open file and admission fails.
+    await assertNoSymbolicPathComponents(workspace, segments, artifactPath)
     const stableTarget = await realpath(lexicalTarget)
     if (!isContained(workspace, stableTarget)) {
       throw new Error(`artifact resolves outside the session cwd: ${artifactPath}`)

@@ -190,7 +190,7 @@ export class FakeApi {
       describe: async (): Promise<{ result: { ok: true; value: HostDescription } }> => this.ok({
         protocolVersion: 1,
         hostInstanceId: 'host-1',
-        version: '0.1.0-rc.8',
+        version: '0.1.1-rc.2',
         cwd: '/tmp',
         attachedSessions: 0,
         home: '/tmp',
@@ -405,6 +405,7 @@ export class FakeApi {
     const sampledTokens = uncachedInputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
     if (minimumUsedTokens > sampledTokens) uncachedInputTokens += minimumUsedTokens - sampledTokens
     const usedTokens = uncachedInputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+    const overshootTokens = Math.max(0, usedTokens - limitTokens)
     return {
       schemaVersion: 1,
       sessionId: request.sessionId,
@@ -413,6 +414,8 @@ export class FakeApi {
       usedTokens,
       remainingTokens: Math.max(0, limitTokens - usedTokens),
       exhausted: usedTokens >= limitTokens,
+      status: overshootTokens > 0 ? 'OVERSHOT' : usedTokens === limitTokens ? 'EXHAUSTED' : 'ACTIVE',
+      overshootTokens,
       sessions: related.size,
       uncachedInputTokens,
       outputTokens,

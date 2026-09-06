@@ -21,6 +21,7 @@ async function repository(): Promise<string> {
   await writeFile(join(root, 'src', 'app.ts'), 'export const value = 1\n')
   await writeFile(join(root, 'docs', 'guide.md'), '# guide\n')
   await writeFile(join(root, 'preexisting.txt'), 'user change baseline\n')
+  await writeFile(join(root, '.gitignore'), '.dsh-handoff/\n')
   await git(root, ['add', '.'])
   await git(root, ['commit', '--quiet', '-m', 'baseline'])
   return root
@@ -94,6 +95,76 @@ describe('Host Git baseline store', () => {
       await expect(store.capture({
         sessionId: 'session-4', runId: 'run-4', cwd: root, allowedScope: ['docs'],
       })).rejects.toThrow('identity changed across admission retry')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(ledger, { recursive: true, force: true })
+    }
+  })
+
+  it('exempts only admitted files in the exact run handoff directory from writer scope', async () => {
+    const root = await repository()
+    const ledger = await mkdtemp(join(tmpdir(), 'dsh-gate-git-ledger-'))
+    try {
+      const runId = 'run-5'
+      const reportDirectory = join(root, '.dsh-handoff', runId)
+      const otherRunDirectory = join(root, '.dsh-handoff', 'other-run')
+      await mkdir(reportDirectory, { recursive: true })
+      await mkdir(otherRunDirectory, { recursive: true })
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-5', runId, cwd: root, allowedScope: ['src'] })
+
+      await writeFile(join(reportDirectory, 'report.md'), '# detailed report\n')
+      await writeFile(join(reportDirectory, 'unlisted.md'), '# not admitted\n')
+      await writeFile(join(otherRunDirectory, 'report.md'), '# another run\n')
+      await writeFile(join(root, 'docs', 'guide.md'), '# unrelated edit\n')
+
+      const verified = await store.verify({
+        sessionId: 'session-5',
+        runId,
+        cwd: root,
+        admittedHandoffArtifactPaths: [
+          `.dsh-handoff/${runId}/report.md`,
+          '.dsh-handoff/other-run/report.md',
+          'docs/guide.md',
+        ],
+      })
+      expect(verified.changedPaths).toEqual([
+        '.dsh-handoff/other-run/report.md',
+        `.dsh-handoff/${runId}/report.md`,
+        `.dsh-handoff/${runId}/unlisted.md`,
+        'docs/guide.md',
+      ])
+      expect(verified.outOfScopePaths).toEqual([
+        '.dsh-handoff/other-run/report.md',
+        `.dsh-handoff/${runId}/unlisted.md`,
+        'docs/guide.md',
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(ledger, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves ignored handoff files present at admission but detects later modification', async () => {
+    const root = await repository()
+    const ledger = await mkdtemp(join(tmpdir(), 'dsh-gate-git-ledger-'))
+    try {
+      const reportDirectory = join(root, '.dsh-handoff', 'old-run')
+      await mkdir(reportDirectory, { recursive: true })
+      const report = join(reportDirectory, 'report.md')
+      await writeFile(report, '# user-owned baseline report\n')
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-6', runId: 'run-6', cwd: root, allowedScope: ['src'] })
+
+      await expect(store.verify({ sessionId: 'session-6', runId: 'run-6', cwd: root }))
+        .resolves.toMatchObject({ changedPaths: [], outOfScopePaths: [] })
+
+      await writeFile(report, '# modified during task\n')
+      await expect(store.verify({ sessionId: 'session-6', runId: 'run-6', cwd: root }))
+        .resolves.toMatchObject({
+          changedPaths: ['.dsh-handoff/old-run/report.md'],
+          outOfScopePaths: ['.dsh-handoff/old-run/report.md'],
+        })
     } finally {
       await rm(root, { recursive: true, force: true })
       await rm(ledger, { recursive: true, force: true })

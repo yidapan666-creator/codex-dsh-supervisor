@@ -50,6 +50,8 @@ export interface RunRecord {
     observedTokens: number
     remainingTokens: number
     exhausted: boolean
+    status: 'ACTIVE' | 'EXHAUSTED' | 'REQUEST_REJECTED' | 'OVERSHOT'
+    overshootTokens: number
     coverage: 'root_session' | 'run_tree'
     enforcement: 'DSH_HOST_RUNTIME'
   }

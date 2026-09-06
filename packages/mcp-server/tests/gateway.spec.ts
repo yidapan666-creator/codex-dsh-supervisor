@@ -10,7 +10,7 @@ import {
 } from '../src/gateway.js'
 import { parseTaskPacket } from '../src/fold.js'
 import { EXPECTED_GATE_BUILD_ID, HostConnection } from '../src/host.js'
-import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
+import { TASK_PACKET_END, TASK_PACKET_START, taskAdmissionReceiptSchema, type DshEvent } from '../src/contracts.js'
 import { FakeApi } from './host.fake.js'
 import type { RunJournal, RunRecord } from '@dsh-gate/run-journal'
 import { decisionPolicyDigest, DEFAULT_DECISION_POLICY } from '@dsh-gate/decision-policy'
@@ -209,16 +209,23 @@ describe('session cwd validation', () => {
   })
 
   it('requires cwd for creation and sends its canonical path to the Host', async () => {
-    let createdCwd: string | undefined
+    let adoptedPath: string | undefined
+    let createdWorkspaceId: string | undefined
     let createdPreset: string | undefined
     const connection = {
       baseUrl: 'http://host',
-      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.1-rc.2' }),
       ensureGateReady: gateReady,
       api: {
+        workspace: {
+          create: async (input: { path: string }) => {
+            adoptedPath = input.path
+            return { result: { ok: true, value: { workspace: { workspaceId: 'w-project', title: 'project' }, created: true } } }
+          },
+        },
         sessions: {
-          create: async (input: { cwd: string; agentPreset: string }) => {
-            createdCwd = input.cwd
+          create: async (input: { workspaceId: string; agentPreset: string }) => {
+            createdWorkspaceId = input.workspaceId
             createdPreset = input.agentPreset
             return { result: { ok: true, value: { sessionId: 's-new' } } }
           },
@@ -234,9 +241,11 @@ describe('session cwd validation', () => {
     await expect(manager.startOrConnect({})).rejects.toThrow(/cwd is required/)
     await expect(manager.startOrConnect({ cwd: '/alias/project' })).resolves.toMatchObject({
       sessionId: 's-new', cwd: '/canonical/project', agentPreset: 'standard',
+      workspaceId: 'w-project', workspaceTitle: 'project',
       browserUrl: `http://host#dsh_token=${'t'.repeat(32)}`,
     })
-    expect(createdCwd).toBe('/canonical/project')
+    expect(adoptedPath).toBe('/canonical/project')
+    expect(createdWorkspaceId).toBe('w-project')
     expect(createdPreset).toBe('standard')
   })
 
@@ -244,12 +253,15 @@ describe('session cwd validation', () => {
     let createdPreset: string | undefined
     const connection = {
       baseUrl: 'http://host',
-      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.1-rc.2' }),
       ensureGateReady: gateReady,
-      api: { sessions: { create: async (input: { agentPreset: string }) => {
-        createdPreset = input.agentPreset
-        return { result: { ok: true, value: { sessionId: 's-ptc' } } }
-      } } },
+      api: {
+        workspace: { create: async () => ({ result: { ok: true, value: { workspace: { workspaceId: 'w-ptc', title: 'work' }, created: false } } }) },
+        sessions: { create: async (input: { agentPreset: string }) => {
+          createdPreset = input.agentPreset
+          return { result: { ok: true, value: { sessionId: 's-ptc' } } }
+        } },
+      },
       refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
     } as unknown as HostConnection
     const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
@@ -266,7 +278,7 @@ describe('session cwd validation', () => {
   it('rejects presets that cannot preserve the strict supervision boundary', async () => {
     const connection = {
       baseUrl: 'http://host',
-      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.1-rc.2' }),
       ensureGateReady: gateReady,
     } as unknown as HostConnection
     const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
@@ -283,7 +295,7 @@ describe('session cwd validation', () => {
   it('rejects a reconnect request that names a different cwd', async () => {
     const connection = {
       baseUrl: 'http://host',
-      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.1-rc.2' }),
       ensureGateReady: gateReady,
       sessionExists: async () => true,
       refreshSession: async () => ({ cwd: '/existing/project', agentPreset: 'standard' }),
@@ -301,7 +313,7 @@ describe('session cwd validation', () => {
   it('rejects reconnecting an existing session under a different requested preset', async () => {
     const connection = {
       baseUrl: 'http://host',
-      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }),
+      ensureConnected: async () => ({ protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.1-rc.2' }),
       ensureGateReady: gateReady,
       sessionExists: async () => true,
       refreshSession: async () => ({ cwd: '/work', agentPreset: 'code' }),
@@ -990,6 +1002,7 @@ describe('Web-visible task identity', () => {
     expect(result).toMatchObject({
       executionBrief: { source: 'CODEX_COMPILED', workstreamCount: 2, workstreamIds: ['AUTH', 'RECOVERY'] },
     })
+    expect(() => taskAdmissionReceiptSchema.parse(result)).not.toThrow()
     expect(parseTaskPacket(api.rows.get('s1')?.events ?? [])).toMatchObject({
       executionBrief: {
         schemaVersion: 1, source: 'CODEX_COMPILED',
@@ -1146,6 +1159,25 @@ describe('multi-Host reconnect', () => {
     })
   })
 
+  it('fails durable run discovery closed when the supervisor descriptor is incompatible', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work/good' })
+    let descriptorCalls = 0
+    const manager = new GatewayManager({ hostUrls: ['http://host'], runJournal: false }, {
+      createConnection: () => {
+        const connection = connected(api)
+        connection.ensureGateReady = async () => {
+          descriptorCalls++
+          throw new Error('synthetic incompatible supervisor descriptor')
+        }
+        return connection
+      },
+    })
+
+    await expect(manager.runs(false)).rejects.toThrow(/incompatible supervisor descriptor/)
+    expect(descriptorCalls).toBe(1)
+  })
+
   it('keeps a run discoverable when its budget projection endpoint is temporarily unavailable', async () => {
     const api = new FakeApi()
     api.addRow('s1', { cwd: '/work/good' })
@@ -1221,10 +1253,13 @@ describe('Host launch coalescing', () => {
           throw new Error('Host offline')
         }
         await hostMayBecomeReady
-        return { protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.0-rc.8' }
+        return { protocolVersion: 1, hostInstanceId: 'host-1', version: '0.1.1-rc.2' }
       },
       ensureGateReady: gateReady,
       api: {
+        workspace: {
+          create: async () => ({ result: { ok: true, value: { workspace: { workspaceId: 'w-work', title: 'tree' }, created: false } } }),
+        },
         sessions: {
           create: async () => ({ result: { ok: true, value: { sessionId: `s-${++nextSession}` } } }),
         },
@@ -1335,6 +1370,24 @@ function s1V2CompletedEvents(): DshEvent[] {
 }
 
 describe('wait cadence', () => {
+  it('keeps wait, recover, and durable run discovery consistent when an accepted handoff is followed by interruption', async () => {
+    const events = s1V2CompletedEvents()
+    events[events.length - 1] = event('turn/end', 5, { turn: 1, reason: { kind: 'interrupted' } })
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'FAILED', failure: { kind: 'HOST_FAILED' }, recovery: { kind: 'CONTINUATION_REQUIRED' },
+    })
+    await expect(manager.recover({ sessionId: 's1', runId: v2RunId })).resolves.toMatchObject({
+      status: 'FAILED', failure: { kind: 'HOST_FAILED' }, recovery: { kind: 'CONTINUATION_REQUIRED' },
+    })
+    await expect(manager.runs()).resolves.toMatchObject({
+      entries: [{ sessionId: 's1', runId: v2RunId, status: 'FAILED' }],
+    })
+  })
+
   it('defaults the wait window to the five-minute aggregated cadence', () => {
     expect(DEFAULT_WAIT_TIMEOUT_MS).toBe(300_000)
   })

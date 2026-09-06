@@ -20,6 +20,11 @@ import {
   TaskAdmissionCoordinator,
   type TaskAdmissionRuntime,
 } from './admission.js'
+import {
+  EXPECTED_GATE_CAPABILITIES,
+  EXPECTED_GATE_PLUGIN_VERSION,
+  EXPECTED_GATE_PROTOCOL_VERSION,
+} from '../compatibility.mjs'
 
 export { admitArtifact, admitArtifacts, type ArtifactManifestEntry } from './artifacts.js'
 export {
@@ -62,19 +67,9 @@ export {
 
 export const name = 'dsh-gate-supervisor-tools'
 export const DSH_GATE_DESCRIPTOR_PATH = '/api/dsh-gate.describe'
-export const DSH_GATE_PROTOCOL_VERSION = 1
-export const DSH_GATE_PLUGIN_VERSION = '0.1.0'
-export const DSH_GATE_CAPABILITIES = [
-  'idempotent-admission-v1',
-  'durable-before-execute-v1',
-  'recovery-capsule-v1',
-  'run-tree-token-budget-v1',
-  'crash-durable-token-reservations-v1',
-  'host-git-baseline-v1',
-  'direct-child-authority-v1',
-  'strict-handoff-v1',
-  'bearer-auth-v1',
-] as const
+export const DSH_GATE_PROTOCOL_VERSION = EXPECTED_GATE_PROTOCOL_VERSION
+export const DSH_GATE_PLUGIN_VERSION = EXPECTED_GATE_PLUGIN_VERSION
+export const DSH_GATE_CAPABILITIES = EXPECTED_GATE_CAPABILITIES
 export const inject = [
   'tools', 'systemPrompt', 'tokenMeter', 'agents', 'sessions', 'sessionPersistence', 'apiProxy', 'webServer',
   'sandboxPolicy', 'approval',
@@ -123,6 +118,29 @@ export const SUPERVISOR_PROGRESS_MIN_INTERVAL_MS = 60_000
 export const WORKSPACE_CHANGES_FILES_LIMIT = 16
 export const WORKSPACE_CHANGE_PATH_LIMIT = 200
 export const TOKEN_BUDGET_STATE_PATH = '/api/dsh-gate.budget-state'
+export const WEB_AUTH_GUARD_ID = 'dsh-gate-auth-guard'
+
+export type WebAuthGuardInjection =
+  | { kind: 'script'; placement: 'head' | 'body'; text: string }
+  | { kind: 'style'; text: string }
+  | { kind: 'html'; placement: 'head' | 'body'; html: string }
+
+/**
+ * Make a missing or rejected Web credential fail visibly. The DSH client reads
+ * its credential from the URL fragment, so the unauthenticated index itself is
+ * intentionally public; without this guard an API 401 is indistinguishable in
+ * the current UI from a genuinely empty Host.
+ */
+export function webAuthGuardInjections(): WebAuthGuardInjection[] {
+  const style = `#${WEB_AUTH_GUARD_ID}{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:#0d1117;color:#f0f6fc;font:16px/1.5 system-ui,sans-serif;padding:24px}#${WEB_AUTH_GUARD_ID}[hidden]{display:none}#${WEB_AUTH_GUARD_ID}>div{max-width:680px;padding:24px;border:1px solid #30363d;border-radius:12px;background:#161b22}#${WEB_AUTH_GUARD_ID} strong{display:block;margin-bottom:8px;font-size:20px}`
+  const html = `<div id="${WEB_AUTH_GUARD_ID}" role="alert"><div><strong>Checking DSH Web access…</strong><span>Verifying this Host and browser credential.</span></div></div>`
+  const script = `(()=>{const id=${JSON.stringify(WEB_AUTH_GUARD_ID)};const show=(title,detail)=>{const el=document.getElementById(id);if(!el)return;el.hidden=false;el.querySelector('strong').textContent=title;el.querySelector('span').textContent=detail};const hide=()=>{const el=document.getElementById(id);if(el)el.hidden=true};const verify=async()=>{const token=new URLSearchParams(location.hash.slice(1)).get('dsh_token');if(!token){show('DSH Web authentication required','This URL cannot show Host sessions. Reopen the exact browserUrl returned by dsh_start_or_connect; do not replace its port or remove its fragment.');return}try{const response=await fetch(${JSON.stringify(DSH_GATE_DESCRIPTOR_PATH)},{headers:{authorization:'Bearer '+token},cache:'no-store'});if(!response.ok){show('DSH Web credential rejected','This browserUrl belongs to another Host or an expired deployment. Reconnect through dsh_start_or_connect instead of treating the session list as empty.');return}hide()}catch{show('DSH Host connection failed','The Web page loaded but the Host API could not be reached. Check the exact Host address and reconnect; do not dispatch a duplicate task.')}};if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>{void verify()},{once:true});else void verify()})()`
+  return [
+    { kind: 'style', text: style },
+    { kind: 'html', placement: 'body', html },
+    { kind: 'script', placement: 'head', text: script },
+  ]
+}
 
 export interface WorkspaceChangesEvidence {
   source: 'HOST_GIT_BASELINE'
@@ -423,6 +441,7 @@ interface SupervisorRuntimeContext {
       next: () => Promise<PromptAssembly>,
     ) => Promise<PromptAssembly>,
   ): void
+  on(name: 'webserver/index-inject', listener: (table: WebAuthGuardInjection[]) => void): void
   apiProxy: TaskAdmissionRuntime['apiProxy']
   sandboxPolicy: { defaultMode: 'read-only' | 'workspace-write' | 'danger-full-access' }
   approval: { config: { policy?: 'ask' | 'never' } }
@@ -506,12 +525,16 @@ interface TokenBuckets {
   cacheWriteTokens: number
 }
 
+export type TokenBudgetStatus = 'ACTIVE' | 'EXHAUSTED' | 'OVERSHOT'
+
 export interface TokenBudgetState extends TokenBuckets {
   runId: string
   limitTokens: number
   usedTokens: number
   remainingTokens: number
   exhausted: boolean
+  status: TokenBudgetStatus
+  overshootTokens: number
   sessions: number
 }
 
@@ -696,6 +719,7 @@ function budgetFromBuckets(
 ): TokenBudgetState {
   const usedTokens = buckets.uncachedInputTokens + buckets.outputTokens
     + buckets.cacheReadTokens + buckets.cacheWriteTokens
+  const overshootTokens = Math.max(0, usedTokens - limitTokens)
   return {
     ...buckets,
     runId,
@@ -703,6 +727,8 @@ function budgetFromBuckets(
     usedTokens,
     remainingTokens: Math.max(0, limitTokens - usedTokens),
     exhausted: usedTokens >= limitTokens,
+    status: overshootTokens > 0 ? 'OVERSHOT' : usedTokens === limitTokens ? 'EXHAUSTED' : 'ACTIVE',
+    overshootTokens,
     sessions,
   }
 }
@@ -1434,6 +1460,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     recovery,
     gitBaselines,
   )
+  runtime.on('webserver/index-inject', (table) => {
+    table.push(...webAuthGuardInjections())
+  })
   ctx.effect(() => registerTaskAdmissionRoute(
     runtime.webServer,
     admission,
@@ -1674,6 +1703,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       const payloadError = handoffPayloadError(args)
       if (payloadError !== undefined) throw new Error(payloadError)
       const identity = latestTaskIdentity(exec.agent.session.events)
+      const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       let gitValidation
       if (identity?.writerMode === 'writer') {
         if (exec.agent.session.header.cwd === undefined) {
@@ -1683,12 +1713,12 @@ export function apply(ctx: Context, config: Config = {}): void {
           sessionId: identity.sessionId,
           runId: identity.runId ?? args.runId ?? '',
           cwd: exec.agent.session.header.cwd,
+          admittedHandoffArtifactPaths: artifacts.map(artifact => artifact.path),
         })
         if (gitValidation.outOfScopePaths.length > 0) {
           throw new Error(`supervisor_handoff found out-of-scope writer changes: ${gitValidation.outOfScopePaths.join(', ')}`)
         }
       }
-      const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       const handoff = {
         ...args.taskId === undefined ? {} : { taskId: args.taskId },
         ...args.sessionId === undefined ? {} : { sessionId: args.sessionId },

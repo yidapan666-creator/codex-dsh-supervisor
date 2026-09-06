@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { link, lstat, mkdir, open, readFile, readlink, realpath, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, open, readFile, readdir, readlink, realpath, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 
@@ -31,7 +31,13 @@ export interface GitBaselineVerification {
 
 export interface GitBaselineStore {
   capture(input: { sessionId: string; runId: string; cwd: string; allowedScope?: unknown }): Promise<GitBaselineRecord>
-  verify(input: { sessionId: string; runId: string; cwd: string }): Promise<GitBaselineVerification>
+  verify(input: {
+    sessionId: string
+    runId: string
+    cwd: string
+    /** Exact workspace-relative paths already admitted as safe handoff artifacts. */
+    admittedHandoffArtifactPaths?: readonly string[]
+  }): Promise<GitBaselineVerification>
 }
 
 function baselineFileName(sessionId: string, runId: string): string {
@@ -63,12 +69,67 @@ async function gitPaths(cwd: string, args: string[]): Promise<string[]> {
   return output.toString('utf8').split('\u0000').filter(path => path.length > 0)
 }
 
-async function dirtyPaths(gitRoot: string): Promise<string[]> {
+async function gitDirtyPaths(gitRoot: string): Promise<string[]> {
   const [tracked, untracked] = await Promise.all([
     gitPaths(gitRoot, ['diff', '--name-only', '-z', 'HEAD', '--']),
     gitPaths(gitRoot, ['ls-files', '--others', '--exclude-standard', '-z', '--']),
   ])
   return [...new Set([...tracked, ...untracked])].sort()
+}
+
+const HANDOFF_TREE_MAX_ENTRIES = 10_000
+const HANDOFF_TREE_MAX_BYTES = 256 * 1024 * 1024
+
+/**
+ * Enumerate the session handoff tree independently of Git. The repository may
+ * intentionally ignore `.dsh-handoff/`; Git status therefore cannot be the
+ * security boundary for deciding whether an unlisted artifact was created.
+ */
+async function handoffTreePaths(gitRoot: string, cwd: string): Promise<string[]> {
+  const cwdPrefix = pathFromGitRoot(gitRoot, cwd)
+  const rootRelative = [cwdPrefix, '.dsh-handoff'].filter(Boolean).join('/')
+  const root = join(cwd, '.dsh-handoff')
+  let entries = 0
+  let bytes = 0
+  const paths: string[] = []
+
+  async function walk(absolute: string, relativePath: string): Promise<void> {
+    let info
+    try {
+      info = await lstat(absolute)
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return
+      throw error
+    }
+    if (info.isSymbolicLink()) {
+      throw new Error(`Host handoff tree must not contain symbolic links: ${relativePath}`)
+    }
+    if (!info.isDirectory()) {
+      entries++
+      bytes += info.isFile() ? info.size : 0
+      if (entries > HANDOFF_TREE_MAX_ENTRIES || bytes > HANDOFF_TREE_MAX_BYTES) {
+        throw new Error('Host handoff tree exceeds the bounded baseline scan limit')
+      }
+      paths.push(relativePath)
+      return
+    }
+    const children = await readdir(absolute, { withFileTypes: true })
+    for (const child of children) {
+      const childRelative = `${relativePath}/${child.name}`
+      await walk(join(absolute, child.name), childRelative)
+    }
+  }
+
+  await walk(root, rootRelative)
+  return paths.sort()
+}
+
+async function observablePaths(gitRoot: string, cwd: string): Promise<string[]> {
+  const [dirty, handoff] = await Promise.all([
+    gitDirtyPaths(gitRoot),
+    handoffTreePaths(gitRoot, cwd),
+  ])
+  return [...new Set([...dirty, ...handoff])].sort()
 }
 
 async function hashFile(path: string): Promise<string> {
@@ -129,6 +190,22 @@ function normalizeAllowedScope(cwdPrefix: string, value: unknown): string[] {
 
 function within(path: string, prefix: string): boolean {
   return prefix === '' || path === prefix || path.startsWith(`${prefix}/`)
+}
+
+function admittedHandoffArtifactSet(
+  cwdPrefix: string,
+  runId: string,
+  paths: readonly string[] | undefined,
+): ReadonlySet<string> {
+  if (paths === undefined || !/^[A-Za-z0-9_-]+$/.test(runId)) return new Set()
+  const handoffPrefix = `.dsh-handoff/${runId}/`
+  return new Set(paths.flatMap((entry) => {
+    const raw = entry.trim().replaceAll('\\', '/')
+    if (raw === '' || raw.includes('\u0000') || posix.isAbsolute(raw)) return []
+    const normalized = posix.normalize(raw).replace(/^\.\//, '')
+    if (!normalized.startsWith(handoffPrefix)) return []
+    return [[cwdPrefix, normalized].filter(Boolean).join('/')]
+  }))
 }
 
 function parseRecord(text: string): GitBaselineRecord {
@@ -196,7 +273,7 @@ export class FileGitBaselineStore implements GitBaselineStore {
       return existing
     }
     const head = await gitText(gitRoot, ['rev-parse', 'HEAD'])
-    const paths = await dirtyPaths(gitRoot)
+    const paths = await observablePaths(gitRoot, cwd)
     const dirty = await Promise.all(paths.map(async path => ({ path, fingerprint: await pathFingerprint(gitRoot, path) })))
     const record: GitBaselineRecord = {
       schemaVersion: 1,
@@ -233,7 +310,12 @@ export class FileGitBaselineStore implements GitBaselineStore {
     return record
   }
 
-  async verify(input: { sessionId: string; runId: string; cwd: string }): Promise<GitBaselineVerification> {
+  async verify(input: {
+    sessionId: string
+    runId: string
+    cwd: string
+    admittedHandoffArtifactPaths?: readonly string[]
+  }): Promise<GitBaselineVerification> {
     const baseline = await this.read(input.sessionId, input.runId)
     if (baseline === undefined) throw new Error(`missing Host Git baseline for run ${input.runId}`)
     if (baseline.sessionId !== input.sessionId || baseline.runId !== input.runId) {
@@ -241,7 +323,7 @@ export class FileGitBaselineStore implements GitBaselineStore {
     }
     if (baseline.cwd !== await realpath(input.cwd)) throw new Error('session cwd no longer matches its Host Git baseline')
     const headAfter = await gitText(baseline.gitRoot, ['rev-parse', 'HEAD'])
-    const currentDirty = await dirtyPaths(baseline.gitRoot)
+    const currentDirty = await observablePaths(baseline.gitRoot, baseline.cwd)
     const committed = headAfter === baseline.head
       ? []
       : await gitPaths(baseline.gitRoot, ['diff', '--name-only', '-z', `${baseline.head}..${headAfter}`, '--'])
@@ -255,7 +337,11 @@ export class FileGitBaselineStore implements GitBaselineStore {
       }
       if (await pathFingerprint(baseline.gitRoot, path) !== baselineDirty.get(path)) changedPaths.push(path)
     }
-    const outOfScopePaths = changedPaths.filter(path => !baseline.allowedPrefixes.some(prefix => within(path, prefix)))
+    const admittedArtifacts = admittedHandoffArtifactSet(
+      pathFromGitRoot(baseline.gitRoot, baseline.cwd), input.runId, input.admittedHandoffArtifactPaths,
+    )
+    const outOfScopePaths = changedPaths.filter(path => !admittedArtifacts.has(path)
+      && !baseline.allowedPrefixes.some(prefix => within(path, prefix)))
     return { headBefore: baseline.head, headAfter, changedPaths, outOfScopePaths }
   }
 }

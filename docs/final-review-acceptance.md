@@ -49,6 +49,27 @@ blocks sign-off; do not waive it with a prose explanation.
 Acceptance: one durable Root session survives MCP/Codex replacement; separate
 executions remain distinguishable by `runId`.
 
+### 2a. Web observability and workspace identity — mandatory
+
+1. Keep two different local DSH Hosts reachable on different ports and prove
+   that `host status` distinguishes the managed Host from the occupied foreign
+   origin instead of reporting either one as empty or absent.
+2. Open the managed Host without the `browserUrl` credential fragment. Confirm
+   that the dsh-gate authentication guard blocks the misleading empty-session
+   view and explains how to reconnect.
+3. Create a session through `dsh_start_or_connect(cwd=...)`. Confirm that the
+   gateway idempotently adopts that canonical cwd as a DSH workspace, creates
+   the session with the returned `workspaceId`, and returns its title.
+4. Open the exact returned `browserUrl`; confirm that the workspace and current
+   session/objective are visible in the sidebar and that Chat/Trajectory show
+   the live execution records.
+5. Restart the Host while idle, reopen the same authenticated URL, and confirm
+   that the historical session remains visible under the same workspace.
+
+Acceptance: wrong origin, missing credentials, missing workspace membership,
+and genuine empty state are distinguishable; Web visibility is verified rather
+than inferred from a successful API receipt.
+
 ### 3. Host lifecycle independence — mandatory
 
 1. Start a supervised run and record the Host PID/instance identity.
@@ -133,13 +154,15 @@ claimed DSH server resume cursor.
 ### 8. Workspace and artifact confinement — mandatory
 
 - Admit a regular artifact inside `.dsh-handoff/<runId>/` under the session cwd.
+- With a narrow writer `allowedScope`, confirm that the exact admitted report is accepted while an unlisted file in the same handoff directory, another run's file, or an arbitrary out-of-scope artifact remains rejected.
 - Reject absolute paths, `..` traversal, symlink escape, hardlink aliasing,
   non-regular files, and any target whose real path leaves the session cwd.
 - Confirm that the concise handoff remains bounded and references the admitted
   relative artifact path rather than copying a long report into model context.
 
 Acceptance: every admitted artifact is handle-validated and physically
-contained in the corresponding session workspace.
+contained in the corresponding session workspace; the Git-scope exemption is
+limited to the exact admitted paths in the current run's handoff directory.
 
 ### 9. Sign-off and release decision
 

@@ -80,6 +80,19 @@ describe('authoritative completion fold', () => {
     })
   })
 
+  it('does not let a valid handoff mask an abnormal corresponding turn end', () => {
+    for (const [reason, expected] of [
+      ['interrupted', { stage: 'host-restart-interrupted', kind: 'HOST_FAILED' }],
+      ['error', { stage: 'turn-ended', kind: 'WORKER_FAILED' }],
+    ] as const) {
+      const events = handoffEvents()
+      events[events.length - 1] = event('turn/end', 4, { turn: 1, reason: { kind: reason } })
+      expect(deriveObservation(state(events))).toMatchObject({
+        status: 'FAILED', stage: expected.stage, failure: { kind: expected.kind },
+      })
+    }
+  })
+
   it('folds Host Git-baseline evidence into terminal project activity', () => {
     const observed = deriveObservation(state(handoffEvents(true, {
       source: 'HOST_GIT_BASELINE',
@@ -839,10 +852,52 @@ describe('project activity summarization', () => {
       stage: 'token-budget-exhausted',
       budget: {
         limitTokens: 100, observedTokens: 130, remainingTokens: 0,
-        exhausted: true, coverage: 'run_tree', enforcement: 'DSH_HOST_RUNTIME',
+        exhausted: true, status: 'OVERSHOT', overshootTokens: 30,
+        coverage: 'run_tree', enforcement: 'DSH_HOST_RUNTIME',
       },
     })
     expect(observationSchema.safeParse(observed).success).toBe(true)
+  })
+
+  it('does not let a valid handoff mask a Host-enforced budget abort', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'bounded work',
+      writerMode: 'writer',
+      budget: { maxTokens: 100 },
+    }
+    const handoff = {
+      sessionId: packetV2.sessionId,
+      runId: packetV2.runId,
+      completionToken: packetV2.completionToken,
+      status: 'completed', stage: 'done', summary: 'worker claimed completion', files: [], verification: [], artifacts: [],
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, {
+        turn: 1, step: 1, callId: 'handoff-before-budget-stop', name: 'supervisor_handoff', arguments: JSON.stringify(handoff),
+      }),
+      event('tool/result', 3, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'handoff-before-budget-stop' }, content: [{
+          type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ accepted: true, handoff, artifacts: [] }) }],
+        }] },
+      }),
+      event('turn/end', 4, {
+        turn: 1,
+        reason: { kind: 'aborted', reason: { kind: 'hook', reason: `dsh-gate:token-budget-exhausted;runId=${packetV2.runId};used=130;limit=100` } },
+      }),
+    ]))
+    expect(observed).toMatchObject({
+      status: 'ESCALATION_REQUIRED', stage: 'token-budget-exhausted',
+      budget: { limitTokens: 100, observedTokens: 130, exhausted: true },
+    })
   })
 
   it('distinguishes a request that cannot fit from already-consumed budget exhaustion', () => {
@@ -870,7 +925,7 @@ describe('project activity summarization', () => {
       stage: 'token-budget-request-rejected',
       budget: {
         limitTokens: 8_000, observedTokens: 0, remainingTokens: 8_000,
-        exhausted: false, coverage: 'run_tree',
+        exhausted: false, status: 'REQUEST_REJECTED', overshootTokens: 0, coverage: 'run_tree',
       },
     })
     expect(observed.summary).toContain('12000 input tokens required')

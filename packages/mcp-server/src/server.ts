@@ -3,7 +3,7 @@ import { z } from 'zod'
 import {
   FAILURE_MESSAGE_LIMIT, INTERACTION_ID_LIMIT, QUESTION_COUNT_LIMIT, QUESTION_ID_LIMIT,
   QUESTION_OPTION_LABEL_LIMIT,
-  executionBriefInputSchema, observationSchema, recoveryCapsuleSchema,
+  executionBriefInputSchema, observationSchema, recoveryCapsuleSchema, taskAdmissionReceiptSchema,
 } from './contracts.js'
 import { GatewayManager, HostDiscoveryError } from './gateway.js'
 import { ProtocolContractError } from './host.js'
@@ -86,13 +86,13 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
   }, guarded(input => manager.startOrConnect(input)))
 
   server.registerTool('dsh_task', {
-    description: 'Atomically admit one supervised run into an idle durable session. Codex should compile a bounded executionBrief with 1-5 cohesive workstreams, dependency edges, child-candidate hints, per-stream done conditions, and Root integration duties; omit it only for an intentional single-stream fallback. This is one Root task, not multiple competing roots. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits the task before execution and returns the original runId without duplicating it. Start the first dsh_wait with afterAsOfSeq=initialWaitAfterAsOfSeq (the exact admission boundary); observedAsOfSeq is diagnostic only. A Host-restart continuation requires the exact dsh_recover capsule and parentRunId; missing, stale, cross-session, child-incomplete, or truncated evidence is rejected before a provider call. tokenBudget.maxTokens is enforced across the run tree with crash-durable per-request reservations. authority.maxDirectChildren is Host-enforced from durable child creations and concurrent reservations. Every later wait/control call carries sessionId + runId. Writer mode requires one Host and a Git worktree: the Host captures the actual baseline before execution, permits one writer per worktree, and rejects completed handoff if task-era changes escape workspace-relative allowedScope prefixes. Parallel writers require independent worktrees.',
+    description: 'Atomically admit one supervised run into an idle durable session. Codex should compile one executionBrief with 1-5 workstreams. Every workstream object requires id matching /^[A-Z][A-Z0-9_-]{0,15}$/, outcome, delegation, and doneWhen; optional fields are scopeHints, evidenceToGather, and dependsOn. executionBrief.integration is also required. Use exact uppercase short dependency ids and omit executionBrief only for an intentional single-stream fallback. This is one Root task, not multiple competing roots. Supply a fresh UUID requestId and reuse it after any ambiguous disconnect: the Host commits the task before execution and returns the original runId without duplicating it. A successful structured receipt includes accepted, requestId, runId, executionBrief source/ids, admissionBoundarySeq, initialWaitAfterAsOfSeq, and observedAsOfSeq. Start the first dsh_wait with afterAsOfSeq=initialWaitAfterAsOfSeq (the exact admission boundary); observedAsOfSeq is diagnostic only. A Host-restart continuation requires the exact dsh_recover capsule and parentRunId; missing, stale, cross-session, child-incomplete, or truncated evidence is rejected before a provider call. tokenBudget.maxTokens is enforced across the run tree with crash-durable per-request reservations. authority.maxDirectChildren is Host-enforced from durable child creations and concurrent reservations. Every later wait/control call carries sessionId + runId. Writer mode requires one Host and a Git worktree: the Host captures the actual baseline before execution, permits one writer per worktree, and rejects completed handoff if task-era changes escape workspace-relative allowedScope prefixes. Parallel writers require independent worktrees.',
     inputSchema: z.object({
       requestId: z.string().uuid().optional(),
       sessionId: z.string().max(512), taskId: z.string().max(512).optional(), objective: z.string().min(1).max(8_192), writerMode: z.enum(['writer', 'read_only']).optional(),
       provider: z.string().max(256).optional(), model: z.string().max(256).optional(), reasoningEffort: z.string().max(128).optional(),
       context: z.string().max(32_768).optional(),
-      executionBrief: executionBriefInputSchema.optional().describe('Codex-compiled work map. Workstream scopeHints are planning hints only; allowedScope remains the authoritative write boundary.'),
+      executionBrief: executionBriefInputSchema.optional().describe('Codex-compiled work map. Requires workstreams[].{id,outcome,delegation,doneWhen} and integration; scopeHints are planning hints only and allowedScope remains authoritative.'),
       allowedScope: z.array(z.string().max(4_096)).min(1).max(64).optional()
         .describe('Writer mode: workspace-relative path prefixes; use "." for the full session cwd. Absolute and parent-traversing paths are rejected.'),
       constraints: z.array(z.string().max(4_096)).max(64).optional(),
@@ -108,6 +108,7 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
         preAuthorizedDecisionCategories: z.array(z.enum(DECISION_CATEGORIES)).optional(),
       }).optional(),
     }),
+    outputSchema: taskAdmissionReceiptSchema,
   }, guarded(input => manager.task(input)))
 
   server.registerTool('dsh_runs', {

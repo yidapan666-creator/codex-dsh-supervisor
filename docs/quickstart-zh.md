@@ -138,7 +138,7 @@ MCP 退出不会顺带停止独立运行的 DSH Host。若 Host 本身重启并�
 ## Codex 实际执行的链路
 
 1. 记录 Git 基线，决定新建或复用 Root，并选择 Standard/PTC。
-2. 调用 `dsh_start_or_connect`，用返回的 `browserUrl` 打开已鉴权的 DSH Web；该 URL fragment 是本机凭据，不写日志、不分享，也不能当成 `hostBaseUrl` 回传。
+2. 调用 `dsh_start_or_connect`，原样使用返回的 `browserUrl` 打开已鉴权的 DSH Web，不得换成默认端口或复用另一个 Host 的页面；该 URL fragment 是本机凭据，不写日志、不分享，也不能当成 `hostBaseUrl` 回传。新 session 会自动采用 cwd 作为 DSH workspace，并返回 `workspaceId`/`workspaceTitle`。派发后必须确认当前 session/任务出现在该 workspace 侧栏；成功启动后仍显示 `No sessions yet` 代表地址或鉴权错误，不能当成空 Host，也不能重复派发。
 3. 调用 `dsh_task`，记录唯一的 `sessionId + runId`。
 4. 使用 `dsh_wait` 每五分钟取得一次聚合观察；必要时处理明确的交互或恢复。
 5. 只在严格完成条件成立后汇报完成，并给出步骤、工具、token、文件和验证总结。

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { deriveObservation } from '../src/fold.js'
-import { boundedPendingQuestion, HostConnection, needsOlderHistoryPage } from '../src/host.js'
+import { boundedPendingQuestion, HostConnection, needsOlderHistoryPage, ProtocolContractError } from '../src/host.js'
 import { TASK_PACKET_END, TASK_PACKET_START, type DshEvent } from '../src/contracts.js'
 import { FakeApi, settleFrames } from './host.fake.js'
 
@@ -46,6 +46,21 @@ describe('durable history overlap pagination', () => {
     expect(snapshot.events.at(-1)?.seq).toBe(151)
     expect(api.historyCalls - before).toBe(1)
     expect(api.historyPayloads.at(-1)?.maxMessages).toBe(200)
+  })
+})
+
+describe('Host compatibility', () => {
+  it('rejects an unpinned Host product version even when the wire protocol matches', async () => {
+    const api = new FakeApi()
+    const describe = api.api.host.describe.bind(api.api.host)
+    api.api.host.describe = async (...args: never[]) => {
+      const response = await describe(...args)
+      response.result.value.version = '999.0.0'
+      return response
+    }
+    const connection = connected(api)
+    await expect(connection.ensureConnected()).rejects.toBeInstanceOf(ProtocolContractError)
+    await expect(connection.ensureConnected()).rejects.toThrow(/Host version 999\.0\.0/)
   })
 })
 

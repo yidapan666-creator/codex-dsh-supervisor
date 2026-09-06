@@ -691,11 +691,15 @@ function base(state: TaskRuntimeState, packet: TaskPacket | undefined): Omit<Obs
         const tokens = activity.tokenUsage
         const observedTokens = tokens.uncachedInputTokens + tokens.outputTokens
           + tokens.cacheReadTokens + tokens.cacheWriteTokens
+        const overshootTokens = Math.max(0, observedTokens - packet.budget.maxTokens)
         return {
           limitTokens: packet.budget.maxTokens,
           observedTokens,
           remainingTokens: Math.max(0, packet.budget.maxTokens - observedTokens),
           exhausted: observedTokens >= packet.budget.maxTokens,
+          status: overshootTokens > 0 ? 'OVERSHOT' as const
+            : observedTokens === packet.budget.maxTokens ? 'EXHAUSTED' as const : 'ACTIVE' as const,
+          overshootTokens,
           coverage: 'root_session' as const,
           enforcement: 'DSH_HOST_RUNTIME' as const,
           overshootBound: 'IN_FLIGHT_MODEL_RESPONSES' as const,
@@ -1162,6 +1166,9 @@ function budgetTurnObservation(
       observedTokens,
       remainingTokens,
       exhausted: !requestRejected,
+      status: requestRejected ? 'REQUEST_REJECTED'
+        : observedTokens > limitTokens ? 'OVERSHOT' : 'EXHAUSTED',
+      overshootTokens: requestRejected ? 0 : Math.max(0, observedTokens - limitTokens),
       coverage: 'run_tree',
       enforcement: 'DSH_HOST_RUNTIME',
       overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
@@ -1238,15 +1245,20 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
     return { ...common, status: 'WAITING', stage: 'running', summary: 'The supervised turn has not ended.' }
   }
   if (turnEnd !== undefined) {
-    const handoff = handoffObservation(scopedState, packet, turnEnd)
-    if (handoff !== undefined) return handoff
-    const exhausted = exhaustedFailureObservation(scopedState, packet, turnEnd)
-    if (exhausted !== undefined) return exhausted
     const budget = budgetTurnObservation(scopedState, packet, turnEnd)
     if (budget !== undefined) return budget
+    const exhausted = exhaustedFailureObservation(scopedState, packet, turnEnd)
+    if (exhausted !== undefined) return exhausted
     const reason = (turnEnd.data as { reason?: { kind?: unknown } }).reason?.kind
     const missing = reason === 'completed'
     const interrupted = reason === 'interrupted'
+    // A handoff is only authoritative when the corresponding turn itself ended
+    // successfully. An earlier accepted result must never turn an interrupt,
+    // worker failure, or Host-enforced abort into a false COMPLETED state.
+    if (missing) {
+      const handoff = handoffObservation(scopedState, packet, turnEnd)
+      if (handoff !== undefined) return handoff
+    }
     return {
       ...common,
       status: 'FAILED',

@@ -498,10 +498,13 @@ export class GatewayManager {
     }
     const gateDescription = await connection.ensureGateReady()
     let sessionId = input.sessionId
+    let workspace: { workspaceId: string; title: string } | undefined
     if (sessionId === undefined) {
       if (requestedCwd === undefined) throw new Error('validated cwd is unavailable for new DSH session')
+      const adopted = unwrap(await connection.api.workspace.create({ path: requestedCwd }))
+      workspace = { workspaceId: adopted.workspace.workspaceId, title: adopted.workspace.title }
       const created = unwrap(await connection.api.sessions.create({
-        cwd: requestedCwd,
+        workspaceId: adopted.workspace.workspaceId,
         agentPreset: requestedPreset,
       }))
       sessionId = created.sessionId
@@ -540,6 +543,10 @@ export class GatewayManager {
       // Compatibility alias for v1 callers. New control calls use sessionId + runId.
       taskId: sessionId,
       cwd: requestedCwd ?? snapshot.cwd,
+      ...workspace === undefined ? {} : {
+        workspaceId: workspace.workspaceId,
+        workspaceTitle: workspace.title,
+      },
       agentPreset: effectivePreset,
       agentPresetDisplayName: effectivePreset === 'code' ? 'PTC mode' : 'Standard mode',
       reconnected: input.sessionId !== undefined,
@@ -1015,6 +1022,9 @@ export class GatewayManager {
             observedTokens,
             remainingTokens,
             exhausted: !requestRejected,
+            status: requestRejected ? 'REQUEST_REJECTED'
+              : observedTokens > limitTokens ? 'OVERSHOT' : 'EXHAUSTED',
+            overshootTokens: requestRejected ? 0 : Math.max(0, observedTokens - limitTokens),
             coverage: 'run_tree',
             enforcement: 'DSH_HOST_RUNTIME',
             overshootBound: 'IN_FLIGHT_MODEL_RESPONSES',
@@ -1118,6 +1128,8 @@ export class GatewayManager {
           observedTokens: state.usedTokens,
           remainingTokens: state.remainingTokens,
           exhausted: state.exhausted,
+          status: state.status,
+          overshootTokens: state.overshootTokens,
           coverage: state.coverage,
           enforcement: state.enforcement,
           overshootBound: state.overshootBound,
@@ -1172,6 +1184,8 @@ export class GatewayManager {
         observedTokens: observation.budget.observedTokens,
         remainingTokens: observation.budget.remainingTokens,
         exhausted: observation.budget.exhausted,
+        status: observation.budget.status,
+        overshootTokens: observation.budget.overshootTokens,
         coverage: observation.budget.coverage,
         enforcement: observation.budget.enforcement,
       } },
@@ -1210,6 +1224,7 @@ export class GatewayManager {
       const connection = this.connection(url)
       try {
         await connection.ensureConnected()
+        await connection.ensureGateReady()
         const rows = await connection.listSessions()
         reachable++
         for (const row of rows) {
@@ -1256,6 +1271,8 @@ export class GatewayManager {
                   observedTokens: budget.usedTokens,
                   remainingTokens: budget.remainingTokens,
                   exhausted: budget.exhausted,
+                  status: budget.status,
+                  overshootTokens: budget.overshootTokens,
                   coverage: budget.coverage,
                   enforcement: budget.enforcement,
                   overshootBound: budget.overshootBound,

@@ -21,6 +21,8 @@ export async function expectedBuildIdentity() {
   const files = [
     ...(await sourceFiles(join(pluginRoot, 'src'))).filter(file => file !== compiledIdentityFile),
     join(pluginRoot, 'cordis.patch.yml'),
+    join(pluginRoot, 'compatibility.mjs'),
+    join(pluginRoot, 'compatibility.d.mts'),
   ].sort((left, right) => left.localeCompare(right))
   const hash = createHash('sha256')
   for (const file of files) {

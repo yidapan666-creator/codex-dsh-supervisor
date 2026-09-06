@@ -29,6 +29,12 @@ manifest also records its release version and exact gate/DSH commits. New commit
 on `main` become available to release-based installations only after a new tag,
 GitHub Release bundle, and npm package are published.
 
+At runtime MCP and `doctor` use one shared lockstep compatibility contract. They
+require the pinned DSH Host protocol and product version, the supervisor plugin
+protocol/name/version, worker protocol, build identity, and required capability
+set to match. Session discovery fails closed on a mismatch instead of presenting
+an incompatible Host as an empty durable run list.
+
 The unrelated unscoped npm name `dsh-gate` is already owned by another
 publisher. The official package is therefore `@yidapan666/dsh-gate`, matching
 the npm account that owns the package;
