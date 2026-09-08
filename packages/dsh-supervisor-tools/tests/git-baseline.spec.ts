@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -164,6 +164,123 @@ describe('Host Git baseline store', () => {
         .resolves.toMatchObject({
           changedPaths: ['.dsh-handoff/old-run/report.md'],
           outOfScopePaths: ['.dsh-handoff/old-run/report.md'],
+        })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(ledger, { recursive: true, force: true })
+    }
+  })
+
+  it('checks both sides of staged and committed renames against writer scope', async () => {
+    const root = await repository()
+    const ledger = await mkdtemp(join(tmpdir(), 'dsh-gate-git-ledger-'))
+    try {
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-7', runId: 'run-7', cwd: root, allowedScope: ['src'] })
+
+      await git(root, ['mv', 'docs/guide.md', 'src/guide.md'])
+      await expect(store.verify({ sessionId: 'session-7', runId: 'run-7', cwd: root }))
+        .resolves.toMatchObject({
+          changedPaths: ['docs/guide.md', 'src/guide.md'],
+          outOfScopePaths: ['docs/guide.md'],
+        })
+
+      await git(root, ['commit', '--quiet', '-m', 'move guide into allowed scope'])
+      await expect(store.verify({ sessionId: 'session-7', runId: 'run-7', cwd: root }))
+        .resolves.toMatchObject({
+          changedPaths: ['docs/guide.md', 'src/guide.md'],
+          outOfScopePaths: ['docs/guide.md'],
+        })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(ledger, { recursive: true, force: true })
+    }
+  })
+
+  it('treats ordinary ignored files as scope-controlled instead of permission-exempt', async () => {
+    const root = await repository()
+    const ledger = await mkdtemp(join(tmpdir(), 'dsh-gate-git-ledger-'))
+    try {
+      await writeFile(join(root, '.gitignore'), '.dsh-handoff/\n.env.local\n')
+      await git(root, ['add', '.gitignore'])
+      await git(root, ['commit', '--quiet', '-m', 'ignore local environment'])
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-8', runId: 'run-8', cwd: root, allowedScope: ['src'] })
+
+      await writeFile(join(root, '.env.local'), 'PRIVATE_VALUE=test-only\n')
+      await expect(store.verify({ sessionId: 'session-8', runId: 'run-8', cwd: root }))
+        .resolves.toMatchObject({
+          changedPaths: ['.env.local'],
+          outOfScopePaths: ['.env.local'],
+        })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(ledger, { recursive: true, force: true })
+    }
+  })
+
+  it('detects a same-size edit to an ordinary ignored file present at admission', async () => {
+    const root = await repository()
+    const ledger = await mkdtemp(join(tmpdir(), 'dsh-gate-git-ledger-'))
+    try {
+      await writeFile(join(root, '.gitignore'), '.dsh-handoff/\n.env.local\n')
+      await git(root, ['add', '.gitignore'])
+      await git(root, ['commit', '--quiet', '-m', 'ignore local environment'])
+      await writeFile(join(root, '.env.local'), 'PRIVATE_VALUE=one\n')
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-ignored', runId: 'run-ignored', cwd: root, allowedScope: ['src'] })
+
+      await writeFile(join(root, '.env.local'), 'PRIVATE_VALUE=two\n')
+      await expect(store.verify({ sessionId: 'session-ignored', runId: 'run-ignored', cwd: root }))
+        .resolves.toMatchObject({
+          changedPaths: ['.env.local'],
+          outOfScopePaths: ['.env.local'],
+        })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(ledger, { recursive: true, force: true })
+    }
+  })
+
+  it('exempts only the explicitly configured Host runtime-state tree from ignored-file scans', async () => {
+    const root = await repository()
+    const runtimeState = join(root, '.runtime-state')
+    const ledger = join(runtimeState, 'dsh-home', 'dsh-gate', 'git-baselines')
+    const previous = process.env.DSH_GATE_RUNTIME_STATE_DIR
+    try {
+      await writeFile(join(root, '.gitignore'), '.dsh-handoff/\n.runtime-state/\n')
+      await git(root, ['add', '.gitignore'])
+      await git(root, ['commit', '--quiet', '-m', 'ignore Host runtime state'])
+      await mkdir(runtimeState, { recursive: true })
+      process.env.DSH_GATE_RUNTIME_STATE_DIR = runtimeState
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-runtime', runId: 'run-runtime', cwd: root, allowedScope: ['src'] })
+
+      await writeFile(join(runtimeState, 'host.log'), 'Host-owned state\n')
+      await expect(store.verify({ sessionId: 'session-runtime', runId: 'run-runtime', cwd: root }))
+        .resolves.toMatchObject({ changedPaths: [], outOfScopePaths: [] })
+    } finally {
+      if (previous === undefined) delete process.env.DSH_GATE_RUNTIME_STATE_DIR
+      else process.env.DSH_GATE_RUNTIME_STATE_DIR = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('detects an executable-bit change to an already dirty out-of-scope file', async () => {
+    const root = await repository()
+    const ledger = await mkdtemp(join(tmpdir(), 'dsh-gate-git-ledger-'))
+    try {
+      await git(root, ['config', 'core.filemode', 'true'])
+      await writeFile(join(root, 'docs', 'guide.md'), '# dirty before admission\n')
+      await chmod(join(root, 'docs', 'guide.md'), 0o644)
+      const store = new FileGitBaselineStore(ledger)
+      await store.capture({ sessionId: 'session-9', runId: 'run-9', cwd: root, allowedScope: ['src'] })
+
+      await chmod(join(root, 'docs', 'guide.md'), 0o755)
+      await expect(store.verify({ sessionId: 'session-9', runId: 'run-9', cwd: root }))
+        .resolves.toMatchObject({
+          changedPaths: ['docs/guide.md'],
+          outOfScopePaths: ['docs/guide.md'],
         })
     } finally {
       await rm(root, { recursive: true, force: true })

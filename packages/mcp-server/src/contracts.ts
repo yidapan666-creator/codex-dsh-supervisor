@@ -9,6 +9,10 @@ export type FailureKind = z.infer<typeof failureKindSchema>
 export const workerStateSchema = z.enum(['RUNNING', 'IDLE', 'UNKNOWN'])
 export type WorkerState = z.infer<typeof workerStateSchema>
 
+export const SUPERVISION_MODES = ['delegated', 'reviewed'] as const
+export const supervisionModeSchema = z.enum(SUPERVISION_MODES)
+export type SupervisionMode = z.infer<typeof supervisionModeSchema>
+
 export const HANDOFF_STAGE_LIMIT = 128
 export const HANDOFF_SUMMARY_LIMIT = 2_048
 export const HANDOFF_FILES_LIMIT = 64
@@ -154,13 +158,39 @@ export const decisionOutcomeSchema = z.object({
   audience: z.enum(['none', 'supervisor', 'human']),
   action: z.enum([
     'CONTINUE_WAIT', 'SURFACE_PROGRESS', 'RESOLVE_INTERACTION', 'REVIEW_WORKER_REQUEST',
-    'ASK_HUMAN', 'ACCEPT_TERMINAL', 'REVIEW_FAILURE', 'QUEUE_CONTINUATION',
+    'ASK_HUMAN', 'ACCEPT_TERMINAL', 'REVIEW_TERMINAL', 'REVIEW_FAILURE', 'QUEUE_CONTINUATION',
   ]),
   reasonCode: z.string().max(128),
   policyVersion: z.string().max(128),
   matchedRuleId: z.string().max(128),
   protocolInvariant: z.boolean(),
 }).strict()
+
+/** Locators only: these paths confer no write authority or artifact exemption. */
+export const reviewPathSchema = z.string().min(1).max(256).refine(value =>
+  !value.startsWith('/') && !value.includes('\\') && !/^[A-Za-z]:/.test(value)
+  && !/[\x00-\x1f\x7f]/.test(value) && value.split('/').every(part => part !== '' && part !== '..' && part !== '.'),
+'expected a concrete workspace-relative path')
+export const reviewWatchPathsSchema = z.array(reviewPathSchema).max(16)
+export const reviewEvidenceSchema = z.object({
+  criteria: z.array(z.object({
+    workstreamId: z.string().regex(/^[A-Z][A-Z0-9_-]{0,15}$/),
+    doneWhenIndex: z.number().int().nonnegative(),
+    status: z.enum(['met', 'unmet', 'unknown']),
+    evidence: z.string().min(1).max(256),
+  }).strict()).max(8),
+  planChanges: z.array(z.string().min(1).max(256)).max(3),
+  negativeEvidence: z.array(z.string().min(1).max(256)).max(5),
+  evidencePaths: z.array(reviewPathSchema).max(8),
+  omitted: z.object({
+    criteria: z.number().int().nonnegative(), planChanges: z.number().int().nonnegative(),
+    negativeEvidence: z.number().int().nonnegative(), evidencePaths: z.number().int().nonnegative(),
+  }).strict(),
+}).strict()
+
+export const finalReviewSchema = reviewEvidenceSchema.extend({
+  criteria: z.array(reviewEvidenceSchema.shape.criteria.element).max(40),
+})
 
 /** Bounded worker-supplied semantic context; quantitative fields stay runtime-derived. */
 export const supervisorProgressSchema = z.object({
@@ -171,6 +201,9 @@ export const supervisorProgressSchema = z.object({
   nextAction: z.string().min(1).max(512),
   currentHypothesis: z.string().max(1_024).optional(),
   risk: z.string().max(512).optional(),
+  riskLevel: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+  reviewEvidence: reviewEvidenceSchema.optional(),
+  reviewEvidenceInvalid: z.literal(true).optional(),
   needsSupervisor: z.boolean(),
   decision: workerDecisionRequestSchema.optional(),
 }).strict()
@@ -295,8 +328,14 @@ export const observationSchema = z.object({
   summary: z.string().max(2_048),
   files: z.array(z.string().max(HANDOFF_PATH_LIMIT)).max(HANDOFF_FILES_LIMIT),
   verification: z.array(verificationSchema).max(HANDOFF_VERIFICATION_LIMIT),
-  /** Independent meaning of worker-supplied verification claims; protocol completion alone is never implicit acceptance. */
+  /** Worker-supplied verification claims, never proof of Codex independent acceptance. */
+  finalReview: finalReviewSchema.optional(),
   acceptanceStatus: z.enum(['UNVERIFIED', 'PASSED', 'FAILED']).optional(),
+  supervision: z.object({
+    mode: supervisionModeSchema,
+    terminalReview: z.enum(['STRUCTURED_EVIDENCE', 'INDEPENDENT_REQUIRED']),
+    terminalReviewContract: z.literal('criteria-v1').optional(),
+  }).strict().optional(),
   blocker: z.string().max(HANDOFF_BLOCKER_LIMIT).optional(),
   failure: z.object({
     kind: failureKindSchema,
@@ -335,6 +374,11 @@ export const observationSchema = z.object({
     answerInWeb: z.literal(true).optional(),
   }).strict().optional(),
   failureSignature: z.string().max(HANDOFF_FAILURE_SIGNATURE_LIMIT).optional(),
+  reportedFailureBudget: z.object({
+    exhausted: z.literal(true),
+    count: z.number().int().nonnegative().optional(),
+    limit: z.number().int().positive().optional(),
+  }).strict().optional(),
   attemptedHypotheses: z.array(z.string().max(HANDOFF_HYPOTHESIS_LIMIT)).max(HANDOFF_HYPOTHESES_LIMIT).optional(),
   artifacts: z.array(artifactSchema).max(HANDOFF_ARTIFACTS_LIMIT),
   handoffTruncated: z.object({
@@ -383,7 +427,26 @@ export const observationSchema = z.object({
   recoveryCapsule: recoveryCapsuleSchema.optional(),
   projectActivity: projectActivitySchema.optional(),
   progress: progressHeartbeatSchema.optional(),
+  reviewSignals: z.object({
+    source: z.literal('HOST_EVENT_FOLD'),
+    reasons: z.array(z.enum(['WATCHED_PATH_CHANGED', 'NEGATIVE_VERIFICATION', 'WORKER_MILESTONE',
+      'SUMMARY_MISSING', 'SUMMARY_INCOMPLETE', 'SUMMARY_INVALID', 'ACTIVITY_COVERAGE_GAP'])).max(7),
+    watchedFiles: z.array(z.string().max(256)).max(16),
+    summaryCoverage: z.enum(['MISSING', 'INCOMPLETE', 'INVALID', 'PROVIDED']),
+    activityCoverage: z.enum(['complete', 'partial']),
+  }).strict().optional(),
   supervisorProgress: supervisorProgressSchema.optional(),
+  pendingRisks: z.object({
+    total: z.number().int().positive(),
+    entries: z.array(z.object({
+      boundarySeq: z.number().int().nonnegative(),
+      riskLevel: z.enum(['high', 'critical']),
+      milestone: z.string().max(512),
+      risk: z.string().max(512).optional(),
+      nextAction: z.string().max(512),
+    }).strict()).max(4),
+    truncated: z.boolean(),
+  }).strict().optional(),
   decision: decisionOutcomeSchema.optional(),
   decisionShadow: decisionOutcomeSchema.extend({ differs: z.boolean() }).optional(),
   journal: z.object({
@@ -491,6 +554,9 @@ export const taskAdmissionReceiptSchema = z.object({
   runId: z.string().uuid(),
   objective: z.string().min(1).max(8_192),
   writerMode: z.enum(['writer', 'read_only']),
+  supervisionMode: supervisionModeSchema,
+  terminalReviewContract: z.literal('criteria-v1').optional(),
+  reviewWatchPaths: reviewWatchPathsSchema.optional(),
   agentPreset: z.enum(['standard', 'code']),
   instructionProfile: z.literal('engineering-v1'),
   executionBrief: z.object({
@@ -538,6 +604,10 @@ export const taskPacketV2Schema = z.object({
   completionToken: z.string().uuid(),
   objective: z.string().min(1).max(8_192),
   writerMode: z.enum(['writer', 'read_only']),
+  /** Durable supervision strength. Optional only for packets admitted before this field existed. */
+  supervisionMode: supervisionModeSchema.optional(),
+  terminalReviewContract: z.literal('criteria-v1').optional(),
+  reviewWatchPaths: reviewWatchPathsSchema.optional(),
   executionBrief: executionBriefSchema.optional(),
   requestId: z.string().uuid().optional(),
   requestDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),

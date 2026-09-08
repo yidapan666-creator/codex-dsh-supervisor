@@ -11,7 +11,7 @@ import {
   HANDOFF_VERIFICATION_COMMAND_LIMIT, HANDOFF_VERIFICATION_LIMIT, HANDOFF_VERIFICATION_SUMMARY_LIMIT,
   RECOVERY_CAPSULE_MAX_BYTES, TASK_PACKET_END, TASK_PACKET_START, UNCERTAIN_EFFECTS_LIMIT,
   type DshEvent, type EditWriteActivity, type Observation, type ProgressHeartbeat,
-  taskPacketSchema, supervisorProgressSchema,
+  taskPacketSchema, supervisorProgressSchema, reviewEvidenceSchema, finalReviewSchema,
   recoveryCapsuleSchema,
   type ProjectActivity, type RecoveryCapsule, type SupervisorProgress, type TaskPacket, type TaskRuntimeState,
   type UncertainEffectLedger,
@@ -278,7 +278,7 @@ const MAX_ACTIVITY_TOOL_NAMES = 32
 const CLASSIFIED_NON_MUTATING_TOOLS = new Set([
   'read', 'view', 'grep', 'glob', 'find', 'ls',
   'run_code',
-  'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure',
+  'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure', 'supervisor_review',
 ])
 
 /** Strip control characters and bound the length of any surfaced label. */
@@ -288,22 +288,22 @@ function cleanLabel(value: string, max: number): string | undefined {
   return cleaned.slice(0, max)
 }
 
-function projectRelativePath(workspaceCwd: string | undefined, raw: string): string | undefined {
+function projectRelativePath(workspaceCwd: string | undefined, raw: string, limit = MAX_PATH_LABEL): string | undefined {
   const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
   if (cleaned === '' || cleaned.length > 4_096) return undefined
   if (workspaceCwd === undefined) {
     if (isAbsolute(cleaned)) return undefined
     const normalized = normalize(cleaned)
     if (normalized === '..' || normalized.startsWith(`..${sep}`)) return undefined
-    return cleanLabel(normalized, MAX_PATH_LABEL)
+    return cleanLabel(normalized, limit)
   }
   const target = isAbsolute(cleaned) ? cleaned : resolve(workspaceCwd, cleaned)
   const suffix = relative(workspaceCwd, target)
   if (suffix === '' || isAbsolute(suffix) || suffix === '..' || suffix.startsWith(`..${sep}`)) return undefined
-  return cleanLabel(suffix, MAX_PATH_LABEL)
+  return cleanLabel(suffix, limit)
 }
 
-function mutatingFilePath(name: string, argsText: string, workspaceCwd: string | undefined): string | undefined {
+function mutatingFilePath(name: string, argsText: string, workspaceCwd: string | undefined, limit = MAX_PATH_LABEL): string | undefined {
   const spec = MUTATING_TOOLS[name]
   if (spec === undefined) return undefined
   let args: Record<string, unknown>
@@ -313,7 +313,7 @@ function mutatingFilePath(name: string, argsText: string, workspaceCwd: string |
     if (typeof command !== 'string' || !spec.mutatingCommands.has(command)) return undefined
   }
   const raw = args[spec.pathKey]
-  return typeof raw === 'string' ? projectRelativePath(workspaceCwd, raw) : undefined
+  return typeof raw === 'string' ? projectRelativePath(workspaceCwd, raw, limit) : undefined
 }
 
 function verificationCommandLabels(name: string, argsText: string): string[] {
@@ -347,7 +347,7 @@ function verificationCommandLabels(name: string, argsText: string): string[] {
   return [...labels]
 }
 
-function workspaceChangesFromResult(event: DshEvent | undefined): {
+function workspaceChangesFromResult(event: DshEvent | undefined, limit = MAX_PATH_LABEL): {
   total: number
   files: string[]
   truncated: boolean
@@ -362,8 +362,9 @@ function workspaceChangesFromResult(event: DshEvent | undefined): {
   let truncated = raw.truncated
   for (const value of raw.files) {
     if (typeof value !== 'string') { truncated = true; continue }
-    const path = projectRelativePath(undefined, value)
+    const path = projectRelativePath(undefined, value, limit)
     if (path === undefined) { truncated = true; continue }
+    if (value.length > limit) truncated = true
     files.push(path)
   }
   return { total: raw.total as number, files, truncated }
@@ -652,14 +653,76 @@ export function progressHeartbeat(state: TaskRuntimeState, requestedFromAsOfSeq:
   }
 }
 
+/** Review hints reuse durable Host activity; no worker prose is treated as observed work. */
+function reviewSignalsFor(state: TaskRuntimeState, current: Observation, fromSeq: number): Observation['reviewSignals'] {
+  if (current.supervision?.mode !== 'reviewed') return undefined
+  const packet = parseTaskPacket(state.events)
+  const watch = packet?.schemaVersion === 2 ? packet.reviewWatchPaths ?? [] : []
+  const activity = projectActivityIn(state.events, fromSeq, current.asOfSeq, state.cwd)
+  const watchedFiles = new Set<string>()
+  let negativeVerification = false
+  const boundarySeq = taskBoundarySeq(state.events) ?? fromSeq
+  const outcomes = callOutcomes(state.events, boundarySeq, current.asOfSeq)
+  const resultSeqs = new Map<string, number>()
+  for (const event of state.events) {
+    const result = foldToolResult(event)
+    if (result !== undefined && event.seq <= current.asOfSeq) resultSeqs.set(result.callId, event.seq)
+  }
+  let uncertainMutation = false
+  // Match before the normal activity preview is truncated. Shell/unclassified
+  // effects remain a coverage gap until a Host Git-baseline snapshot is present.
+  for (const call of foldToolCalls(state.events, boundarySeq, current.asOfSeq)) {
+    if (call.event.seq <= fromSeq && (resultSeqs.get(call.callId) ?? -1) <= fromSeq) continue
+    const paths: string[] = []
+    if (call.name in MUTATING_TOOLS && (outcomes.get(call.callId) ?? 'pending') === 'pending') uncertainMutation = true
+    if (outcomes.get(call.callId) === 'passed') {
+      const path = mutatingFilePath(call.name, call.argumentsText, state.cwd, 256)
+      if (path !== undefined) {
+        paths.push(path)
+        if (path.length === 256) uncertainMutation = true
+      }
+    }
+    if (call.name === 'supervisor_progress' || call.name === 'supervisor_handoff') {
+      paths.push(...workspaceChangesFromResult(toolResultFor(state.events, call.callId, current.asOfSeq + 1), 256)?.files ?? [])
+    }
+    for (const path of paths) {
+      if (watch.some(prefix => path === prefix || path.startsWith(`${prefix}/`))) watchedFiles.add(path)
+    }
+    if (verificationCommandLabels(call.name, call.argumentsText).length > 0 && outcomes.get(call.callId) !== 'passed') {
+      negativeVerification = true
+    }
+  }
+  const latest = current.supervisorProgress
+  const evidence = latest?.reviewEvidence
+  const summaryCoverage = latest?.reviewEvidenceInvalid === true ? 'INVALID' as const
+    : evidence === undefined ? 'MISSING' as const
+    : evidence.criteria.length === 0 || Object.values(evidence.omitted).some(count => count > 0)
+      ? 'INCOMPLETE' as const : 'PROVIDED' as const
+  const reasons: NonNullable<Observation['reviewSignals']>['reasons'] = []
+  if (watchedFiles.size > 0) reasons.push('WATCHED_PATH_CHANGED')
+  if (negativeVerification) reasons.push('NEGATIVE_VERIFICATION')
+  const milestone = packet === undefined ? undefined : latestSupervisorProgress(state.events, packet)
+  if (milestone !== undefined && milestone.seq > fromSeq) reasons.push('WORKER_MILESTONE')
+  if (summaryCoverage !== 'PROVIDED') reasons.push(`SUMMARY_${summaryCoverage}`)
+  const activityCoverage = uncertainMutation || activity.coverage === 'partial' || activity.edits.total > activity.edits.files.length
+    || activity.verification.total > activity.verification.evidence.length || watchedFiles.size > 16 ? 'partial' : 'complete'
+  if (activityCoverage === 'partial') reasons.push('ACTIVITY_COVERAGE_GAP')
+  return {
+    source: 'HOST_EVENT_FOLD', reasons, watchedFiles: [...watchedFiles].sort().slice(0, 16),
+    summaryCoverage, activityCoverage,
+  }
+}
+
 export function progressObservation(
   current: Observation,
   state: TaskRuntimeState,
   fromAsOfSeq: number,
 ): Observation {
   const progress = progressHeartbeat(state, fromAsOfSeq)
+  const reviewSignals = reviewSignalsFor(state, current, fromAsOfSeq)
   return {
     ...current,
+    ...reviewSignals === undefined ? {} : { reviewSignals },
     progress,
     ...current.status === 'WAITING' && progress.toAsOfSeq > progress.fromAsOfSeq
       ? { wait: { reason: 'PROGRESS' as const } }
@@ -671,6 +734,11 @@ function base(state: TaskRuntimeState, packet: TaskPacket | undefined): Omit<Obs
   const asOfSeq = state.events.reduce((max, event) => Math.max(max, event.seq), -1)
   const packetBoundarySeq = taskBoundarySeq(state.events) ?? -1
   const sessionId = packet === undefined ? 'unknown' : taskPacketSessionId(packet)
+  const supervisionMode = packet === undefined
+    ? undefined
+    : packet.schemaVersion === 2 && packet.supervisionMode !== undefined
+      ? packet.supervisionMode
+      : packet.writerMode === 'writer' ? 'reviewed' as const : 'delegated' as const
   return {
     schemaVersion: 1,
     hostInstanceId: state.hostInstanceId,
@@ -678,6 +746,16 @@ function base(state: TaskRuntimeState, packet: TaskPacket | undefined): Omit<Obs
     sessionId,
     runId: packet === undefined ? 'unknown' : taskPacketRunId(packet, packetBoundarySeq),
     objective: packet?.objective ?? '',
+    ...supervisionMode === undefined ? {} : {
+      supervision: {
+        mode: supervisionMode,
+        ...packet?.schemaVersion === 2 && packet.terminalReviewContract !== undefined
+          ? { terminalReviewContract: packet.terminalReviewContract } : {},
+        terminalReview: supervisionMode === 'reviewed'
+          ? 'INDEPENDENT_REQUIRED' as const
+          : 'STRUCTURED_EVIDENCE' as const,
+      },
+    },
     workerState: state.workerState,
     stage: 'unknown',
     summary: '',
@@ -742,6 +820,14 @@ function acceptedSupervisorProgressRecords(
     if (packet.schemaVersion === 2) {
       if (raw.sessionId !== sessionId || raw.runId !== runId) continue
     } else if (raw.taskId !== sessionId) continue
+    const evidence = raw.reviewEvidence === undefined ? undefined : reviewEvidenceSchema.safeParse(raw.reviewEvidence)
+    const evidenceValid = evidence?.success === true && evidence.data.criteria.every(claim => {
+      if (packet.schemaVersion !== 2) return false
+      const stream = packet.executionBrief?.workstreams.find(stream => stream.id === claim.workstreamId)
+      return stream === undefined
+        ? packet.executionBrief === undefined && claim.workstreamId === 'W1' && claim.doneWhenIndex === 0
+        : claim.doneWhenIndex < stream.doneWhen.length
+    })
     const parsed = supervisorProgressSchema.safeParse({
       sessionId,
       runId,
@@ -750,6 +836,9 @@ function acceptedSupervisorProgressRecords(
       nextAction: raw.nextAction,
       ...raw.currentHypothesis === undefined ? {} : { currentHypothesis: raw.currentHypothesis },
       ...raw.risk === undefined ? {} : { risk: raw.risk },
+      ...raw.riskLevel === undefined ? {} : { riskLevel: raw.riskLevel },
+      ...evidence === undefined ? {} : evidenceValid && evidence.success
+        ? { reviewEvidence: evidence.data } : { reviewEvidenceInvalid: true },
       needsSupervisor: raw.needsSupervisor,
       ...raw.decision === undefined ? {} : { decision: raw.decision },
     })
@@ -995,6 +1084,26 @@ export function supervisorDecisionHistory(
   }).slice(-20)
 }
 
+function finalReviewCoverageError(packet: TaskPacket, value: unknown): string | undefined {
+  const parsed = finalReviewSchema.safeParse(value)
+  if (!parsed.success) return 'missing or malformed finalReview'
+  const streams = packet.schemaVersion === 2 ? packet.executionBrief?.workstreams : undefined
+  if (streams === undefined) return 'finalReview has no executionBrief'
+  const expected = new Set(streams.flatMap(stream => stream.doneWhen.map((_, index) => `${stream.id}:${index}`)))
+  const seen = new Set<string>()
+  for (const claim of parsed.data.criteria) {
+    const key = `${claim.workstreamId}:${claim.doneWhenIndex}`
+    if (!expected.has(key) || seen.has(key)) return 'finalReview contains an unknown or duplicate doneWhen reference'
+    if (claim.status !== 'met' || claim.evidence.trim() === '') return 'finalReview contains an unmet, unknown or unsupported criterion'
+    seen.add(key)
+  }
+  if (seen.size !== expected.size) return 'finalReview does not cover every doneWhen'
+  if (Object.values(parsed.data.omitted).some(count => count !== 0)) return 'finalReview omits evidence'
+  if (parsed.data.negativeEvidence.length > 0) return 'finalReview has unresolved negative evidence'
+  if (parsed.data.evidencePaths.length === 0) return 'finalReview lacks evidence locators'
+  return undefined
+}
+
 function handoffObservation(
   state: TaskRuntimeState,
   packet: TaskPacket,
@@ -1019,6 +1128,15 @@ function handoffObservation(
       if (args.taskId !== packet.taskId || args.completionToken !== packet.completionToken) continue
       handoff = args
     }
+    if (packet.schemaVersion === 2 && packet.terminalReviewContract === 'criteria-v1' && handoff.status === 'completed') {
+      const error = finalReviewCoverageError(packet, handoff.finalReview)
+      if (error !== undefined) return {
+        ...base(state, packet), status: 'FAILED', stage: 'terminal-review-evidence',
+        boundarySeq: turnEnd.seq, summary: 'Completed handoff lacks the required full review evidence table.',
+        failure: { kind: 'PROTOCOL_ERROR', message: error, retryable: true },
+      }
+    }
+    const finalReview = finalReviewSchema.safeParse(handoff.finalReview)
     const truncated = new Set<HandoffTruncatedField>()
     const stage = boundedHandoffString(handoff.stage, HANDOFF_STAGE_LIMIT, 'stage', truncated) ?? 'unknown'
     const summary = boundedHandoffString(handoff.summary, HANDOFF_SUMMARY_LIMIT, 'summary', truncated) ?? ''
@@ -1046,6 +1164,7 @@ function handoffObservation(
       summary,
       files,
       verification,
+      ...finalReview.success ? { finalReview: finalReview.data } : {},
       artifacts,
       projectActivity: projectActivityIn(state.events, state.events.at(0)?.seq ?? turnEnd.seq, turnEnd.seq, state.cwd),
       ...blocker === undefined ? {} : { blocker },
@@ -1108,6 +1227,11 @@ function exhaustedFailureObservation(
       ...typeof output.failureSignature === 'string'
         ? { failureSignature: output.failureSignature.slice(0, HANDOFF_FAILURE_SIGNATURE_LIMIT) }
         : {},
+      reportedFailureBudget: {
+        exhausted: true,
+        ...Number.isSafeInteger(output.count) && Number(output.count) >= 0 ? { count: Number(output.count) } : {},
+        ...Number.isSafeInteger(output.budget) && Number(output.budget) > 0 ? { limit: Number(output.budget) } : {},
+      },
     }
   }
   return undefined
@@ -1180,32 +1304,66 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
   const boundary = taskPacketBoundary(state.events)
   const packet = boundary?.packet
   const commonBase = base(state, packet)
-  const progressRecord = packet === undefined ? undefined : latestSupervisorProgress(state.events, packet)
-  const decisionRequest = progressRecord?.progress.decision
-  const supervisorResponded = progressRecord === undefined
-    ? false
-    : state.events.some(event => event.type === 'user/message' && event.seq > progressRecord.seq)
-  const workerDecision = progressRecord === undefined || supervisorResponded
-    || (decisionRequest === undefined && !progressRecord.progress.needsSupervisor)
-    ? undefined
-    : compareDecision({
-      signal: 'WORKER_DECISION',
-      category: decisionRequest?.category ?? 'unspecified',
-      impact: decisionRequest?.impact ?? 'medium',
-      blocking: decisionRequest?.blocking ?? progressRecord.progress.needsSupervisor,
-      ...decisionRequest?.requiresHuman === undefined ? {} : { requiresHuman: decisionRequest.requiresHuman },
-      explicitlyPreAuthorized: packet?.schemaVersion === 2
-        && packet.authority?.preAuthorizedDecisionCategories?.includes(decisionRequest?.category ?? 'unspecified') === true,
-    }, decisionPolicy, shadowPolicy)
-  const activeWorkerDecision = workerDecision?.active
-  const common = {
-    ...commonBase,
+  const records = packet === undefined ? [] : acceptedSupervisorProgressRecords(state.events, packet)
+  const progressRecord = records.at(-1)
+  const guidanceSeq = state.events.reduce((seq, event) =>
+    event.type === 'user/message' ? Math.max(seq, event.seq) : seq, -1)
+  const pendingRisks = commonBase.supervision?.mode === 'reviewed'
+    ? records.filter(record => record.seq > guidanceSeq
+      && (record.progress.riskLevel === 'high' || record.progress.riskLevel === 'critical'))
+    : []
+  const semanticContext = {
     ...progressRecord === undefined ? {} : { supervisorProgress: progressRecord.progress },
-    ...activeWorkerDecision === undefined ? {} : { decision: activeWorkerDecision },
-    ...workerDecision?.shadow === undefined ? {} : {
-      decisionShadow: { ...workerDecision.shadow, differs: workerDecision.differs },
+    ...pendingRisks.length === 0 ? {} : { pendingRisks: {
+      total: pendingRisks.length,
+      entries: pendingRisks.slice(0, 4).map(({ seq, progress }) => ({
+        boundarySeq: seq,
+        riskLevel: progress.riskLevel as 'high' | 'critical',
+        milestone: progress.milestone,
+        ...progress.risk === undefined ? {} : { risk: progress.risk },
+        nextAction: progress.nextAction,
+      })),
+      truncated: pendingRisks.length > 4,
+    } },
+  }
+  // Evaluate risk and decision facts independently. A cadence decision (including
+  // pre-authorization) cannot downgrade a risk, and a risk cannot downgrade a
+  // human-directed decision. Keep the originating record for the boundary.
+  const pendingRiskSet = new Set(pendingRisks)
+  const candidates = [...new Set([...pendingRisks, ...progressRecord === undefined ? [] : [progressRecord]])]
+    .filter(record => record.seq > guidanceSeq)
+    .flatMap(record => {
+      const request = record.progress.decision
+      const worker = request === undefined && !record.progress.needsSupervisor ? [] : [{
+        record,
+        comparison: compareDecision({
+          signal: 'WORKER_DECISION',
+          category: request?.category ?? 'unspecified',
+          impact: request?.impact ?? 'medium',
+          blocking: request?.blocking ?? record.progress.needsSupervisor,
+          ...request?.requiresHuman === undefined ? {} : { requiresHuman: request.requiresHuman },
+          explicitlyPreAuthorized: packet?.schemaVersion === 2
+            && packet.authority?.preAuthorizedDecisionCategories?.includes(request?.category ?? 'unspecified') === true,
+        }, decisionPolicy, shadowPolicy),
+      }]
+      return [...worker, ...pendingRiskSet.has(record)
+        ? [{ record, comparison: compareDecision({ signal: 'RISK' }, decisionPolicy, shadowPolicy) }]
+        : []]
+    })
+  const decisionRank = (decision: DecisionOutcome): number =>
+    (decision.timing === 'immediate' ? 3 : 0)
+    + (decision.audience === 'human' ? 2 : decision.audience === 'supervisor' ? 1 : 0)
+  const selected = candidates.sort((left, right) =>
+    decisionRank(right.comparison.active) - decisionRank(left.comparison.active))[0]
+  const workerContext = selected === undefined ? {} : {
+    decision: selected.comparison.active,
+    ...selected.comparison.shadow === undefined ? {} : {
+      decisionShadow: { ...selected.comparison.shadow, differs: selected.comparison.differs },
     },
   }
+  // Material requests supplement lifecycle facts; they never replace a Host
+  // failure, interaction, budget stop, recovery boundary, or completed handoff.
+  const common = { ...commonBase, ...semanticContext }
   if (packet === undefined) return {
     ...common,
     status: 'FAILED',
@@ -1225,39 +1383,26 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
     ...common, status: 'QUESTION_REQUIRED', stage: 'question', summary: 'Worker is waiting for an answer.', question: state.pendingQuestion,
   }
 
-  if (activeWorkerDecision?.timing === 'immediate' && progressRecord !== undefined && !supervisorResponded) return {
-    ...common,
-    status: 'SUPERVISOR_REQUIRED',
-    boundarySeq: progressRecord.seq,
-    stage: progressRecord.progress.phase,
-    summary: decisionRequest?.request
-      ?? (progressRecord?.progress.risk === undefined
-        ? progressRecord?.progress.milestone ?? 'Worker requested a supervisor decision.'
-        : `${progressRecord.progress.milestone} Risk: ${progressRecord.progress.risk}`.slice(0, 2_048)),
-  }
-
   const scopedState = boundary === undefined
     ? state
     : { ...state, events: state.events.filter(event => event.seq >= boundary.seq) }
   const turnEnd = scopedState.events.findLast(event => event.type === 'turn/end')
   const turnStart = scopedState.events.findLast(event => event.type === 'turn/start')
-  if (turnStart !== undefined && (turnEnd === undefined || turnStart.seq > turnEnd.seq)) {
-    return { ...common, status: 'WAITING', stage: 'running', summary: 'The supervised turn has not ended.' }
-  }
-  if (turnEnd !== undefined) {
+  const turnRunning = turnStart !== undefined && (turnEnd === undefined || turnStart.seq > turnEnd.seq)
+  if (turnEnd !== undefined && !turnRunning) {
     const budget = budgetTurnObservation(scopedState, packet, turnEnd)
-    if (budget !== undefined) return budget
+    if (budget !== undefined) return { ...budget, ...semanticContext }
     const exhausted = exhaustedFailureObservation(scopedState, packet, turnEnd)
-    if (exhausted !== undefined) return exhausted
     const reason = (turnEnd.data as { reason?: { kind?: unknown } }).reason?.kind
     const missing = reason === 'completed'
     const interrupted = reason === 'interrupted'
+    if (exhausted !== undefined && !interrupted) return { ...exhausted, ...semanticContext }
     // A handoff is only authoritative when the corresponding turn itself ended
     // successfully. An earlier accepted result must never turn an interrupt,
     // worker failure, or Host-enforced abort into a false COMPLETED state.
     if (missing) {
       const handoff = handoffObservation(scopedState, packet, turnEnd)
-      if (handoff !== undefined) return handoff
+      if (handoff !== undefined) return { ...handoff, ...semanticContext }
     }
     return {
       ...common,
@@ -1267,7 +1412,7 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
       summary: missing
         ? 'Turn ended without a valid supervisor handoff.'
         : interrupted
-          ? 'The Host recovered the durable session, but the in-flight turn was interrupted and requires a bounded continuation.'
+          ? `The Host recovered the durable session, but the in-flight turn was interrupted and requires a bounded continuation.${exhausted === undefined ? '' : ' The worker had also exhausted its reported-failure recovery budget.'}`
           : `Worker turn ended: ${String(reason ?? 'unknown')}.`,
       failure: {
         kind: missing ? 'MISSING_HANDOFF' : interrupted ? 'HOST_FAILED' : 'WORKER_FAILED',
@@ -1281,9 +1426,29 @@ function deriveObservationRaw(state: TaskRuntimeState, decisionPolicy: DecisionP
           parentRunId: packet.runId,
         },
       } : {},
+      ...interrupted && exhausted?.failureSignature !== undefined
+        ? { failureSignature: exhausted.failureSignature }
+        : {},
+      ...interrupted && exhausted?.reportedFailureBudget !== undefined
+        ? { reportedFailureBudget: exhausted.reportedFailureBudget }
+        : {},
     }
   }
-  return { ...common, status: 'WAITING', stage: state.workerState === 'RUNNING' ? 'running' : 'idle', summary: 'No completed supervisor boundary observed.' }
+  if (selected?.comparison.active.timing === 'immediate') {
+    const { progress, seq } = selected.record
+    return {
+      ...common, ...workerContext,
+      status: 'SUPERVISOR_REQUIRED', boundarySeq: seq, stage: progress.phase,
+      summary: selected.comparison.active.reasonCode === 'REPORTED_HIGH_RISK'
+        ? `${progress.milestone}${progress.risk === undefined ? '' : ` Risk: ${progress.risk}`}`.slice(0, 2_048)
+        : progress.decision?.request ?? progress.milestone,
+    }
+  }
+  return {
+    ...common, ...workerContext, status: 'WAITING',
+    stage: turnRunning || state.workerState === 'RUNNING' ? 'running' : 'idle',
+    summary: turnRunning ? 'The supervised turn has not ended.' : 'No completed supervisor boundary observed.',
+  }
 }
 
 function protocolSignal(observation: Observation): DecisionSignal {
@@ -1293,7 +1458,8 @@ function protocolSignal(observation: Observation): DecisionSignal {
     case 'QUESTION_REQUIRED': return 'QUESTION'
     case 'SUPERVISOR_REQUIRED': return 'WORKER_DECISION'
     case 'MAJOR_CHECKPOINT': return 'CHECKPOINT'
-    case 'COMPLETED': return 'TERMINAL_SUCCESS'
+    case 'COMPLETED': return observation.supervision?.mode === 'reviewed'
+      ? 'TERMINAL_REVIEW' : 'TERMINAL_SUCCESS'
     default: return 'TERMINAL_FAILURE'
   }
 }

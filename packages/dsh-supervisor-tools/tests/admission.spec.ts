@@ -189,6 +189,37 @@ function nextRequest(sessionId = 's1'): TaskAdmissionRequest {
   }
 }
 
+describe('blocking review presentation admission', () => {
+  const reviewed = () => ({ ...request(), prompt: request().prompt.replace('"writerMode":"read_only"', '"writerMode":"read_only","supervisionMode":"reviewed"') })
+
+  it.each(['code-preset', 'presentation-override'])('rejects reviewed %s before queueing or selecting a model', async kind => {
+    const test = harness()
+    if (kind === 'code-preset') test.runtime.agents.list()[0]!.session.header.agentPreset = 'code'
+    else test.runtime.supportsBlockingReview = () => false
+    await expect(test.coordinator.admit(reviewed())).rejects.toThrow(/requires Standard/)
+    expect(test.calls).toMatchObject({ prompt: 0, selectModel: 0, rearm: 0, flush: 0 })
+    await expect(test.coordinator.admit(request())).resolves.toMatchObject({ reconciled: false })
+  })
+
+  it('does not rearm a previously admitted reviewed PTC task after restart', async () => {
+    const input = reviewed()
+    const test = harness({ seed: [inboxEvent(0, { id: 'message-seed', content: [{ type: 'text', text: input.prompt }] })] })
+    test.runtime.supportsBlockingReview = () => false
+    await expect(test.coordinator.admit(input)).rejects.toThrow(/requires Standard/)
+    expect(test.calls).toMatchObject({ prompt: 0, selectModel: 0, rearm: 0 })
+    expect(test.pending).toHaveLength(1)
+  })
+
+  it('keeps a non-pending historical receipt reconcilable without restarting its work', async () => {
+    const input = reviewed()
+    const test = harness({ seed: [inboxEvent(0, { id: 'message-seed', content: [{ type: 'text', text: input.prompt }] })] })
+    test.runtime.supportsBlockingReview = () => false
+    test.pending.splice(0)
+    await expect(test.coordinator.admit(input)).resolves.toMatchObject({ reconciled: true })
+    expect(test.calls).toMatchObject({ prompt: 0, selectModel: 0, rearm: 0 })
+  })
+})
+
 function terminalHandoffEvents(
   startSeq: number,
   options: { resultTime?: number; turn?: number; status?: 'completed' | 'blocked' | 'failed' } = {},

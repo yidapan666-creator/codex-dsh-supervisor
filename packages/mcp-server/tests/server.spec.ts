@@ -15,6 +15,7 @@ describe('public dsh_task contract', () => {
     expect(task?.description).toContain('id matching /^[A-Z][A-Z0-9_-]{0,15}$/')
     expect(task?.description).toContain('outcome, delegation, and doneWhen')
     expect(task?.description).toContain('integration')
+    expect(task?.description).toContain('supervisionMode')
     expect(task?.outputSchema).toBe(taskAdmissionReceiptSchema)
   })
 
@@ -28,6 +29,7 @@ describe('public dsh_task contract', () => {
       runId: '22222222-2222-4222-8222-222222222222',
       objective: 'Audit the repository',
       writerMode: 'read_only',
+      supervisionMode: 'delegated',
       agentPreset: 'standard',
       instructionProfile: 'engineering-v1',
       executionBrief: {

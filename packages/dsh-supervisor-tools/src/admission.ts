@@ -95,7 +95,7 @@ interface AdmissionEvent {
 }
 
 interface AdmissionSession {
-  header: { id: string; cwd?: string; parentSession?: string; seedLength?: number; createdAt?: number }
+  header: { id: string; cwd?: string; agentPreset?: string; parentSession?: string; seedLength?: number; createdAt?: number }
   events: readonly AdmissionEvent[]
   append?(type: string, data: unknown): AdmissionEvent
 }
@@ -112,6 +112,8 @@ interface AdmissionAgent {
 }
 
 export interface TaskAdmissionRuntime {
+  /** Production checks the actual tool presentation, including deployment overrides. */
+  supportsBlockingReview?(agent: AdmissionAgent): boolean
   agents: { list(): AdmissionAgent[] }
   sessions: { flush(session: AdmissionSession): Promise<boolean> }
   sessionPersistence: {
@@ -735,6 +737,7 @@ export class TaskAdmissionCoordinator {
         matches[0]?.seq as number, agent.session.events.at(-1)?.seq ?? -1,
       )
     }
+    this.assertReviewSupported(agent, request.packet)
     if (request.parentRunId !== undefined && request.recoveryCapsule !== undefined) {
       const expected = await this.recovery.capsule(request.sessionId, request.parentRunId)
       if (canonicalJson(expected) !== canonicalJson(request.recoveryCapsule)) {
@@ -986,7 +989,17 @@ export class TaskAdmissionCoordinator {
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
       .find(message => message.id !== undefined && ids.has(message.id))
     if (pending?.id === undefined) return
+    for (const match of matches) this.assertReviewSupported(agent, match.packet)
     agent.wakePending()
+  }
+
+  private assertReviewSupported(agent: AdmissionAgent, packet: Record<string, unknown>): void {
+    const reviewed = packet.supervisionMode === 'reviewed'
+      || (packet.supervisionMode === undefined && packet.writerMode !== 'read_only')
+    if (reviewed && (agent.session.header.agentPreset === 'code'
+      || this.runtime.supportsBlockingReview?.(agent) === false)) {
+      throw new TaskAdmissionError('BAD_REQUEST', 'reviewed supervision requires Standard/native tools: PTC code execution times out while awaiting review. Keep this session for observation; do not redispatch an existing objective or downgrade supervision automatically.')
+    }
   }
 
   private receipt(

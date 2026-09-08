@@ -17,6 +17,7 @@ export const EXPECTED_GATE_CAPABILITIES = Object.freeze([
   'host-git-baseline-v1',
   'direct-child-authority-v1',
   'strict-handoff-v1',
+  'blocking-supervisor-review-v1',
   'bearer-auth-v1',
 ])
 

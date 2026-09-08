@@ -17,15 +17,18 @@ import {
 } from '@dsh-gate/run-journal'
 import {
   authenticatedHostConnection, HostConnection, launchDetachedHost, parseLaunchConfig, type HostLaunchConfig,
+  type TokenBudgetStateReceipt,
 } from './host.js'
 import {
-  FAILURE_MESSAGE_LIMIT, recoveryCapsuleSchema, taskPacketV2Schema,
+  FAILURE_MESSAGE_LIMIT, recoveryCapsuleSchema, taskPacketV2Schema, reviewWatchPathsSchema,
   telemetrySessionStatsSchema, telemetryTokenUsageSchema,
-  type DshEvent, type ExecutionBrief, type ExecutionBriefInput, type Observation, type RecoveryCapsule, type TaskRuntimeState,
+  type DshEvent, type ExecutionBrief, type ExecutionBriefInput, type Observation, type RecoveryCapsule,
+  type SupervisionMode, type TaskRuntimeState,
 } from './contracts.js'
 import { UsageMonitorClient } from './usage-monitor.js'
 import {
-  compileTaskPrompt, normalizeExecutionBrief, normalizeTaskInstructions, TASK_INSTRUCTION_PROFILE,
+  compileTaskPrompt, normalizeExecutionBrief, normalizeTaskInstructions, resolveSupervisionMode,
+  TASK_INSTRUCTION_PROFILE,
 } from './task-prompt.js'
 
 interface SessionAddress {
@@ -89,6 +92,35 @@ function positiveIntegerEnvironment(env: NodeJS.ProcessEnv, name: string): numbe
   const value = Number(raw)
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`)
   return value
+}
+
+/**
+ * Add the Host-authoritative run-tree counters without erasing a terminal
+ * request-rejection fact derived from the durable turn boundary. The Host
+ * state endpoint reports cumulative consumption only, so remaining below the
+ * limit is correctly ACTIVE there even when one oversized next request was
+ * rejected before a provider call.
+ */
+function mergeBudgetProjection(
+  previous: Observation['budget'],
+  state: TokenBudgetStateReceipt,
+): NonNullable<Observation['budget']> {
+  return {
+    limitTokens: state.limitTokens,
+    observedTokens: state.usedTokens,
+    remainingTokens: state.remainingTokens,
+    exhausted: state.exhausted,
+    status: previous?.status === 'REQUEST_REJECTED' ? 'REQUEST_REJECTED' : state.status,
+    overshootTokens: state.overshootTokens,
+    coverage: state.coverage,
+    enforcement: state.enforcement,
+    overshootBound: state.overshootBound,
+    sessions: state.sessions,
+    uncachedInputTokens: state.uncachedInputTokens,
+    outputTokens: state.outputTokens,
+    cacheReadTokens: state.cacheReadTokens,
+    cacheWriteTokens: state.cacheWriteTokens,
+  }
 }
 
 /** Discovery could not prove absence because at least one configured Host was unavailable. */
@@ -610,6 +642,8 @@ export class GatewayManager {
     requestId?: string | undefined
     objective: string
     writerMode?: 'writer' | 'read_only' | undefined
+    reviewWatchPaths?: string[] | undefined
+    supervisionMode?: SupervisionMode | undefined
     provider?: string | undefined
     model?: string | undefined
     reasoningEffort?: string | undefined
@@ -635,7 +669,19 @@ export class GatewayManager {
     const snapshot = await connection.refreshSession(sessionId)
     if (snapshot.cwd === undefined) throw new Error('task session has no authoritative cwd')
     const agentPreset = supervisedAgentPreset(snapshot.agentPreset)
-    const writerMode = input.writerMode ?? 'writer'
+    const parentEntry = input.parentRunId === undefined
+      ? undefined
+      : taskPacketEntries(snapshot.events).find(({ packet }) =>
+        packet.schemaVersion === 2 && packet.runId === input.parentRunId)
+    let writerMode = input.writerMode ?? 'writer'
+    if (parentEntry?.packet.schemaVersion === 2) {
+      if (input.writerMode !== undefined && input.writerMode !== parentEntry.packet.writerMode) {
+        throw new Error('continuation writerMode must match the interrupted parent run')
+      }
+      writerMode = parentEntry.packet.writerMode
+    }
+    let supervisionMode = resolveSupervisionMode(writerMode, input.supervisionMode)
+    let terminalReviewContract = supervisionMode === 'reviewed' ? 'criteria-v1' as const : undefined
     if (writerMode === 'writer' && this.knownUrls.length !== 1) {
       throw new Error('writer admission requires exactly one configured DSH Host; use read_only or isolate each writer in an independent worktree and single-Host deployment')
     }
@@ -668,10 +714,9 @@ export class GatewayManager {
       authority: input.authority,
     })
     const proposedExecutionBrief = normalizeExecutionBrief(input.objective, input.executionBrief)
+    let reviewWatchPaths = input.reviewWatchPaths === undefined ? undefined : reviewWatchPathsSchema.parse(input.reviewWatchPaths)
     let executionBrief: ExecutionBrief = proposedExecutionBrief
     if (input.parentRunId !== undefined) {
-      const parentEntry = taskPacketEntries(snapshot.events).find(({ packet }) =>
-        packet.schemaVersion === 2 && packet.runId === input.parentRunId)
       // Do not replace the authoritative recovery error for a stale or
       // cross-session parent. Host admission validates that case below.
       if (parentEntry?.packet.schemaVersion === 2) {
@@ -681,13 +726,30 @@ export class GatewayManager {
           && JSON.stringify(proposedExecutionBrief) !== JSON.stringify(parentBrief)) {
           throw new Error('continuation executionBrief must match the interrupted parent run')
         }
+        const parentWatchPaths = parentEntry.packet.reviewWatchPaths
+        if (reviewWatchPaths !== undefined && JSON.stringify(reviewWatchPaths) !== JSON.stringify(parentWatchPaths ?? [])) {
+          throw new Error('continuation reviewWatchPaths must match the interrupted parent run')
+        }
+        reviewWatchPaths = parentWatchPaths
         executionBrief = parentBrief
+        const parentSupervisionMode = resolveSupervisionMode(
+          parentEntry.packet.writerMode, parentEntry.packet.supervisionMode,
+        )
+        if (input.supervisionMode !== undefined && input.supervisionMode !== parentSupervisionMode) {
+          throw new Error('continuation supervisionMode must match the interrupted parent run')
+        }
+        supervisionMode = parentSupervisionMode
+        terminalReviewContract = parentEntry.packet.terminalReviewContract
       }
     }
     const requestDigest = createHash('sha256').update(JSON.stringify({
       sessionId,
       objective: input.objective,
       writerMode,
+      // Preserve the pre-supervision-mode digest for omitted/default calls so
+      // ambiguous admissions created before this upgrade remain reconcilable.
+      supervisionMode: input.supervisionMode,
+      reviewWatchPaths,
       provider: input.provider,
       model: input.model,
       reasoningEffort: input.reasoningEffort,
@@ -718,6 +780,9 @@ export class GatewayManager {
       return true
     }
     const alreadyVisible = existingRequest(snapshot)
+    if (!alreadyVisible && supervisionMode === 'reviewed' && agentPreset === 'code') {
+      throw new Error('reviewed supervision currently requires agentPreset "standard": PTC code execution times out while awaiting review. Do not downgrade supervision or redispatch existing work automatically; keep observing any existing run.')
+    }
 
     const reasoningEffort = input.reasoningEffort ?? this.config.defaultReasoningEffort
     let provider = input.provider ?? this.config.defaultProvider
@@ -746,6 +811,9 @@ export class GatewayManager {
       completionToken: randomUUID(),
       objective: input.objective,
       writerMode,
+      supervisionMode,
+      ...terminalReviewContract === undefined ? {} : { terminalReviewContract },
+      ...reviewWatchPaths === undefined ? {} : { reviewWatchPaths },
       executionBrief,
       requestId,
       requestDigest,
@@ -790,6 +858,9 @@ export class GatewayManager {
       })
       const refreshed = await connection.refreshSession(sessionId)
       const observedAsOfSeq = Math.max(receipt.asOfSeq, refreshed.events.at(-1)?.seq ?? -1)
+      const admittedPacket = taskPacketEntries(refreshed.events).find(entry =>
+        entry.packet.schemaVersion === 2 && entry.packet.runId === receipt.runId)?.packet
+      const admittedReviewContract = admittedPacket?.schemaVersion === 2 ? admittedPacket.terminalReviewContract : undefined
       return {
         schemaVersion: 1,
         hostInstanceId: refreshed.hostInstanceId,
@@ -799,6 +870,9 @@ export class GatewayManager {
         runId: receipt.runId,
         objective: input.objective,
         writerMode,
+        supervisionMode,
+        ...admittedReviewContract === undefined ? {} : { terminalReviewContract: admittedReviewContract },
+        ...reviewWatchPaths === undefined ? {} : { reviewWatchPaths },
         agentPreset,
         instructionProfile: TASK_INSTRUCTION_PROFILE,
         executionBrief: {
@@ -1123,22 +1197,7 @@ export class GatewayManager {
       })
       observation = {
         ...observation,
-        budget: {
-          limitTokens: state.limitTokens,
-          observedTokens: state.usedTokens,
-          remainingTokens: state.remainingTokens,
-          exhausted: state.exhausted,
-          status: state.status,
-          overshootTokens: state.overshootTokens,
-          coverage: state.coverage,
-          enforcement: state.enforcement,
-          overshootBound: state.overshootBound,
-          sessions: state.sessions,
-          uncachedInputTokens: state.uncachedInputTokens,
-          outputTokens: state.outputTokens,
-          cacheReadTokens: state.cacheReadTokens,
-          cacheWriteTokens: state.cacheWriteTokens,
-        },
+        budget: mergeBudgetProjection(observation.budget, state),
       }
     }
     if (this.usageMonitor !== undefined) {
@@ -1266,22 +1325,7 @@ export class GatewayManager {
               ...budgetWarning === undefined ? {} : { budgetWarning },
               ...packet.budget === undefined ? {} : {
                 tokenBudget: packet.budget,
-                budget: budget === undefined ? observation.budget : {
-                  limitTokens: budget.limitTokens,
-                  observedTokens: budget.usedTokens,
-                  remainingTokens: budget.remainingTokens,
-                  exhausted: budget.exhausted,
-                  status: budget.status,
-                  overshootTokens: budget.overshootTokens,
-                  coverage: budget.coverage,
-                  enforcement: budget.enforcement,
-                  overshootBound: budget.overshootBound,
-                  sessions: budget.sessions,
-                  uncachedInputTokens: budget.uncachedInputTokens,
-                  outputTokens: budget.outputTokens,
-                  cacheReadTokens: budget.cacheReadTokens,
-                  cacheWriteTokens: budget.cacheWriteTokens,
-                },
+                budget: budget === undefined ? observation.budget : mergeBudgetProjection(observation.budget, budget),
               },
             })
           } catch (error) {

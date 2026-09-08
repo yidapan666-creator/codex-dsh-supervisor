@@ -14,6 +14,14 @@ describe('decision policy', () => {
     expect(evaluateDecision({ signal: 'TERMINAL_SUCCESS' })).toMatchObject({
       timing: 'immediate', action: 'ACCEPT_TERMINAL', protocolInvariant: true,
     })
+    expect(evaluateDecision({ signal: 'TERMINAL_REVIEW' })).toMatchObject({
+      timing: 'immediate', audience: 'supervisor', action: 'REVIEW_TERMINAL',
+      reasonCode: 'INDEPENDENT_TERMINAL_REVIEW', protocolInvariant: true,
+    })
+    expect(evaluateDecision({ signal: 'RISK' })).toMatchObject({
+      timing: 'immediate', audience: 'supervisor', action: 'REVIEW_WORKER_REQUEST',
+      reasonCode: 'REPORTED_HIGH_RISK', protocolInvariant: true,
+    })
   })
 
   it('routes sensitive/high-impact worker decisions to the human with an explanation', () => {

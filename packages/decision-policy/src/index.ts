@@ -11,7 +11,7 @@ export type DecisionImpact = typeof DECISION_IMPACTS[number]
 
 export const DECISION_SIGNALS = [
   'WAIT', 'PROGRESS', 'APPROVAL', 'QUESTION', 'WORKER_DECISION',
-  'CHECKPOINT', 'TERMINAL_SUCCESS', 'TERMINAL_FAILURE',
+  'RISK', 'CHECKPOINT', 'TERMINAL_SUCCESS', 'TERMINAL_REVIEW', 'TERMINAL_FAILURE',
 ] as const
 export type DecisionSignal = typeof DECISION_SIGNALS[number]
 
@@ -24,6 +24,7 @@ export type DecisionAction =
   | 'REVIEW_WORKER_REQUEST'
   | 'ASK_HUMAN'
   | 'ACCEPT_TERMINAL'
+  | 'REVIEW_TERMINAL'
   | 'REVIEW_FAILURE'
   | 'QUEUE_CONTINUATION'
 
@@ -160,8 +161,10 @@ const PROTOCOL_EFFECTS: Record<Exclude<DecisionSignal, 'WORKER_DECISION'>, Decis
   PROGRESS: effect('cadence', 'supervisor', 'SURFACE_PROGRESS', 'ORDINARY_PROGRESS'),
   APPROVAL: effect('immediate', 'supervisor', 'RESOLVE_INTERACTION', 'APPROVAL_PENDING'),
   QUESTION: effect('immediate', 'supervisor', 'RESOLVE_INTERACTION', 'QUESTION_PENDING'),
+  RISK: effect('immediate', 'supervisor', 'REVIEW_WORKER_REQUEST', 'REPORTED_HIGH_RISK'),
   CHECKPOINT: effect('immediate', 'supervisor', 'QUEUE_CONTINUATION', 'CHECKPOINT_REACHED'),
   TERMINAL_SUCCESS: effect('immediate', 'supervisor', 'ACCEPT_TERMINAL', 'TERMINAL_SUCCESS'),
+  TERMINAL_REVIEW: effect('immediate', 'supervisor', 'REVIEW_TERMINAL', 'INDEPENDENT_TERMINAL_REVIEW'),
   TERMINAL_FAILURE: effect('immediate', 'supervisor', 'REVIEW_FAILURE', 'TERMINAL_FAILURE'),
 }
 
@@ -226,7 +229,7 @@ function parseEffect(value: unknown, label: string): DecisionEffect {
   const candidate = value as Record<string, unknown>
   if ((candidate.timing !== 'cadence' && candidate.timing !== 'immediate')
     || (candidate.audience !== 'none' && candidate.audience !== 'supervisor' && candidate.audience !== 'human')
-    || !['CONTINUE_WAIT', 'SURFACE_PROGRESS', 'RESOLVE_INTERACTION', 'REVIEW_WORKER_REQUEST', 'ASK_HUMAN', 'ACCEPT_TERMINAL', 'REVIEW_FAILURE', 'QUEUE_CONTINUATION'].includes(String(candidate.action))
+    || !['CONTINUE_WAIT', 'SURFACE_PROGRESS', 'RESOLVE_INTERACTION', 'REVIEW_WORKER_REQUEST', 'ASK_HUMAN', 'ACCEPT_TERMINAL', 'REVIEW_TERMINAL', 'REVIEW_FAILURE', 'QUEUE_CONTINUATION'].includes(String(candidate.action))
     || typeof candidate.reasonCode !== 'string' || candidate.reasonCode.trim() === '') {
     throw new Error(`${label} has an unsupported effect`)
   }

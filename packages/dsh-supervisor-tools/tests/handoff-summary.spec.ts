@@ -165,6 +165,8 @@ describe('bounded supervisor progress', () => {
         options: Array.from({ length: 6 }, (_, index) => `option-${index}`),
       },
     })).toBe('supervisor_progress decision.options exceeds 5 entries')
+    expect(progressPayloadError({ ...progress, riskLevel: 'urgent' as never }))
+      .toBe('supervisor_progress riskLevel is unsupported')
   })
 
   it('deduplicates an identical prior progress record', () => {
@@ -194,5 +196,10 @@ describe('bounded supervisor progress', () => {
     expect(supervisorProgressDecision([
       packet(v2), call(progress, 1_000), call(structuredDecision, 2_000),
     ], structuredDecision, 2_000)).toEqual({ accepted: true })
+
+    const highRisk = { ...changed, riskLevel: 'high' as const, risk: 'Public API compatibility may change.' }
+    expect(supervisorProgressDecision([
+      packet(v2), call(progress, 1_000), call(highRisk, 2_000),
+    ], highRisk, 2_000)).toEqual({ accepted: true })
   })
 })

@@ -1,10 +1,13 @@
 /** DSH tools that make an external supervisor handoff explicit and durable. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createHash } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { admitArtifacts } from './artifacts.js'
+import { finalReviewError, reviewEvidenceError, type ReviewEvidence } from './review-evidence.js'
+import { allowedDuringReview, awaitSupervisorReview, reviewCheckpointPending, type ReviewQuestionChannel } from './review-checkpoint.js'
 import {
   FileBudgetReservationLedger,
   type BudgetReservationLedger,
@@ -72,7 +75,7 @@ export const DSH_GATE_PLUGIN_VERSION = EXPECTED_GATE_PLUGIN_VERSION
 export const DSH_GATE_CAPABILITIES = EXPECTED_GATE_CAPABILITIES
 export const inject = [
   'tools', 'systemPrompt', 'tokenMeter', 'agents', 'sessions', 'sessionPersistence', 'apiProxy', 'webServer',
-  'sandboxPolicy', 'approval',
+  'sandboxPolicy', 'approval', 'userQuestions',
 ]
 
 export interface Config {
@@ -241,6 +244,7 @@ type HandoffIdentityArgs = {
 }
 
 export type HandoffPayloadArgs = HandoffIdentityArgs & {
+  finalReview?: ReviewEvidence | undefined
   status: typeof HANDOFF_STATUSES[number]
   stage: string
   summary: string
@@ -254,6 +258,10 @@ export type HandoffPayloadArgs = HandoffIdentityArgs & {
 
 /** Defense-in-depth for programmatic callers that bypass the generated tool schema. */
 export function handoffPayloadError(args: HandoffPayloadArgs): string | undefined {
+  if (args.finalReview !== undefined) {
+    const error = reviewEvidenceError(args.finalReview, 40)
+    if (error !== undefined) return `supervisor_handoff ${error}`
+  }
   if (args.status === 'completed') {
     const nonPassing = args.verification.find(entry => entry.outcome !== 'passed')
     if (nonPassing !== undefined) {
@@ -287,6 +295,17 @@ export function handoffPayloadError(args: HandoffPayloadArgs): string | undefine
     + `.dsh-handoff/${runId}/ inside the session cwd and reference that report in artifacts.`
 }
 
+/** Required only by the immutable reviewed contract of newly admitted runs. */
+export function handoffReviewError(
+  events: Parameters<typeof latestTaskIdentity>[0],
+  args: Pick<HandoffPayloadArgs, 'status' | 'finalReview'>,
+): string | undefined {
+  const identity = latestTaskIdentity(events)
+  if (args.status !== 'completed' || identity?.terminalReviewContract === undefined) return undefined
+  if (identity.terminalReviewContract !== 'criteria-v1') return 'unsupported terminalReviewContract'
+  return finalReviewError(args.finalReview, identity.reviewWorkstreams)
+}
+
 type ProgressIdentityArgs = {
   taskId?: string | undefined
   sessionId?: string | undefined
@@ -299,6 +318,8 @@ export type SupervisorProgressArgs = ProgressIdentityArgs & {
   nextAction: string
   currentHypothesis?: string | undefined
   risk?: string | undefined
+  riskLevel?: 'low' | 'medium' | 'high' | 'critical' | undefined
+  reviewEvidence?: ReviewEvidence | undefined
   needsSupervisor: boolean
   decision?: {
     category: 'architecture' | 'scope' | 'acceptance' | 'security' | 'destructive_action'
@@ -319,11 +340,17 @@ export type SupervisorProgressArgs = ProgressIdentityArgs & {
  * receives the same protection.
  */
 export function progressPayloadError(args: SupervisorProgressArgs): string | undefined {
+  if (args.reviewEvidence !== undefined) {
+    const error = reviewEvidenceError(args.reviewEvidence)
+    if (error !== undefined) return `supervisor_progress ${error}`
+  }
   const checks: Array<[boolean, string]> = [
     [args.milestone.length > 512, 'milestone exceeds 512 characters'],
     [args.nextAction.length > 512, 'nextAction exceeds 512 characters'],
     [(args.currentHypothesis?.length ?? 0) > 1_024, 'currentHypothesis exceeds 1024 characters'],
     [(args.risk?.length ?? 0) > 512, 'risk exceeds 512 characters'],
+    [args.riskLevel !== undefined && !['low', 'medium', 'high', 'critical'].includes(args.riskLevel),
+      'riskLevel is unsupported'],
     [(args.decision?.request.length ?? 0) > 512, 'decision.request exceeds 512 characters'],
     [(args.decision?.options?.length ?? 0) > 5, 'decision.options exceeds 5 entries'],
     [args.decision?.options?.some(value => value.length > 256) === true,
@@ -336,6 +363,10 @@ export function progressPayloadError(args: SupervisorProgressArgs): string | und
 }
 
 type TaskIdentity = {
+  supervisionMode?: unknown
+  parentRunId?: unknown
+  terminalReviewContract?: unknown
+  reviewWorkstreams?: unknown
   schemaVersion: 1 | 2
   sessionId: string
   runId?: string | undefined
@@ -373,6 +404,7 @@ interface RuntimeAgent {
 
 interface RuntimeToolExecution {
   readonly name: string
+  readonly arguments?: unknown
   readonly token: symbol
   readonly agent?: RuntimeAgent
 }
@@ -475,6 +507,10 @@ function latestTaskIdentityBoundary(
           return {
             identity: {
               schemaVersion: 2,
+              supervisionMode: value.supervisionMode,
+              parentRunId: value.parentRunId,
+              terminalReviewContract: value.terminalReviewContract,
+              reviewWorkstreams: (value.executionBrief as { workstreams?: unknown } | undefined)?.workstreams,
               sessionId: value.sessionId,
               runId: value.runId,
               completionToken: value.completionToken,
@@ -1066,6 +1102,8 @@ function sameProgress(left: SupervisorProgressArgs, right: SupervisorProgressArg
     && left.nextAction === right.nextAction
     && left.currentHypothesis === right.currentHypothesis
     && left.risk === right.risk
+    && left.riskLevel === right.riskLevel
+    && JSON.stringify(left.reviewEvidence) === JSON.stringify(right.reviewEvidence)
     && left.needsSupervisor === right.needsSupervisor
     && JSON.stringify(left.decision) === JSON.stringify(right.decision)
 }
@@ -1092,6 +1130,7 @@ export function supervisorProgressDecision(
   if (previous === undefined) return { accepted: true }
   if (sameProgress(previous.args, args)) return { accepted: false, reason: 'duplicate' }
   if (!args.needsSupervisor && args.decision === undefined
+    && args.riskLevel !== 'high' && args.riskLevel !== 'critical'
     && typeof previous.time === 'number' && now - previous.time < SUPERVISOR_PROGRESS_MIN_INTERVAL_MS) {
     return { accepted: false, reason: 'rate_limited' }
   }
@@ -1434,6 +1473,36 @@ export function installTokenBudgetGuards(
   })
 }
 
+/** Runs in the native monotonic guard, including nested PTC dispatches. */
+export function supervisorReviewGuard(
+  sessions: readonly RuntimeSession[], execution: RuntimeToolExecution,
+): string | undefined {
+  const session = execution.agent?.session
+  if (session === undefined) return undefined
+  const headers = new Map(sessions.map(value => [value.header.id, value.header]))
+  for (const root of sessions) {
+    const boundaries = ownTaskBoundaries(root)
+    const identity = boundaries.at(-1)?.identity
+    if (identity?.supervisionMode !== 'reviewed' || identity.runId === undefined
+      || identity.sessionId !== root.header.id
+      || !isDescendantOf(session.header, root.header.id, headers)) continue
+    const runIds = new Set([identity.runId])
+    let parent = identity.parentRunId
+    while (typeof parent === 'string' && !runIds.has(parent)) {
+      const predecessor = boundaries.find(value => value.identity.runId === parent)?.identity
+      if (predecessor === undefined) break
+      runIds.add(parent)
+      parent = predecessor.parentRunId
+    }
+    if (![...runIds].some(runId => runAffiliationBoundary(session, root, runId) !== undefined)) continue
+    if (reviewCheckpointPending(root.events, root.header.id, runIds)
+      && !allowedDuringReview(execution.name, execution.arguments, session.header.id === root.header.id)) {
+      return 'dsh-gate:supervisor-review-pending; await explicit approval through supervisor_review before execution; reads and a revised review remain available'
+    }
+  }
+  return undefined
+}
+
 export function apply(ctx: Context, config: Config = {}): void {
   requiredHostToken()
   const resolved = Config(config) as Required<Config>
@@ -1443,6 +1512,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
   const runtime = ctx as unknown as SupervisorRuntimeContext
   const admissionRuntime: TaskAdmissionRuntime = {
+    supportsBlockingReview: agent => ctx.tools.get('run_code', agent as never) === undefined,
     agents: runtime.agents as unknown as TaskAdmissionRuntime['agents'],
     sessions: runtime.sessions as unknown as TaskAdmissionRuntime['sessions'],
     sessionPersistence: runtime.sessionPersistence as unknown as TaskAdmissionRuntime['sessionPersistence'],
@@ -1479,6 +1549,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     runtime.webServer,
   ), 'dsh-gate supervisor descriptor route')
   installDirectChildAuthorityGuards(runtime, { directChildToolNames })
+  ctx.tools.guard(execution => supervisorReviewGuard(runtime.sessions.list(), execution as unknown as RuntimeToolExecution))
   installTokenBudgetGuards(runtime, {
     maxReservedOutputTokensPerRequest: resolved.maxReservedOutputTokensPerRequest,
   })
@@ -1493,8 +1564,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'Markdown report under `.dsh-handoff/<runId>/` inside the session cwd, include its relative path in '
       + '`artifacts`, and reference it from the concise summary. Keep the file list, verification claims, blocker, '
       + 'failure signature, hypotheses, and artifact manifest compact; their schemas are also bounded. '
+      + 'In reviewed mode, Request review only at a decision boundary: after investigation yields a nontrivial approach not already approved in the task packet; before changing a public interface, data/persistence/recovery contract or authority boundary; when new evidence invalidates the approved approach; or when a local repair must expand into a refactor or broader impact. If the packet already approves the approach and investigation confirms its assumptions, implement without asking again. Routine milestones and progress through an approved plan do not require review. Codex may explicitly request a checkpoint before affected implementation. Investigate enough to present a concrete decision, affected doneWhen, tradeoff and unresolved risk. Await `supervisor_review` before implementing such a decision. Approval is limited to the submitted proposal and existing permissions. Progress and generic guidance never release a review gate. Stop relevant child work before review; new execution is gated until explicit approval. After rejection/cancellation, submit a revised proposal. Reviewed runs require Standard/native tools; PTC review is rejected because its outer execution times out while waiting. Preserve existing run identity; do not downgrade or redispatch automatically. '
       + 'Use `supervisor_progress` only for bounded milestone changes; it never ends the turn. When a decision is needed, '
       + 'include the structured decision category, impact, blocking state, request, options, and recommendation. '
+      + 'For reviewed milestones include reviewEvidence: at most 8 criterion claims, 3 plan changes, 5 negative evidence items, and 8 workspace-relative evidence paths; each text/path is at most 256 characters. Always retain failure/not-run/uncertainty facts and explicitly count omitted entries. These are worker claims for independent inspection, not proof of acceptance. '
+      + 'When a reviewed task reaches a material risk boundary, include a low/medium/high/critical `riskLevel`; high and critical worker-reported risk can wake the supervisor immediately. '
       + '`needsSupervisor` is a migration hint; the runtime policy decides whether the request interrupts immediately or '
       + 'is folded into the normal progress cadence. Never claim pre-authorization yourself. '
       + 'When the task packet grants `authority.maxDirectChildren`, you may create children within that cap without asking again; the Host rejects starts beyond the durable run limit. DSH native maxDepth permits Root-to-child delegation and forbids grandchildren. '
@@ -1503,6 +1577,43 @@ export function apply(ctx: Context, config: Config = {}): void {
       + '`supervisor_report_failure`; its budget is enforced from your reported failureSignature, while deciding '
       + 'whether two failures are semantically the same remains your responsibility.',
   })
+
+  ctx.tools.register(defineTool({
+    name: 'supervisor_review',
+    description: 'Reviewed Root only: BEFORE a major approach, public interface change, material plan change or risk-sensitive implementation, request a blocking Codex decision. Approval covers only this proposal within existing authority. Revise/cancel/error keeps execution gated; submit a revised proposal. Stop relevant child work before requesting. Does not conclude the turn.',
+    parameters: {
+      sessionId: { type: 'string', required: true },
+      runId: { type: 'string', required: true },
+      category: { type: 'string', required: true, enum: ['approach', 'public_interface', 'plan_change', 'risk'] },
+      proposal: { type: 'string', required: true, description: 'At most 768 characters; proposal + rationale at most 997 total: decision, affected workstream/doneWhen, intended change; no reasoning trace, code or raw logs.' },
+      rationale: { type: 'string', required: true, description: 'At most 768 characters; proposal + rationale at most 997 total: concise engineering justification, alternatives/tradeoff, unresolved risk, and key evidence locators.' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: {
+        approved: { type: 'boolean', required: true },
+        sessionId: { type: 'string', required: true },
+        runId: { type: 'string', required: true },
+        feedback: { type: 'string', required: true },
+      } },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      if (exec.agent === undefined) throw new Error('supervisor_review requires a live Root agent')
+      const identity = latestTaskIdentity(exec.agent.session.events)
+      if (identity?.schemaVersion !== 2 || identity.supervisionMode !== 'reviewed'
+        || exec.agent.session.header.id !== identity.sessionId
+        || args.sessionId !== identity.sessionId || args.runId !== identity.runId) {
+        throw new Error('supervisor_review requires the current reviewed Root sessionId and runId')
+      }
+      const channel = ctx.get('userQuestions') as unknown as ReviewQuestionChannel | undefined
+      if (ctx.tools.get('run_code', exec.agent) !== undefined) {
+        throw new Error('supervisor_review requires Standard/native tools; PTC cannot wait safely for review')
+      }
+      if (channel === undefined) throw new Error('supervisor_review requires the native user-questions channel; execution remains gated')
+      const questionId = `dsh-review:${createHash('sha256').update(`${args.runId}:${exec.callId}`).digest('hex').slice(0, 24)}`
+      return awaitSupervisorReview(channel, args, { agent: exec.agent, signal: exec.signal }, questionId)
+    },
+  }))
 
   ctx.tools.register(defineTool({
     name: 'supervisor_progress',
@@ -1517,6 +1628,28 @@ export function apply(ctx: Context, config: Config = {}): void {
       nextAction: { type: 'string', required: true },
       currentHypothesis: { type: 'string' },
       risk: { type: 'string' },
+      riskLevel: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
+      reviewEvidence: {
+        type: 'object', additionalProperties: false,
+        description: 'Required for reviewed milestones. Worker claims, not verified acceptance. Report changes by workstream and zero-based doneWhen index; retain failures, not-run checks and uncertainty before narrative. Paths are unverified locators. Use omitted counts for truncation.',
+        properties: {
+          criteria: { type: 'array', required: true, items: {
+            type: 'object', additionalProperties: false, properties: {
+              workstreamId: { type: 'string', required: true },
+              doneWhenIndex: { type: 'integer', required: true },
+              status: { type: 'string', required: true, enum: ['met', 'unmet', 'unknown'] },
+              evidence: { type: 'string', required: true },
+            },
+          } },
+          planChanges: { type: 'array', required: true, items: { type: 'string' } },
+          negativeEvidence: { type: 'array', required: true, items: { type: 'string' } },
+          evidencePaths: { type: 'array', required: true, items: { type: 'string' } },
+          omitted: { type: 'object', required: true, additionalProperties: false, properties: {
+            criteria: { type: 'integer', required: true }, planChanges: { type: 'integer', required: true },
+            negativeEvidence: { type: 'integer', required: true }, evidencePaths: { type: 'integer', required: true },
+          } },
+        },
+      },
       needsSupervisor: { type: 'boolean', required: true },
       decision: {
         type: 'object', additionalProperties: false,
@@ -1564,6 +1697,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         nextAction: args.nextAction,
         ...args.currentHypothesis === undefined ? {} : { currentHypothesis: args.currentHypothesis },
         ...args.risk === undefined ? {} : { risk: args.risk },
+        ...args.riskLevel === undefined ? {} : { riskLevel: args.riskLevel },
+        ...args.reviewEvidence === undefined ? {} : { reviewEvidence: args.reviewEvidence },
         needsSupervisor: args.needsSupervisor,
         ...args.decision === undefined ? {} : { decision: args.decision },
       }
@@ -1637,7 +1772,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'only when the packet session/run identity and completionToken match and this successful tool result is followed by '
       + 'the corresponding turn/end event. A completed handoff cannot contain failed or not-run verification; an empty '
       + 'verification list remains protocol-complete but externally unverified. All model-facing fields and collection sizes are bounded; put complete detail '
-      + 'in an admitted .dsh-handoff/<runId>/ report instead of expanding the tool payload.',
+      + 'in an admitted .dsh-handoff/<runId>/ report instead of expanding the tool payload. New reviewed runs require finalReview covering every doneWhen before completed can be accepted; missing evidence must use blocked/failed.',
     parameters: {
       taskId: { type: 'string', description: 'Legacy schemaVersion 1 session/task id.' },
       sessionId: { type: 'string', description: 'SchemaVersion 2 durable DSH session id.' },
@@ -1659,6 +1794,27 @@ export function apply(ctx: Context, config: Config = {}): void {
             outcome: { type: 'string', required: true, enum: ['passed', 'failed', 'not_run'] },
             summary: { type: 'string', required: true },
           },
+        },
+      },
+      finalReview: {
+        type: 'object', additionalProperties: false,
+        description: 'Required for completed reviewed runs with terminalReviewContract=criteria-v1. Full table, not a delta: cover every doneWhen exactly once (max 40), all met with evidence, zero omitted counts, no unresolved negativeEvidence, and at least one evidencePath. Blocked/failed exits do not require it. Supporting artifacts do not replace this table.',
+        properties: {
+          criteria: { type: 'array', required: true, items: {
+            type: 'object', additionalProperties: false, properties: {
+              workstreamId: { type: 'string', required: true },
+              doneWhenIndex: { type: 'integer', required: true },
+              status: { type: 'string', required: true, enum: ['met', 'unmet', 'unknown'] },
+              evidence: { type: 'string', required: true },
+            },
+          } },
+          planChanges: { type: 'array', required: true, items: { type: 'string' } },
+          negativeEvidence: { type: 'array', required: true, items: { type: 'string' } },
+          evidencePaths: { type: 'array', required: true, items: { type: 'string' } },
+          omitted: { type: 'object', required: true, additionalProperties: false, properties: {
+            criteria: { type: 'integer', required: true }, planChanges: { type: 'integer', required: true },
+            negativeEvidence: { type: 'integer', required: true }, evidencePaths: { type: 'integer', required: true },
+          } },
         },
       },
       blocker: { type: 'string' },
@@ -1702,6 +1858,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (summaryError !== undefined) throw new Error(summaryError)
       const payloadError = handoffPayloadError(args)
       if (payloadError !== undefined) throw new Error(payloadError)
+      const reviewError = handoffReviewError(exec.agent.session.events, args)
+      if (reviewError !== undefined) throw new Error(`supervisor_handoff ${reviewError}`)
       const identity = latestTaskIdentity(exec.agent.session.events)
       const artifacts = await admitArtifacts(exec.agent.session.header.cwd, args.artifacts)
       let gitValidation
@@ -1729,6 +1887,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         summary: args.summary,
         files: args.files,
         verification: args.verification,
+        ...args.finalReview === undefined ? {} : { finalReview: args.finalReview },
         ...args.blocker === undefined ? {} : { blocker: args.blocker },
         ...args.failureSignature === undefined ? {} : { failureSignature: args.failureSignature },
         ...args.attemptedHypotheses === undefined ? {} : { attemptedHypotheses: args.attemptedHypotheses },

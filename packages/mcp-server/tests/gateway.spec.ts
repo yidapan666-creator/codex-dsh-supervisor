@@ -32,7 +32,7 @@ function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
       pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2,
       capabilities: [
         'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
-        'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+        'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'bearer-auth-v1',
       ],
     }),
   )
@@ -55,7 +55,7 @@ const gateReady = async () => ({
   pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2 as const,
   capabilities: [
     'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
-    'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'bearer-auth-v1',
+    'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'bearer-auth-v1',
   ],
 })
 
@@ -376,6 +376,7 @@ describe('writer admission', () => {
       schemaVersion: 2, sessionId: 's1', runId: '11111111-1111-4111-8111-111111111111',
       completionToken: '22222222-2222-4222-8222-222222222222', objective: 'interrupted writer',
       writerMode: 'writer',
+      supervisionMode: 'reviewed',
     }
     const ended = [event('user/message', 1, {
       content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
@@ -661,6 +662,22 @@ describe('Web-visible task identity', () => {
       },
     })).rejects.toThrow(/must match the interrupted parent run/)
 
+    await expect(manager.task({
+      sessionId: 's1',
+      objective: 'resume from the durable recovery evidence',
+      parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+      writerMode: 'read_only',
+    })).rejects.toThrow(/writerMode must match the interrupted parent run/)
+
+    await expect(manager.task({
+      sessionId: 's1',
+      objective: 'resume from the durable recovery evidence',
+      parentRunId: interruptedRunId,
+      recoveryCapsule: recovered.recoveryCapsule,
+      supervisionMode: 'delegated',
+    })).rejects.toThrow(/supervisionMode must match the interrupted parent run/)
+
     const continuation = await manager.task({
       sessionId: 's1',
       objective: 'resume from the durable recovery evidence',
@@ -672,6 +689,7 @@ describe('Web-visible task identity', () => {
     expect(packet).toMatchObject({
       schemaVersion: 2,
       parentRunId: interruptedRunId,
+      supervisionMode: 'reviewed',
       recoveryCapsule: {
         parentRunId: interruptedRunId,
         uncertainEffects: { total: 1 },
@@ -979,8 +997,24 @@ describe('Web-visible task identity', () => {
       sessionId: 's1',
       runId: result.runId,
       objective,
+      supervisionMode: 'delegated',
     })
     expect(JSON.stringify(api.rows.get('s1')?.events)).toContain('/dsh-supervised-worker')
+  })
+
+  it('pins a safe default or explicit supervision mode in the receipt and durable packet', async () => {
+    const api = new FakeApi()
+    api.addRow('writer', { cwd: '/work/tree' })
+    api.addRow('reader', { cwd: '/work/other' })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.task({ sessionId: 'writer', objective: 'Implement it', writerMode: 'writer' }))
+      .resolves.toMatchObject({ supervisionMode: 'reviewed' })
+    await expect(manager.task({
+      sessionId: 'reader', objective: 'Inspect it', writerMode: 'read_only', supervisionMode: 'delegated',
+    })).resolves.toMatchObject({ supervisionMode: 'delegated' })
+    expect(parseTaskPacket(api.rows.get('writer')?.events ?? [])).toMatchObject({ supervisionMode: 'reviewed' })
+    expect(parseTaskPacket(api.rows.get('reader')?.events ?? [])).toMatchObject({ supervisionMode: 'delegated' })
   })
 
   it('durably carries one bounded Codex workstream graph and reports its compact receipt', async () => {
@@ -1370,6 +1404,78 @@ function s1V2CompletedEvents(): DshEvent[] {
 }
 
 describe('wait cadence', () => {
+  it('recovers an interrupted run even when its reported-failure budget was exhausted', async () => {
+    const packet = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: v2RunId,
+      completionToken: v2CompletionToken,
+      objective: 'recover after repeated failure',
+      writerMode: 'writer',
+    }
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events: [
+      event('user/message', 1, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 2, { turn: 1 }),
+      toolCall(3, 'failure-1', 'supervisor_report_failure', { failureSignature: 'build:missing-export' }),
+      event('tool/result', 4, {
+        turn: 1, step: 1,
+        message: { source: { callId: 'failure-1' }, content: [{
+          type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({
+            exhausted: true, failureSignature: 'build:missing-export', count: 2, budget: 2,
+          }) }],
+        }] },
+      }),
+      event('turn/end', 5, { turn: 1, reason: { kind: 'interrupted' } }),
+    ] })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      status: 'FAILED', recovery: { kind: 'CONTINUATION_REQUIRED' },
+      reportedFailureBudget: { exhausted: true, count: 2, limit: 2 },
+    })
+    await expect(manager.recover({ sessionId: 's1', runId: v2RunId })).resolves.toMatchObject({
+      status: 'FAILED', recovery: { kind: 'CONTINUATION_REQUIRED' },
+      recoveryCapsule: { parentRunId: v2RunId },
+      reportedFailureBudget: { exhausted: true, count: 2, limit: 2 },
+    })
+    expect(api.recoveryCapsuleCalls).toBeGreaterThan(0)
+  })
+
+  it('preserves request-rejected budget semantics when Host usage is still below the limit', async () => {
+    const events = s1V2CompletedEvents()
+    events[events.length - 1] = event('turn/end', 5, {
+      turn: 1,
+      reason: {
+        kind: 'aborted',
+        reason: {
+          kind: 'hook',
+          reason: `dsh-gate:token-budget-request-rejected;runId=${v2RunId};used=0;limit=100;remaining=100;requiredInput=120`,
+        },
+      },
+    })
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/work', events })
+    const manager = managerWith(api, sameDomain)
+
+    await expect(manager.wait({ sessionId: 's1', runId: v2RunId, timeoutMs: 0 })).resolves.toMatchObject({
+      stage: 'token-budget-request-rejected',
+      budget: { status: 'REQUEST_REJECTED', observedTokens: 0, remainingTokens: 100, exhausted: false },
+    })
+    await expect(manager.recover({ sessionId: 's1', runId: v2RunId })).resolves.toMatchObject({
+      stage: 'token-budget-request-rejected',
+      budget: { status: 'REQUEST_REJECTED', observedTokens: 0, remainingTokens: 100, exhausted: false },
+    })
+    await expect(manager.runs()).resolves.toMatchObject({
+      entries: [{
+        sessionId: 's1', runId: v2RunId, stage: 'token-budget-request-rejected',
+        budget: { status: 'REQUEST_REJECTED', observedTokens: 0, remainingTokens: 100, exhausted: false },
+      }],
+    })
+  })
+
   it('keeps wait, recover, and durable run discovery consistent when an accepted handoff is followed by interruption', async () => {
     const events = s1V2CompletedEvents()
     events[events.length - 1] = event('turn/end', 5, { turn: 1, reason: { kind: 'interrupted' } })

@@ -112,7 +112,7 @@ const MUTATING_TOOLS: Record<string, { pathKey: string; mutatingCommands?: Reado
 }
 const CLASSIFIED_NON_MUTATING_TOOLS = new Set([
   'read', 'view', 'grep', 'glob', 'find', 'ls',
-  'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure',
+  'supervisor_progress', 'supervisor_handoff', 'supervisor_report_failure', 'supervisor_review',
 ])
 const VERIFICATION_TOKENS = new Set([
   'pnpm', 'npm', 'yarn', 'npx', 'bun', 'deno', 'tsc', 'vitest', 'jest', 'mocha',

@@ -45,6 +45,7 @@ export class FakeApi {
   listCalls = 0
   promptCalls = 0
   interruptCalls = 0
+  recoveryCapsuleCalls = 0
   failModels = false
   resolveWriterDomain: (cwd: string) => Promise<string> = async cwd => cwd
   readonly historyPayloads: Array<{ sessionId: string; beforeSeq?: number; maxMessages?: number }> = []
@@ -309,6 +310,7 @@ export class FakeApi {
   }
 
   async recoveryCapsule(request: RecoveryCapsuleRequest): Promise<RecoveryCapsule> {
+    this.recoveryCapsuleCalls++
     const root = this.rows.get(request.sessionId)
     const packet = parseTaskPacket(root?.events ?? [])
     if (root === undefined || packet?.schemaVersion !== 2 || packet.runId !== request.parentRunId) {

@@ -553,7 +553,12 @@ async function runHost({ paths, options, hostAction }) {
     if (hostAction === 'run') {
       const child = io.spawn(argv[0], argv.slice(1), {
         cwd: hostPaths.root,
-        env: { ...process.env, DSH_HOME: hostPaths.dshHome, DSH_HOST_TOKEN: hostToken },
+        env: {
+          ...process.env,
+          DSH_HOME: hostPaths.dshHome,
+          DSH_GATE_RUNTIME_STATE_DIR: hostPaths.stateDir,
+          DSH_HOST_TOKEN: hostToken,
+        },
         detached: false,
         stdio: 'inherit',
       })
@@ -639,7 +644,12 @@ async function runHost({ paths, options, hostAction }) {
     const logFd = await openAppend(hostPaths.hostLogFile)
     const child = io.spawn(argv[0], argv.slice(1), {
       cwd: hostPaths.root,
-      env: { ...process.env, DSH_HOME: hostPaths.dshHome, DSH_HOST_TOKEN: hostToken },
+      env: {
+        ...process.env,
+        DSH_HOME: hostPaths.dshHome,
+        DSH_GATE_RUNTIME_STATE_DIR: hostPaths.stateDir,
+        DSH_HOST_TOKEN: hostToken,
+      },
       detached: true,
       stdio: ['ignore', logFd, logFd],
     })

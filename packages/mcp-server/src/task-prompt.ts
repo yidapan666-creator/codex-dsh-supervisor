@@ -1,8 +1,16 @@
-import type { ExecutionBrief, ExecutionBriefInput, TaskPacketV2 } from './contracts.js'
+import type { ExecutionBrief, ExecutionBriefInput, SupervisionMode, TaskPacketV2 } from './contracts.js'
 import { executionBriefInputSchema, executionBriefSchema, TASK_PACKET_END, TASK_PACKET_START } from './contracts.js'
 
 export const TASK_INSTRUCTION_PROFILE = 'engineering-v1' as const
 export const DEFAULT_MAX_DIRECT_CHILDREN = 5
+
+/** Resolve once at admission; writers fail safe to independent terminal review. */
+export function resolveSupervisionMode(
+  writerMode: 'writer' | 'read_only',
+  requested?: SupervisionMode,
+): SupervisionMode {
+  return requested ?? (writerMode === 'writer' ? 'reviewed' : 'delegated')
+}
 
 const DEFAULT_CONSTRAINTS = [
   'Stay inside the objective and workspace scope; preserve unrelated behavior and pre-existing user changes.',
@@ -81,6 +89,10 @@ export function compileTaskPrompt(packet: TaskPacketV2): string {
   const continuation = packet.recoveryCapsule === undefined
     ? ''
     : '\n- This is a recovery continuation. Reconcile every uncertain effect before any retry; never blindly replay an unresolved call.'
+  const supervisionMode = resolveSupervisionMode(packet.writerMode, packet.supervisionMode)
+  const supervision = supervisionMode === 'reviewed'
+    ? '\n- This run uses reviewed supervision. Follow the Codex technical direction in context, constraints and executionBrief.integration. Request review only at a decision boundary: after investigation yields a nontrivial approach not already approved in the task packet; before changing a public interface, data/persistence/recovery contract or authority boundary; when new evidence invalidates the approved approach; or when a local repair must expand into a refactor or broader impact. If the packet already approves the approach and investigation confirms its assumptions, implement without asking again. Routine milestones and progress through an approved plan do not require review. Codex may explicitly request a checkpoint before affected implementation. Investigate enough to present a concrete decision, affected doneWhen, tradeoff and unresolved risk. BEFORE implementing an unapproved material decision, call supervisor_review with the exact sessionId/runId and a bounded proposal/rationale identifying affected workstream/doneWhen, tradeoff and evidence locators. Await explicit approval; progress reports and generic steer are not approvals. Do not ask again for routine work under an approved approach. Stop relevant child work before review; the Host blocks new execution while review is pending or rejected, but cannot undo already-running effects. If revised or cancelled, submit a revised proposal. Reviewed supervision requires Standard/native tools; PTC cannot safely hold an indefinite review. Never switch an existing session or downgrade supervision automatically. Approval never expands scope or permissions. Report high/critical risk with riskLevel at a meaningful boundary. Include reviewEvidence at each milestone: criteria claims keyed by executionBrief workstreamId and zero-based doneWhenIndex, planChanges, negativeEvidence, evidencePaths, and omitted counts. Limit criteria to 8, planChanges to 3, negativeEvidence to 5, paths to 8; each text/path is at most 256 characters. Report changed criteria but carry unresolved failures, not-run checks and uncertainty forward. Remove repetition before negative evidence; never hide omissions or treat unknown as met. Evidence paths are locators, not verified artifacts. Codex may inspect watched paths and correct in-scope engineering deviations without taking over implementation. A completed handoff is candidate evidence for Codex independent terminal review, not supervisor acceptance.'
+    : '\n- This run uses delegated supervision. Work autonomously within the packet and provide compact structured terminal evidence; do not manufacture extra checkpoints.'
   return `${packet.objective}\n\n/dsh-supervised-worker\n\n`
     + `${TASK_PACKET_START}\n${JSON.stringify(packet)}\n${TASK_PACKET_END}\n\n`
     + `<dsh-execution-contract profile="${TASK_INSTRUCTION_PROFILE}">\n`
@@ -92,6 +104,10 @@ export function compileTaskPrompt(packet: TaskPacketV2): string {
     + '- Do not ask again for ordinary edits, compilation, tests, builds, debugging, or child use already authorized by the packet. Escalate only under the packet conditions.\n'
     + '- Completion requires a successful supervisor_handoff with matching sessionId, runId, and completionToken, followed by this Root turn ending. A plain turn end is not success.\n'
     + '- Artifact paths are relative to the session cwd. Report repeated recovery failures with a stable worker-chosen failureSignature. The Host enforces the task token budget while the supervisor is disconnected.'
+    + (packet.terminalReviewContract === 'criteria-v1'
+      ? '\n- Before completed handoff, supply finalReview: a full table of every executionBrief doneWhen exactly once (up to 40), all met with nonempty evidence, at least one evidencePath, no omitted items and no unresolved negativeEvidence. This is not a milestone delta. Preserve resolved failure history in verification summaries or admitted artifacts. Use blocked/failed if any criterion or negative evidence remains unresolved. The Host rejects incomplete success; Codex still independently reviews the result.'
+      : '')
+    + supervision
     + continuation
     + '\n</dsh-execution-contract>'
 }

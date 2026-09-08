@@ -143,6 +143,7 @@ describe('authoritative completion fold', () => {
       completionToken: '22222222-2222-4222-8222-222222222222',
       objective: 'ship it',
       writerMode: 'writer',
+      supervisionMode: 'reviewed',
     }
     const startV2 = event('user/message', 0, {
       content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
@@ -170,6 +171,8 @@ describe('authoritative completion fold', () => {
     expect(observed).toMatchObject({
       status: 'COMPLETED', sessionId: 's1', runId: packetV2.runId,
       stage: 'verified', summary: 'canonical result',
+      supervision: { mode: 'reviewed', terminalReview: 'INDEPENDENT_REQUIRED' },
+      decision: { action: 'REVIEW_TERMINAL', reasonCode: 'INDEPENDENT_TERMINAL_REVIEW' },
     })
   })
 
@@ -355,6 +358,46 @@ describe('authoritative completion fold', () => {
     expect(observed).toMatchObject({ status: 'ESCALATION_REQUIRED', failureSignature: 'build:missing-export' })
   })
 
+  it('keeps interrupted continuation authoritative when the reported-failure budget was exhausted', () => {
+    const interruptedPacket = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'recover after exhausted failure reports',
+      writerMode: 'writer',
+    }
+    const failureCall = event('tool/call', 2, {
+      turn: 1, callId: 'f1', name: 'supervisor_report_failure',
+      arguments: JSON.stringify({ failureSignature: 'build:missing-export' }),
+    })
+    const failureResult = event('tool/result', 3, {
+      turn: 1,
+      message: {
+        source: { callId: 'f1' },
+        content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ exhausted: true, failureSignature: 'build:missing-export', count: 2, budget: 2 }),
+        }] }],
+      },
+    })
+    const packetStart = event('user/message', 0, {
+      content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(interruptedPacket)}\n${TASK_PACKET_END}` }],
+    })
+    const observed = deriveObservation(state([
+      packetStart, event('turn/start', 1, { turn: 1 }), failureCall, failureResult,
+      event('turn/end', 4, { turn: 1, reason: { kind: 'interrupted' } }),
+    ]))
+    expect(observed).toMatchObject({
+      status: 'FAILED',
+      stage: 'host-restart-interrupted',
+      failure: { kind: 'HOST_FAILED', retryable: true },
+      recovery: { kind: 'CONTINUATION_REQUIRED' },
+      failureSignature: 'build:missing-export',
+      reportedFailureBudget: { exhausted: true, count: 2, limit: 2 },
+    })
+    expect(observationSchema.safeParse(observed).success).toBe(true)
+  })
+
   it('marks WAITING as an explicit timeout without changing worker state', () => {
     const waiting = deriveObservation(state([start], { workerState: 'RUNNING' }))
     expect(timeoutObservation(waiting, 250)).toMatchObject({
@@ -535,6 +578,80 @@ describe('authoritative completion fold', () => {
         timing: 'cadence', audience: 'supervisor', action: 'SURFACE_PROGRESS',
         matchedRuleId: 'worker.fallback', reasonCode: 'NON_BLOCKING_WORKER_DECISION',
       },
+    })
+  })
+
+  it('surfaces a reported high risk immediately in reviewed mode without requiring a decision payload', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'ship it',
+      writerMode: 'writer',
+      supervisionMode: 'reviewed',
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'implementing',
+      milestone: 'The public API may need to change.', nextAction: 'Pause for supervisor review.',
+      riskLevel: 'high', risk: 'Compatibility cannot be preserved with the current design.',
+      needsSupervisor: false,
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, { turn: 1, callId: 'risk', name: 'supervisor_progress', arguments: JSON.stringify(progress) }),
+      event('tool/result', 3, {
+        turn: 1,
+        message: { source: { callId: 'risk' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+    ], { workerState: 'RUNNING' }))
+
+    expect(observed).toMatchObject({
+      status: 'SUPERVISOR_REQUIRED', boundarySeq: 3,
+      supervision: { mode: 'reviewed' },
+      decision: {
+        timing: 'immediate', audience: 'supervisor', action: 'REVIEW_WORKER_REQUEST',
+        reasonCode: 'REPORTED_HIGH_RISK',
+      },
+    })
+  })
+
+  it('keeps a standalone reported risk in the normal cadence in delegated mode', () => {
+    const packetV2 = {
+      schemaVersion: 2,
+      sessionId: 's1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'inspect it',
+      writerMode: 'read_only',
+      supervisionMode: 'delegated',
+    }
+    const progress = {
+      sessionId: 's1', runId: packetV2.runId, phase: 'investigating',
+      milestone: 'A compatibility concern was found.', nextAction: 'Continue gathering evidence.',
+      riskLevel: 'high', risk: 'The concern is not yet actionable.', needsSupervisor: false,
+    }
+    const observed = deriveObservation(state([
+      event('user/message', 0, {
+        content: [{ type: 'text', text: `${TASK_PACKET_START}\n${JSON.stringify(packetV2)}\n${TASK_PACKET_END}` }],
+      }),
+      event('turn/start', 1, { turn: 1 }),
+      event('tool/call', 2, { turn: 1, callId: 'risk', name: 'supervisor_progress', arguments: JSON.stringify(progress) }),
+      event('tool/result', 3, {
+        turn: 1,
+        message: { source: { callId: 'risk' }, content: [{ type: 'tool-result', content: [{
+          type: 'text', text: JSON.stringify({ accepted: true, progress }),
+        }] }] },
+      }),
+    ], { workerState: 'RUNNING' }))
+    expect(observed).toMatchObject({
+      status: 'WAITING', supervision: { mode: 'delegated' },
+      decision: { timing: 'cadence', action: 'SURFACE_PROGRESS' },
     })
   })
 

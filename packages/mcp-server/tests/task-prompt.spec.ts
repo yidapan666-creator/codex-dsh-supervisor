@@ -2,10 +2,16 @@ import { describe, expect, it } from 'vitest'
 import type { TaskPacketV2 } from '../src/contracts.js'
 import {
   compileTaskPrompt, DEFAULT_MAX_DIRECT_CHILDREN, normalizeExecutionBrief, normalizeTaskInstructions,
-  TASK_INSTRUCTION_PROFILE,
+  resolveSupervisionMode, TASK_INSTRUCTION_PROFILE,
 } from '../src/task-prompt.js'
 
 describe('Codex-to-DSH task instruction compiler', () => {
+  it('defaults writers to reviewed supervision and read-only work to delegated supervision', () => {
+    expect(resolveSupervisionMode('writer')).toBe('reviewed')
+    expect(resolveSupervisionMode('read_only')).toBe('delegated')
+    expect(resolveSupervisionMode('writer', 'delegated')).toBe('delegated')
+  })
+
   it('fills safe engineering defaults without a model call', () => {
     const value = normalizeTaskInstructions({ writerMode: 'writer' })
     expect(value.allowedScope).toEqual(['.'])
@@ -41,13 +47,37 @@ describe('Codex-to-DSH task instruction compiler', () => {
       completionToken: '22222222-2222-4222-8222-222222222222',
       objective: 'Fix the parser',
       writerMode: 'writer',
+      supervisionMode: 'reviewed',
     } as TaskPacketV2
     const prompt = compileTaskPrompt(packet)
     expect(prompt).toContain(`profile="${TASK_INSTRUCTION_PROFILE}"`)
     expect(prompt).toContain('inspect evidence; choose the smallest coherent approach; implement within scope')
     expect(prompt).toContain('A plain turn end is not success')
+    expect(prompt).toContain('independent terminal review')
+    expect(prompt).toContain('riskLevel')
+    expect(prompt).toContain('BEFORE implementing')
+    expect(prompt).toContain('supervisor_review')
+    expect(prompt).toContain('implement without asking again')
+    expect(prompt).toContain('Routine milestones')
+    expect(prompt).toContain('Standard/native tools')
+    expect(prompt).toContain('generic steer are not approvals')
     expect(prompt).toContain('Treat executionBrief as a bounded work map')
     expect(prompt).toContain(JSON.stringify(packet))
+  })
+
+  it('keeps delegated supervision autonomous while preserving bounded evidence', () => {
+    const prompt = compileTaskPrompt({
+      schemaVersion: 2,
+      sessionId: 'session-1',
+      runId: '11111111-1111-4111-8111-111111111111',
+      completionToken: '22222222-2222-4222-8222-222222222222',
+      objective: 'Review the parser',
+      writerMode: 'read_only',
+      supervisionMode: 'delegated',
+    } as TaskPacketV2)
+    expect(prompt).toContain('delegated supervision')
+    expect(prompt).toContain('structured terminal evidence')
+    expect(prompt).not.toContain('call supervisor_review')
   })
 
   it('marks an omitted decomposition as an explicit single-stream fallback', () => {
