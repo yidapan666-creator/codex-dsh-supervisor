@@ -1,3 +1,5 @@
+import { ExecutionAuthority, MemoryExecutionStore } from '../../dsh-supervisor-tools/src/execution-authority.js'
+import type { ExecutionControlInput } from '../src/execution-control.js'
 // In-memory IApiClient used to drive real HostConnection/ConnectionController
 // code paths in tests: the controller's handshake (both streams open + describe)
 // completes immediately, history is served from the row's event list, and prompt
@@ -36,6 +38,11 @@ export interface FakeRow {
 }
 
 export class FakeApi {
+  readonly executionAuthority = new ExecutionAuthority(new MemoryExecutionStore())
+  executionControl(input: ExecutionControlInput) {
+    return this.executionAuthority.control(input as never, ['.'], true)
+  }
+
   readonly rows = new Map<string, FakeRow>()
   readonly childCatalog = new Map<string, Array<
     | { kind: 'child'; id: string; mode: 'one-shot' | 'continuable'; activity: 'running' | 'inactive'; hasChildren: boolean; label?: string }

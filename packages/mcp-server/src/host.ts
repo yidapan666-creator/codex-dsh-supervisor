@@ -1,3 +1,4 @@
+import { postExecutionControl, type ExecutionControlInput, type ExecutionState } from './execution-control.js'
 import { spawn } from 'node:child_process'
 import {
   ConnectionController,
@@ -480,6 +481,7 @@ export class HostConnection {
     private readonly budgetStateTransport: TokenBudgetStateTransport = request => postTokenBudgetState(baseUrl, request),
     private readonly recoveryTransport: RecoveryCapsuleTransport = request => postRecoveryCapsule(baseUrl, request),
     private readonly gateDescriptorTransport: GateDescriptorTransport = () => fetchGateDescriptor(baseUrl),
+    private readonly executionTransport: (command: ExecutionControlInput) => Promise<ExecutionState> = command => postExecutionControl(baseUrl, command),
   ) {
     this.controller = new ConnectionController(this.api, {
       onConnected: (description) => {
@@ -499,6 +501,8 @@ export class HostConnection {
     })
     this.controller.start()
   }
+
+  executionControl(command: ExecutionControlInput): Promise<ExecutionState> { return this.executionTransport(command) }
 
   stopClient(): void {
     this.controller.stop()
@@ -784,6 +788,7 @@ export function authenticatedHostConnection(baseUrl: string, token: string): Hos
     request => postTokenBudgetState(baseUrl, request, token),
     request => postRecoveryCapsule(baseUrl, request, token),
     () => fetchGateDescriptor(baseUrl, token),
+    command => postExecutionControl(baseUrl, command, token),
   )
 }
 

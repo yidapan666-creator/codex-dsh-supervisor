@@ -169,9 +169,11 @@ reason; live checks are optional and skipped without `--live`.
 
 The supervisor descriptor's `buildId` is a content-derived identity, independent
 of the package version. `pnpm build-id:check` verifies it and `pnpm
-build-id:update` refreshes it after intentional Host-runtime changes. MCP and
+build-id:update` refreshes it after intentional Host, MCP or packaged skill changes. MCP and
 doctor import the same recorded identity and therefore reject a still-running
 Host loaded from older plugin code until that Host is restarted.
+
+Execution authority is persisted under `DSH_HOME/dsh-gate/execution-authority` with retained session state. MCP exit does not stop the Host; reviewed grants remain bounded by their expiry/effect allowance. Host restart invalidates old grants even if their expiry has not passed. Upgrade the MCP, Host plugin and packaged skills together; re-read the new supervisor instructions in Codex. A build hash cannot attest to already-loaded instructions. Existing run history is not rewritten. Deployment/restart must be scheduled with session state reconciled; rebuilding this repository alone does not update the running Host.
 
 ## Host lifecycle (independent of MCP)
 

@@ -11,7 +11,7 @@ const compiledIdentityFile = join(pluginRoot, 'src', 'build-identity.ts')
 
 async function sourceFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true })
-  const nested = await Promise.all(entries.map(entry => entry.isDirectory()
+  const nested = await Promise.all(entries.filter(entry => !entry.name.startsWith('.') && entry.name !== '__pycache__').map(entry => entry.isDirectory()
     ? sourceFiles(join(directory, entry.name))
     : [join(directory, entry.name)]))
   return nested.flat()
@@ -20,6 +20,8 @@ async function sourceFiles(directory) {
 export async function expectedBuildIdentity() {
   const files = [
     ...(await sourceFiles(join(pluginRoot, 'src'))).filter(file => file !== compiledIdentityFile),
+    ...(await sourceFiles(join(workspaceRoot, 'packages', 'mcp-server', 'src'))),
+    ...(await sourceFiles(join(workspaceRoot, 'skills'))),
     join(pluginRoot, 'cordis.patch.yml'),
     join(pluginRoot, 'compatibility.mjs'),
     join(pluginRoot, 'compatibility.d.mts'),

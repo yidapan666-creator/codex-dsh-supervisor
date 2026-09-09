@@ -59,7 +59,7 @@ describe('blocking native supervisor review', () => {
       expect(ask.mock.calls[0]?.[0].questions[0]?.detail).toContain(proposal.proposal)
       expect(ask.mock.calls[0]?.[0].questions[0]?.detail).toContain(proposal.rationale)
       const content = review.output.render(proposal, value)
-      const check = () => guards[0]?.({ name: 'write', token: Symbol(), agent: exec.agent })
+      const check = () => guards.map(guard => guard({ name: 'write', token: Symbol(), agent: exec.agent })).find(reason => reason !== undefined)
       expect(check()).toContain('review-pending')
       root.events.push({ type: 'tool/result', seq: 2, time: 102, data: {
         message: { source: { callId: 'review-1' }, content: [{ type: 'tool-result', isError: false, content }] },

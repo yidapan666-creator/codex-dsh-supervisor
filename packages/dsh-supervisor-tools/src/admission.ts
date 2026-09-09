@@ -657,6 +657,20 @@ export class TaskAdmissionCoordinator {
     })
   }
 
+  /** Hold admission closed while recording a supervisor declaration against a settled, exact boundary. */
+  async recordTerminalReview<T>(sessionId: string, runId: string, asOfSeq: number | undefined, record: () => Promise<T>): Promise<T> {
+    return this.exclusive(`session:${sessionId}`, async () => {
+      const sessions = await this.recovery.snapshot()
+      const root = sessions.get(sessionId)
+      const identity = root === undefined ? undefined : packetIdentities(root.events).at(-1)
+      if (root === undefined || identity?.runId !== runId || root.events.at(-1)?.seq !== asOfSeq
+        || this.unsettledRunTree(sessionId, sessions) !== undefined
+        || acceptedTerminalHandoff(root.events, identity)?.status !== 'completed'
+        || acceptedTerminalHandoff(root.events, identity)?.turnEnd.seq !== root.events.findLast(e => e.type === 'turn/end')?.seq) throw new Error('Independent review requires the exact settled run-tree boundary')
+      return record()
+    })
+  }
+
   /** Reuse DSH's native cold-session resolver before admission needs live cwd/policy state. */
   private async ensureAttached(sessionId: string, requestId: string): Promise<AdmissionAgent> {
     const current = this.runtime.agents.list()
@@ -737,7 +751,17 @@ export class TaskAdmissionCoordinator {
         matches[0]?.seq as number, agent.session.events.at(-1)?.seq ?? -1,
       )
     }
+    if ((request.packet.supervisionMode !== undefined && !['reviewed', 'delegated'].includes(String(request.packet.supervisionMode)))
+      || !['writer', 'read_only'].includes(String(request.packet.writerMode))
+      || typeof request.packet.objective !== 'string' || request.packet.objective.length === 0
+      || typeof request.packet.completionToken !== 'string' || !UUID_PATTERN.test(request.packet.completionToken)) {
+      throw new TaskAdmissionError('BAD_REQUEST', 'invalid supervised task execution identity')
+    }
     this.assertReviewSupported(agent, request.packet)
+    if ((request.packet.supervisionMode === 'reviewed' || (request.packet.supervisionMode === undefined && request.writerMode === 'writer'))
+      && (agent.session.header.parentSession !== undefined || request.packet.executionReviewContract !== 'execution-lease-v1')) {
+      throw new TaskAdmissionError('BAD_REQUEST', 'new reviewed runs require executionReviewContract=execution-lease-v1; update the MCP and active supervisor instructions')
+    }
     if (request.parentRunId !== undefined && request.recoveryCapsule !== undefined) {
       const expected = await this.recovery.capsule(request.sessionId, request.parentRunId)
       if (canonicalJson(expected) !== canonicalJson(request.recoveryCapsule)) {

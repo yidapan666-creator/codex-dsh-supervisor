@@ -32,6 +32,7 @@ function request(runId = firstRunId, requestDigest = digest): TaskAdmissionReque
     requestId,
     requestDigest,
     objective: 'atomic work',
+    executionReviewContract: 'execution-lease-v1',
     writerMode: 'read_only',
   }
   return {
@@ -180,7 +181,7 @@ function nextRequest(sessionId = 's1'): TaskAdmissionRequest {
     schemaVersion: 2, sessionId, runId: nextRunId,
     completionToken: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
     requestId: nextRequestId, requestDigest: nextDigest,
-    objective: 'next task', writerMode: 'read_only',
+    objective: 'next task', writerMode: 'read_only', executionReviewContract: 'execution-lease-v1',
   }
   return {
     schemaVersion: 1, sessionId, requestId: nextRequestId, requestDigest: nextDigest, runId: nextRunId,
@@ -289,6 +290,7 @@ function continuationRequest(
     requestId: nextRequestId,
     requestDigest: nextDigest,
     objective: 'continue exactly',
+    executionReviewContract: 'execution-lease-v1',
     writerMode: 'read_only',
     parentRunId: firstRunId,
     recoveryCapsule,
@@ -307,6 +309,37 @@ function continuationRequest(
 }
 
 describe('Host task admission', () => {
+  it('rejects a new reviewed packet without the execution contract before provider setup', async () => {
+    const h = harness()
+    const r = request()
+    r.prompt = r.prompt.replace('"writerMode":"read_only"', '"writerMode":"read_only","supervisionMode":"reviewed"')
+      .replace('"executionReviewContract":"execution-lease-v1",', '')
+    await expect(h.coordinator.admit(r)).rejects.toThrow('executionReviewContract')
+    expect(h.calls.selectModel).toBe(0); expect(h.calls.prompt).toBe(0)
+  })
+
+  it('persists an independent review only at the exact completed boundary and rejects later stale acceptance', async () => {
+    const h = harness()
+    const now = Date.now()
+    h.events.push({ type: 'user/message', seq: 0, time: now, data: { content: [{ type: 'text', text: request().prompt }] } })
+    h.events.push(...terminalHandoffEvents(1, { resultTime: now + 20 }))
+    let records = 0
+    await h.coordinator.recordTerminalReview('s1', firstRunId, 4, async () => { records++ })
+    expect(records).toBe(1)
+    await expect(h.coordinator.recordTerminalReview('s1', firstRunId, 3, async () => { records++ })).rejects.toThrow('settled')
+    h.events.push({ type: 'turn/end', seq: 5, time: now + 30, data: { turn: 2, reason: { kind: 'failed' } } })
+    await expect(h.coordinator.recordTerminalReview('s1', firstRunId, 5, async () => { records++ })).rejects.toThrow('settled')
+    expect(records).toBe(1)
+  })
+
+  it('records review only against a current settled completed boundary, never a bare turn end', async () => {
+    const h = harness({ seed: [inboxEvent(0)] })
+    let records = 0
+    h.events.push({ type: 'turn/end', seq: 1, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } })
+    await expect(h.coordinator.recordTerminalReview('s1', firstRunId, 1, async () => { records++ })).rejects.toThrow('settled')
+    expect(records).toBe(0)
+  })
+
   it('serializes concurrent callers and returns one stable durable run id', async () => {
     const test = harness()
     const [first, second] = await Promise.all([
@@ -392,7 +425,7 @@ describe('Host task admission', () => {
     const secondPacket = {
       schemaVersion: 2, sessionId: 's2', runId: secondRun,
       completionToken: '77777777-7777-4777-8777-777777777777',
-      requestId: secondRequestId, requestDigest: 'b'.repeat(64), objective: 'other writer', writerMode: 'writer',
+      requestId: secondRequestId, requestDigest: 'b'.repeat(64), objective: 'other writer', writerMode: 'writer', executionReviewContract: 'execution-lease-v1',
     }
     const second: TaskAdmissionRequest = {
       schemaVersion: 1, sessionId: 's2', requestId: secondRequestId, requestDigest: 'b'.repeat(64), runId: secondRun,
@@ -470,7 +503,7 @@ describe('Host task admission', () => {
     const secondPacket = {
       schemaVersion: 2, sessionId: 's2', runId: secondRun,
       completionToken: '77777777-7777-4777-8777-777777777777',
-      requestId: secondRequestId, requestDigest: 'b'.repeat(64), objective: 'second writer', writerMode: 'writer',
+      requestId: secondRequestId, requestDigest: 'b'.repeat(64), objective: 'second writer', writerMode: 'writer', executionReviewContract: 'execution-lease-v1',
     }
     const second: TaskAdmissionRequest = {
       schemaVersion: 1, sessionId: 's2', requestId: secondRequestId, requestDigest: 'b'.repeat(64), runId: secondRun,

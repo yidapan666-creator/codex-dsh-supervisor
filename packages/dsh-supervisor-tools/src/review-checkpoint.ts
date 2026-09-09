@@ -115,7 +115,7 @@ export function allowedDuringReview(name: string, args: unknown, isRoot: boolean
     if (match === null || match[1] === 'run_code') return false
     try { return allowedDuringReview(match[1]!, JSON.parse(match[2]!), isRoot) } catch { return false }
   }
-  if (['read', 'read_image', 'glob', 'grep'].includes(name)) return true
+  if (['read', 'read_image', 'glob', 'grep', 'terminal_read', 'terminal_list'].includes(name)) return true
   if (name === 'str_replace_editor') return object(args).command === 'view'
   if (!isRoot) return false
   if (['supervisor_review', 'supervisor_progress', 'supervisor_report_failure'].includes(name)) return true

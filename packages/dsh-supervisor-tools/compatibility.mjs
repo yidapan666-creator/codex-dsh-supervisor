@@ -18,6 +18,7 @@ export const EXPECTED_GATE_CAPABILITIES = Object.freeze([
   'direct-child-authority-v1',
   'strict-handoff-v1',
   'blocking-supervisor-review-v1',
+  'execution-lease-v1',
   'bearer-auth-v1',
 ])
 

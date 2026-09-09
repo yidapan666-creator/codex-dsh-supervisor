@@ -57,7 +57,7 @@ describe('Codex-to-DSH task instruction compiler', () => {
     expect(prompt).toContain('riskLevel')
     expect(prompt).toContain('BEFORE implementing')
     expect(prompt).toContain('supervisor_review')
-    expect(prompt).toContain('implement without asking again')
+    expect(prompt).toContain('bounded Host execution grant before implementation')
     expect(prompt).toContain('Routine milestones')
     expect(prompt).toContain('Standard/native tools')
     expect(prompt).toContain('generic steer are not approvals')

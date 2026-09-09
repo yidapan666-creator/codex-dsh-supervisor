@@ -1,3 +1,4 @@
+import { type ExecutionControlInput, type ExecutionState } from './execution-control.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { lstat, realpath, stat } from 'node:fs/promises'
 import { lstatSync, readFileSync, readdirSync } from 'node:fs'
@@ -812,6 +813,7 @@ export class GatewayManager {
       objective: input.objective,
       writerMode,
       supervisionMode,
+      ...supervisionMode === 'reviewed' ? { executionReviewContract: 'execution-lease-v1' as const } : {},
       ...terminalReviewContract === undefined ? {} : { terminalReviewContract },
       ...reviewWatchPaths === undefined ? {} : { reviewWatchPaths },
       executionBrief,
@@ -871,6 +873,7 @@ export class GatewayManager {
         objective: input.objective,
         writerMode,
         supervisionMode,
+        ...admittedPacket?.schemaVersion === 2 && admittedPacket.executionReviewContract !== undefined ? { executionReviewContract: admittedPacket.executionReviewContract } : {},
         ...admittedReviewContract === undefined ? {} : { terminalReviewContract: admittedReviewContract },
         ...reviewWatchPaths === undefined ? {} : { reviewWatchPaths },
         agentPreset,
@@ -1189,6 +1192,7 @@ export class GatewayManager {
     snapshot: Parameters<typeof deriveObservation>[0],
     connection: HostConnection,
   ): Promise<Observation> {
+    observation = await this.withExecutionAuthority(observation, snapshot, connection)
     if (observation.budget !== undefined) {
       const state = await connection.tokenBudgetState({
         schemaVersion: 1,
@@ -1298,6 +1302,12 @@ export class GatewayManager {
             observation = validated.observation
             observation = await this.validateRecoveryContinuation(connection, validated.snapshot, observation)
             this.sessionHosts.set(packet.sessionId, connection.baseUrl)
+            let executionAuthority
+            let executionAuthorityWarning: string | undefined
+            if (packet.executionReviewContract === 'execution-lease-v1') {
+              try { executionAuthority = await connection.executionControl({ sessionId: packet.sessionId, runId: packet.runId, action: 'status' }) }
+              catch { executionAuthorityWarning = 'Host execution authority unavailable; preserve run identity and reconcile before granting.' }
+            }
             let budget
             let budgetWarning: string | undefined
             if (observation.budget !== undefined) {
@@ -1322,6 +1332,8 @@ export class GatewayManager {
               workerState: observation.workerState,
               stage: observation.stage,
               asOfSeq: observation.asOfSeq,
+              ...executionAuthority === undefined ? {} : { executionAuthority },
+              ...executionAuthorityWarning === undefined ? {} : { executionAuthorityWarning },
               ...budgetWarning === undefined ? {} : { budgetWarning },
               ...packet.budget === undefined ? {} : {
                 tokenBudget: packet.budget,
@@ -1400,6 +1412,7 @@ export class GatewayManager {
       snapshot = validated.snapshot
       observation = validated.observation
       observation = await this.validateRecoveryContinuation(connection, snapshot, observation)
+      observation = await this.withExecutionAuthority(observation, snapshot, connection)
       if (input.afterAsOfSeq !== undefined && input.afterAsOfSeq > observation.asOfSeq) {
         throw new Error(`afterAsOfSeq ${String(input.afterAsOfSeq)} is ahead of observed asOfSeq ${String(observation.asOfSeq)}`)
       }
@@ -1463,6 +1476,36 @@ export class GatewayManager {
       throw new Error(`stale run ${runId}; active run is ${observation.runId}`)
     }
     return observation
+  }
+
+  async executionControl(input: ExecutionControlInput): Promise<ExecutionState> {
+    const connection = await this.locate(input.sessionId)
+    const snapshot = await connection.refreshSession(input.sessionId)
+    const observation = this.observationForRun(snapshot, input.sessionId, input.runId)
+    if (observation.runId !== input.runId || observation.failure?.stale) throw new Error('Execution control requires the exact current run')
+    if (input.action === 'record_review') {
+      const validated = await this.validateRunTreeCompletion(connection, snapshot, observation)
+      if (validated.observation.status !== 'COMPLETED' || validated.observation.asOfSeq !== input.asOfSeq) throw new Error('Independent review requires the exact validated worker completion boundary')
+    }
+    if (!['status', 'pause', 'record_review'].includes(input.action) && ['COMPLETED', 'FAILED'].includes(observation.status)) {
+      throw new Error('Terminal runs cannot acquire execution authority')
+    }
+    return connection.executionControl(input)
+  }
+
+  private async withExecutionAuthority(observation: Observation, snapshot: Parameters<typeof deriveObservation>[0], connection: HostConnection): Promise<Observation> {
+    const packet = parseTaskPacket(snapshot.events)
+    if (packet?.schemaVersion !== 2 || packet.executionReviewContract !== 'execution-lease-v1' || packet.runId !== observation.runId) return observation
+    const executionAuthority = await connection.executionControl({ sessionId: observation.sessionId, runId: observation.runId, action: 'status' })
+    // Preserve native questions, failures and terminal validation. This separate Host state is not a worker summary.
+    const paused = ['AWAITING_GRANT', 'PAUSED', 'EXPIRED', 'RESTARTED'].includes(executionAuthority.status)
+    if (paused && observation.decision?.timing !== 'immediate') {
+      const { wait: _wait, ...withoutTimeout } = observation
+      return { ...withoutTimeout, executionAuthority, status: 'SUPERVISOR_REQUIRED',
+        summary: 'Host execution authority is closed. Inspect the current phase and doneWhen; explicitly grant, revise or keep paused. No task redispatch is needed.',
+        decision: { ...observation.decision!, timing: 'immediate', audience: 'supervisor', action: 'REVIEW_WORKER_REQUEST', reasonCode: 'EXECUTION_AUTHORITY_REQUIRED' } }
+    }
+    return { ...observation, executionAuthority }
   }
 
   async steer(input: SessionAddress & { runId?: string | undefined; message: string }): Promise<Record<string, unknown>> {

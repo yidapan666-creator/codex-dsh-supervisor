@@ -65,14 +65,43 @@ function managerWith(api: FakeApi): GatewayManager {
         capabilities: [
           'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1',
           'run-tree-token-budget-v1', 'crash-durable-token-reservations-v1', 'host-git-baseline-v1',
-          'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'bearer-auth-v1',
+          'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'execution-lease-v1', 'bearer-auth-v1',
         ],
       }),
+      input => api.executionControl(input),
     ),
   })
   managers.push(manager)
   return manager
 }
+
+describe('execution authority through real Gateway/HostConnection and Host state machine', () => {
+  it('surfaces an omitted checkpoint and reconnects to the same held effect without redispatch', async () => {
+    const api = new FakeApi()
+    api.addRow('s1', { cwd: '/fixture', running: true, events: initial({ executionReviewContract: 'execution-lease-v1' }) })
+    const authority = api.executionAuthority
+    const abort = new AbortController()
+    const pending = authority.enter(packet.sessionId, packet.runId, Symbol(), abort.signal, async () => true)
+    const first = managerWith(api)
+    const observation = await first.wait({ sessionId: packet.sessionId, runId: packet.runId, timeoutMs: 300000 })
+    expect(observationSchema.parse(observation)).toMatchObject({ status: 'SUPERVISOR_REQUIRED', executionAuthority: { status: 'AWAITING_GRANT', generation: 0 } })
+    first.stopClients()
+    const replacement = managerWith(api)
+    expect(await replacement.recover({ sessionId: packet.sessionId, runId: packet.runId })).toMatchObject({ executionAuthority: { status: 'AWAITING_GRANT', generation: 0 } })
+    await replacement.executionControl({ sessionId: packet.sessionId, runId: packet.runId, action: 'grant', expectedGeneration: 0, phase: 'W1: reviewed implementation', paths: ['.'] })
+    expect(await pending).toBe(true)
+    await expect(replacement.executionControl({ sessionId: packet.sessionId, runId: packet.runId, action: 'grant', expectedGeneration: 0, phase: 'stale' })).rejects.toThrow('stale')
+    expect(api.promptCalls).toBe(0)
+  })
+
+  it('native Approve alone cannot mint an execution grant', async () => {
+    const api = new FakeApi()
+    await awaitSupervisorReview({ ask: async () => ({ answers: [{ id: 'q', selected: ['Approve'] }] }) }, {
+      sessionId: packet.sessionId, runId: packet.runId, category: 'approach', proposal: 'Implement W1.', rationale: 'Evidence supports this.'
+    }, { agent: {}, signal: new AbortController().signal }, 'q')
+    expect(await api.executionAuthority.inspect(packet.sessionId, packet.runId)).toMatchObject({ status: 'INVESTIGATING', generation: 0 })
+  })
+})
 
 describe('reviewed supervision across risk, progress and lifecycle boundaries', () => {
   it('rejects new reviewed PTC work before model selection or dispatch, while delegated PTC remains available', async () => {

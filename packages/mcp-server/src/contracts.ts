@@ -1,3 +1,4 @@
+import { executionStateSchema } from './execution-control.js'
 import { z } from 'zod'
 import { DECISION_CATEGORIES, DECISION_IMPACTS } from '@dsh-gate/decision-policy'
 
@@ -331,9 +332,11 @@ export const observationSchema = z.object({
   /** Worker-supplied verification claims, never proof of Codex independent acceptance. */
   finalReview: finalReviewSchema.optional(),
   acceptanceStatus: z.enum(['UNVERIFIED', 'PASSED', 'FAILED']).optional(),
+  executionAuthority: executionStateSchema.optional(),
   supervision: z.object({
     mode: supervisionModeSchema,
     terminalReview: z.enum(['STRUCTURED_EVIDENCE', 'INDEPENDENT_REQUIRED']),
+    executionReviewContract: z.literal('execution-lease-v1').optional(),
     terminalReviewContract: z.literal('criteria-v1').optional(),
   }).strict().optional(),
   blocker: z.string().max(HANDOFF_BLOCKER_LIMIT).optional(),
@@ -555,6 +558,7 @@ export const taskAdmissionReceiptSchema = z.object({
   objective: z.string().min(1).max(8_192),
   writerMode: z.enum(['writer', 'read_only']),
   supervisionMode: supervisionModeSchema,
+  executionReviewContract: z.literal('execution-lease-v1').optional(),
   terminalReviewContract: z.literal('criteria-v1').optional(),
   reviewWatchPaths: reviewWatchPathsSchema.optional(),
   agentPreset: z.enum(['standard', 'code']),
@@ -606,6 +610,7 @@ export const taskPacketV2Schema = z.object({
   writerMode: z.enum(['writer', 'read_only']),
   /** Durable supervision strength. Optional only for packets admitted before this field existed. */
   supervisionMode: supervisionModeSchema.optional(),
+  executionReviewContract: z.literal('execution-lease-v1').optional(),
   terminalReviewContract: z.literal('criteria-v1').optional(),
   reviewWatchPaths: reviewWatchPathsSchema.optional(),
   executionBrief: executionBriefSchema.optional(),

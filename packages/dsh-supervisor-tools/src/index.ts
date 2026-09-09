@@ -1,10 +1,12 @@
 /** DSH tools that make an external supervisor handoff explicit and durable. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createHash } from 'node:crypto'
+import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { renderPrompt, type PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+import { ExecutionAuthority, FileExecutionStore, EXECUTION_CONTRACT, effectCovered, registerExecutionRoute } from './execution-authority.js'
 import { admitArtifacts } from './artifacts.js'
 import { finalReviewError, reviewEvidenceError, type ReviewEvidence } from './review-evidence.js'
 import { allowedDuringReview, awaitSupervisorReview, reviewCheckpointPending, type ReviewQuestionChannel } from './review-checkpoint.js'
@@ -365,6 +367,8 @@ export function progressPayloadError(args: SupervisorProgressArgs): string | und
 type TaskIdentity = {
   supervisionMode?: unknown
   parentRunId?: unknown
+  executionReviewContract?: unknown
+  allowedScope?: unknown
   terminalReviewContract?: unknown
   reviewWorkstreams?: unknown
   schemaVersion: 1 | 2
@@ -379,6 +383,7 @@ type TaskIdentity = {
 type TaskIdentityBoundary = { identity: TaskIdentity; boundarySeq: number; boundaryTime?: number }
 
 interface RuntimeSessionHeader {
+  cwd?: string
   id: string
   createdAt?: number
   parentSession?: string
@@ -403,6 +408,7 @@ interface RuntimeAgent {
 }
 
 interface RuntimeToolExecution {
+  readonly signal: AbortSignal
   readonly name: string
   readonly arguments?: unknown
   readonly token: symbol
@@ -507,7 +513,9 @@ function latestTaskIdentityBoundary(
           return {
             identity: {
               schemaVersion: 2,
-              supervisionMode: value.supervisionMode,
+              supervisionMode: value.supervisionMode ?? (value.writerMode === 'read_only' ? 'delegated' : 'reviewed'),
+              executionReviewContract: value.executionReviewContract,
+              allowedScope: value.allowedScope,
               parentRunId: value.parentRunId,
               terminalReviewContract: value.terminalReviewContract,
               reviewWorkstreams: (value.executionBrief as { workstreams?: unknown } | undefined)?.workstreams,
@@ -1483,6 +1491,7 @@ export function supervisorReviewGuard(
   for (const root of sessions) {
     const boundaries = ownTaskBoundaries(root)
     const identity = boundaries.at(-1)?.identity
+    if (identity?.executionReviewContract === EXECUTION_CONTRACT) continue
     if (identity?.supervisionMode !== 'reviewed' || identity.runId === undefined
       || identity.sessionId !== root.header.id
       || !isDescendantOf(session.header, root.header.id, headers)) continue
@@ -1501,6 +1510,97 @@ export function supervisorReviewGuard(
     }
   }
   return undefined
+}
+
+/** Uses durable parent lineage and run windows; child task text cannot mint execution authority. */
+export function executionRoot(sessions: readonly RuntimeSession[], session: RuntimeSession): { root: RuntimeSession; identity: TaskIdentity } | undefined {
+  const headers = new Map(sessions.map(s => [s.header.id, s.header]))
+  for (const root of sessions) {
+    const identity = ownTaskBoundaries(root).at(-1)?.identity
+    if (root.header.parentSession !== undefined || identity?.executionReviewContract !== EXECUTION_CONTRACT || identity.supervisionMode !== 'reviewed'
+      || identity.runId === undefined || identity.sessionId !== root.header.id
+      || !isDescendantOf(session.header, root.header.id, headers)) continue
+    const runIds = new Set([identity.runId])
+    let parent = identity.parentRunId
+    while (typeof parent === 'string' && !runIds.has(parent)) {
+      runIds.add(parent)
+      parent = ownTaskBoundaries(root).find(b => b.identity.runId === parent)?.identity.parentRunId
+    }
+    if (session.header.id === root.header.id) return { root, identity }
+    const boundaries = ownTaskBoundaries(root)
+    // Child-authored task markers cannot establish a separate execution authority.
+    if ([...runIds].some(id => {
+      const index = boundaries.findIndex(b => b.identity.runId === id)
+      const boundary = boundaries[index]
+      return boundary !== undefined && session.events.some(e => e.type === 'user/message'
+        && e.seq >= (session.header.seedLength ?? 0)
+        && eventWithinRunWindow(e, boundary.boundaryTime, boundaries[index + 1]?.boundaryTime))
+    })) return { root, identity }
+  }
+  return undefined
+}
+
+function missingExecutionParent(sessions: readonly RuntimeSession[], session: RuntimeSession): string | undefined {
+  const headers = new Map(sessions.map(s => [s.header.id, s.header]))
+  const seen = new Set<string>()
+  let header = session.header
+  while (header.parentSession !== undefined) {
+    if (seen.has(header.id)) return header.id
+    seen.add(header.id)
+    const parent = headers.get(header.parentSession)
+    if (parent === undefined) return header.parentSession
+    header = parent
+  }
+  return undefined
+}
+
+async function attachExecutionParents(runtime: SupervisorRuntimeContext, session: RuntimeSession): Promise<void> {
+  const attempted = new Set<string>()
+  while (true) {
+    const parent = missingExecutionParent(runtime.sessions.list(), session)
+    if (parent === undefined) return
+    if (attempted.has(parent) || attempted.size >= 64 || runtime.apiProxy?.sessions.models === undefined) {
+      throw new Error('Execution ancestor authority unavailable; recover the Root before resuming its children')
+    }
+    attempted.add(parent)
+    const result = await runtime.apiProxy.sessions.models({ rpcId: `execution-parent:${parent}`, payload: { sessionId: parent } })
+    if (!result.result.ok) throw new Error('Execution ancestor authority unavailable; recover the Root before resuming its children')
+  }
+}
+
+export function executionAuthorityGuard(sessions: readonly RuntimeSession[], execution: RuntimeToolExecution, authority: ExecutionAuthority): string | undefined {
+  if (execution.agent === undefined) return undefined
+  if (missingExecutionParent(sessions, execution.agent.session) !== undefined) return 'dsh-gate:execution-ancestor-unavailable; recover Root authority before child execution'
+  const scope = executionRoot(sessions, execution.agent.session)
+  if (scope === undefined || allowedDuringReview(execution.name, execution.arguments, scope.root.header.id === execution.agent.session.header.id)
+    || (scope.root.header.id === execution.agent.session.header.id && execution.name === 'supervisor_handoff')) return undefined
+  return authority.permits(execution.token) ? undefined : 'dsh-gate:execution-authority-closed; a current durable supervisor phase grant is required'
+}
+
+export function installExecutionAuthority(runtime: SupervisorRuntimeContext, authority: ExecutionAuthority): void {
+  runtime.on('tools/pre-execute', async (execution, next) => {
+    const session = execution.agent?.session
+    if (session !== undefined) await attachExecutionParents(runtime, session)
+    const scope = session === undefined ? undefined : executionRoot(runtime.sessions.list(), session)
+    if (scope === undefined || allowedDuringReview(execution.name, execution.arguments, scope.root.header.id === session?.header.id)
+      || (scope.root.header.id === session?.header.id && execution.name === 'supervisor_handoff')) return next()
+    if (scope.identity.writerMode === 'read_only') return { kind: 'deny', reason: 'Read-only runs cannot acquire effect authority.' }
+    const admitted = await authority.enter(scope.root.header.id, scope.identity.runId!, execution.token, execution.signal,
+      async state => {
+        if (session?.header.cwd === undefined || scope.root.header.cwd === undefined) return false
+        if (await realpath(session.header.cwd) !== await realpath(scope.root.header.cwd)) return false
+        return effectCovered(state, scope.root.header.cwd, execution.name, execution.arguments)
+      })
+    if (!admitted) return { kind: 'deny', reason: 'Execution is outside the current phase grant or requires revision. Investigate and submit supervisor_review; do not retry the effect.' }
+    return next()
+  })
+  runtime.on('tools/result', execution => authority.finish(execution.token))
+  runtime.on('agent/request', async ({ agent, signal }, next) => {
+    await attachExecutionParents(runtime, agent.session)
+    const scope = executionRoot(runtime.sessions.list(), agent.session)
+    if (scope !== undefined) await authority.waitProvider(scope.root.header.id, scope.identity.runId!, signal)
+    return next()
+  })
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
@@ -1522,6 +1622,28 @@ export function apply(ctx: Context, config: Config = {}): void {
       approvalPolicy: runtime.approval.config.policy ?? 'ask',
     },
   }
+  const executionAuthority = new ExecutionAuthority(new FileExecutionStore())
+  installExecutionAuthority(runtime, executionAuthority)
+  ctx.effect(() => registerExecutionRoute(runtime.webServer, async command => {
+    // Attach an existing cold session through a read-only native resolver; never dispatch it.
+    if (!runtime.sessions.list().some(s => s.header.id === command.sessionId)) {
+      await runtime.apiProxy.sessions.models?.({ rpcId: `execution-status:${command.runId}`, payload: { sessionId: command.sessionId } })
+    }
+    const root = runtime.sessions.list().find(s => s.header.id === command.sessionId)
+    const identity = root === undefined ? undefined : ownTaskBoundaries(root).at(-1)?.identity
+    if (root?.header.parentSession !== undefined || identity?.runId !== command.runId || identity.sessionId !== command.sessionId
+      || identity.executionReviewContract !== EXECUTION_CONTRACT || identity.supervisionMode !== 'reviewed') throw new Error('Execution control requires the exact current reviewed Root run')
+    if (['grant', 'renew', 'revise'].includes(command.action)) {
+      const boundary = ownTaskBoundaries(root!).at(-1)!.boundarySeq
+      const terminal = root!.events.findLast(e => e.type === 'turn/end' && e.seq > boundary)
+      if (terminal !== undefined && !root!.events.some(e => e.type === 'turn/start' && e.seq > terminal.seq)) throw new Error('Terminal run cannot acquire new authority')
+    }
+    const scope = Array.isArray(identity.allowedScope) ? identity.allowedScope.filter((p): p is string => typeof p === 'string') : []
+    const control = () => executionAuthority.control(command, scope, identity.writerMode === 'writer')
+    if (command.action === 'record_review') return admission.recordTerminalReview(command.sessionId, command.runId, command.asOfSeq, control)
+    return control()
+  }), 'dsh-gate execution control route')
+  ctx.tools.guard(execution => executionAuthorityGuard(runtime.sessions.list(), execution as unknown as RuntimeToolExecution, executionAuthority))
   const recovery = new HostRecoveryCoordinator(admissionRuntime)
   const gitBaselines = new FileGitBaselineStore()
   const admission = new TaskAdmissionCoordinator(
@@ -1564,7 +1686,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       + 'Markdown report under `.dsh-handoff/<runId>/` inside the session cwd, include its relative path in '
       + '`artifacts`, and reference it from the concise summary. Keep the file list, verification claims, blocker, '
       + 'failure signature, hypotheses, and artifact manifest compact; their schemas are also bounded. '
-      + 'In reviewed mode, Request review only at a decision boundary: after investigation yields a nontrivial approach not already approved in the task packet; before changing a public interface, data/persistence/recovery contract or authority boundary; when new evidence invalidates the approved approach; or when a local repair must expand into a refactor or broader impact. If the packet already approves the approach and investigation confirms its assumptions, implement without asking again. Routine milestones and progress through an approved plan do not require review. Codex may explicitly request a checkpoint before affected implementation. Investigate enough to present a concrete decision, affected doneWhen, tradeoff and unresolved risk. Await `supervisor_review` before implementing such a decision. Approval is limited to the submitted proposal and existing permissions. Progress and generic guidance never release a review gate. Stop relevant child work before review; new execution is gated until explicit approval. After rejection/cancellation, submit a revised proposal. Reviewed runs require Standard/native tools; PTC review is rejected because its outer execution times out while waiting. Preserve existing run identity; do not downgrade or redispatch automatically. '
+      + 'In reviewed mode, Request review only at a decision boundary: after investigation yields a nontrivial approach not already approved in the task packet; before changing a public interface, data/persistence/recovery contract or authority boundary; when new evidence invalidates the approved approach; or when a local repair must expand into a refactor or broader impact. For executionReviewContract=execution-lease-v1, implementation always needs a Host-owned phase grant, including pre-approved approaches. Initial reads remain available. Submit supervisor_review after investigation; native question approval alone does not grant execution. Codex must issue dsh_execution_control with the current generation. Effects omitted from review wait at the Host before execution. Phase leases cover Root and children, expire after at most ten minutes or 64 effects, and are invalid after Host restart. A rejected grant must lead to investigation or a revised proposal, never repeated effect attempts. Routine milestones and progress through an approved plan do not require review. Codex may explicitly request a checkpoint before affected implementation. Investigate enough to present a concrete decision, affected doneWhen, tradeoff and unresolved risk. Await `supervisor_review` before implementing such a decision. Approval is limited to the submitted proposal and existing permissions. Progress and generic guidance never release a review gate. Stop relevant child work before review; new execution is gated until explicit approval. After rejection/cancellation, submit a revised proposal. Reviewed runs require Standard/native tools; PTC review is rejected because its outer execution times out while waiting. Preserve existing run identity; do not downgrade or redispatch automatically. '
       + 'Use `supervisor_progress` only for bounded milestone changes; it never ends the turn. When a decision is needed, '
       + 'include the structured decision category, impact, blocking state, request, options, and recommendation. '
       + 'For reviewed milestones include reviewEvidence: at most 8 criterion claims, 3 plan changes, 5 negative evidence items, and 8 workspace-relative evidence paths; each text/path is at most 256 characters. Always retain failure/not-run/uncertainty facts and explicitly count omitted entries. These are worker claims for independent inspection, not proof of acceptance. '
@@ -1611,7 +1733,18 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
       if (channel === undefined) throw new Error('supervisor_review requires the native user-questions channel; execution remains gated')
       const questionId = `dsh-review:${createHash('sha256').update(`${args.runId}:${exec.callId}`).digest('hex').slice(0, 24)}`
-      return awaitSupervisorReview(channel, args, { agent: exec.agent, signal: exec.signal }, questionId)
+      const generation = identity.executionReviewContract === EXECUTION_CONTRACT
+        ? await executionAuthority.proposal(args.sessionId, args.runId) : undefined
+      const result = await awaitSupervisorReview(channel, args, { agent: exec.agent, signal: exec.signal }, questionId)
+      if (generation !== undefined) {
+        const state = await executionAuthority.inspect(args.sessionId, args.runId)
+        if (!result.approved && state.status === 'GRANTED' && state.generation === generation + 1) {
+          await executionAuthority.control({ sessionId: args.sessionId, runId: args.runId, action: 'revise', expectedGeneration: state.generation }, [], identity.writerMode === 'writer')
+        }
+        result.approved = result.approved && state.status === 'GRANTED' && state.generation === generation + 1
+        result.feedback = result.approved ? 'Current bounded execution grant active.' : 'No matching current execution grant. Native question answers alone do not grant execution.'
+      }
+      return result
     },
   }))
 

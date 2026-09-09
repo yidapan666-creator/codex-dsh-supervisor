@@ -1,3 +1,4 @@
+import { executionControlInputSchema, executionStateSchema } from './execution-control.js'
 import { McpServer, type CallToolResult } from '@modelcontextprotocol/server'
 import { z } from 'zod'
 import {
@@ -134,6 +135,12 @@ export function createServer(manager = GatewayManager.fromEnvironment()): McpSer
     }),
     outputSchema: observationSchema,
   }, guarded(input => manager.wait(input)))
+
+  server.registerTool('dsh_execution_control', {
+    description: 'Host-owned reviewed execution control for exact Root sessionId + runId. Read status, then use expectedGeneration for mutations; after ambiguous results read status, never blindly replay. New reviewed tasks allow investigation but wait before first effect. grant requires a concrete phase, workspace-relative paths, and bounded leaseMs (max/default 600000) and maxEffects (max64/default32). Native question answers alone never grant. For supervisor_review: read proposal, issue grant, then answer its native question. renew keeps the same phase/capabilities after an evidence-based cadence judgment. pause durably closes new effects across Root/children; activeEffects is tracked calls only, not proof that spawned processes stopped. revise withdraws authority and lets a waiting effect return a denial so Root can investigate a correction. Opaque tools require full-cwd original scope and acknowledgeUnconfinedEffects=true: existing backend does not confine their indirect files/network/hooks. This acknowledgement does not expand user permissions. Never grant external or sensitive capabilities without existing user authority. After independently reviewing a validated completed result, record_review requires verdict ACCEPTED|REJECTED, exact asOfSeq and a compact evidence summary. It stores a supervisor declaration, never fabricated verification proof.',
+    inputSchema: executionControlInputSchema,
+    outputSchema: executionStateSchema,
+  }, guarded(input => manager.executionControl(input)))
 
   server.registerTool('dsh_steer', {
     description: 'Send explicit user guidance, or an evidence-backed engineering correction authorized by reviewed supervision within the original objective, scope, acceptance and permissions, to the active DSH root. Scope expansion, material unresolved architecture/acceptance changes and sensitive or external effects require human direction. Never use this to relay child completion/results, acknowledge settled children, wake root to take over child work, or synthesize supervisor nudges; DSH Host delivers child reports to root automatically.',

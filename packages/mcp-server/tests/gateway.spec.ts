@@ -32,9 +32,10 @@ function connected(api: FakeApi, baseUrl = 'http://host'): HostConnection {
       pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2,
       capabilities: [
         'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
-        'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'bearer-auth-v1',
+        'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'execution-lease-v1', 'bearer-auth-v1',
       ],
     }),
+    input => api.executionControl(input),
   )
   live.push(connection)
   return connection
@@ -55,7 +56,7 @@ const gateReady = async () => ({
   pluginVersion: '0.1.0', buildId: EXPECTED_GATE_BUILD_ID, workerProtocolVersion: 2 as const,
   capabilities: [
     'idempotent-admission-v1', 'durable-before-execute-v1', 'recovery-capsule-v1', 'run-tree-token-budget-v1',
-    'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'bearer-auth-v1',
+    'crash-durable-token-reservations-v1', 'host-git-baseline-v1', 'direct-child-authority-v1', 'strict-handoff-v1', 'blocking-supervisor-review-v1', 'execution-lease-v1', 'bearer-auth-v1',
   ],
 })
 
