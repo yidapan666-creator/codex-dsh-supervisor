@@ -6,11 +6,8 @@ The published npm package, CLI command, MCP/plugin package names, wire endpoints
 and state directories retain their existing `dsh-gate` identifiers for backward
 compatibility. The product and repository name are **Codex DSH Supervisor**.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dsh-gate-workflow-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/dsh-gate-workflow-light.svg">
-  <img alt="Codex DSH Supervisor workflow: Codex supervises a durable DSH Root through the gateway, receives five-minute progress observations, and reconnects to the same Host and session after a restart." src="docs/assets/dsh-gate-workflow-light.svg">
-</picture>
+Workflow diagrams: [system overview](docs/diagrams/dsh-supervision-workflow.html) ·
+[reviewed supervision control loop](docs/diagrams/reviewed-supervision-control-loop.html)
 
 The workspace contains:
 

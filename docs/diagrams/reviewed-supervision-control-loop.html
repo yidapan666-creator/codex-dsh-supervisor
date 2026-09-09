@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reviewed supervision — execution control loop</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --paper: #f5f5f5;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --accent: #eb6c36;
+      --sans: 'Geist', system-ui, sans-serif;
+      --serif: 'Instrument Serif', serif;
+      --mono: 'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { width: 100%; max-width: 1200px; }
+    .eyebrow {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      margin-bottom: 0.5rem;
+      text-transform: uppercase;
+    }
+    h1 {
+      color: var(--ink);
+      font-family: var(--serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin-bottom: 0.5rem;
+    }
+    .dek { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+    svg { display: block; min-width: 0; width: 100%; }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">Flowchart · Reviewed supervision</p>
+    <h1>Execution waits for evidence, authority, and independent acceptance</h1>
+    <p class="dek">A worker can propose work and report evidence; only the Host can release effects, and only Codex can record the final review.</p>
+
+    <svg viewBox="0 0 1200 1000" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="reviewed-supervision-control-loop-title reviewed-supervision-control-loop-desc">
+      <title id="reviewed-supervision-control-loop-title">Reviewed supervision execution control loop</title>
+      <desc id="reviewed-supervision-control-loop-desc">Flowchart showing a reviewed DSH run investigating, requesting approval, receiving a bounded Host execution lease, executing under observation, satisfying the Host completion gate, and receiving an independent Codex verdict, with revision and recovery loops.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- Main path first -->
+      <line x1="600" y1="72" x2="600" y2="104" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="600" y1="168" x2="600" y2="200" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="600" y1="264" x2="600" y2="296" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="600" y1="392" x2="600" y2="424" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <line x1="600" y1="488" x2="600" y2="520" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <line x1="600" y1="584" x2="600" y2="616" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="600" y1="712" x2="600" y2="744" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="600" y1="840" x2="600" y2="872" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+
+      <!-- Revision and recovery loops -->
+      <path d="M 480,344 H 336 Q 328,344 328,336 V 128 Q 328,120 336,120 H 480" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 720,664 H 904 Q 912,664 912,656 V 144 Q 912,136 904,136 H 720" fill="none" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <path d="M 480,792 H 256 Q 248,792 248,784 V 160 Q 248,152 256,152 H 480" fill="none" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <!-- Decision labels -->
+      <rect x="612" y="400" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="628" y="408" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">YES</text>
+      <rect x="400" y="324" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="428" y="332" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">REVISE</text>
+      <rect x="612" y="720" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="628" y="728" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">VALID</text>
+      <rect x="776" y="644" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="808" y="652" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">RECOVER</text>
+      <rect x="612" y="848" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="628" y="856" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PASS</text>
+      <rect x="320" y="772" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="356" y="780" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CORRECT</text>
+
+      <!-- Start -->
+      <rect x="500" y="24" width="200" height="48" rx="24" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <text x="600" y="52" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Reviewed run admitted</text>
+
+      <!-- Investigation -->
+      <rect x="480" y="104" width="240" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="488" y="112" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="504" y="120" fill="#2d3142" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">DSH</text>
+      <text x="600" y="132" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Investigate with known reads</text>
+      <text x="600" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">no execution authority yet</text>
+
+      <!-- Proposal -->
+      <rect x="480" y="200" width="240" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="488" y="208" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="504" y="216" fill="#2d3142" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">DSH</text>
+      <text x="600" y="228" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Submit concrete phase proposal</text>
+      <text x="600" y="248" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">Host state: AWAITING_GRANT</text>
+
+      <!-- Approval decision -->
+      <polygon points="600,296 720,344 600,392 480,344" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="576" y="304" width="48" height="12" rx="2" fill="#f5f5f5" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="600" y="312" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CODEX</text>
+      <text x="600" y="340" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Codex approves this</text>
+      <text x="600" y="356" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">bounded phase?</text>
+
+      <!-- Host lease -->
+      <rect x="480" y="424" width="240" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="488" y="432" width="40" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="508" y="440" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">HOST</text>
+      <text x="600" y="452" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Host grants execution lease</text>
+      <text x="600" y="472" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">paths · tools · ≤10 min · ≤64 effects</text>
+
+      <!-- Execute -->
+      <rect x="480" y="520" width="240" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="488" y="528" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="504" y="536" fill="#2d3142" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">DSH</text>
+      <text x="600" y="548" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Root + children execute</text>
+      <text x="600" y="568" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">5-min aggregate · high risk immediate</text>
+
+      <!-- Runtime completion gate -->
+      <polygon points="600,616 720,664 600,712 480,664" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="580" y="624" width="40" height="12" rx="2" fill="#f5f5f5" stroke="rgba(79,93,117,0.50)" stroke-width="0.8"/>
+      <text x="600" y="632" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">HOST</text>
+      <text x="600" y="652" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Host completion proof:</text>
+      <text x="600" y="668" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">handoff + turn end + children</text>
+      <text x="600" y="684" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">scope · budget · evidence</text>
+
+      <!-- Independent review -->
+      <polygon points="600,744 720,792 600,840 480,792" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="576" y="752" width="48" height="12" rx="2" fill="#f5f5f5" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="600" y="760" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CODEX</text>
+      <text x="600" y="780" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Codex inspects real changes</text>
+      <text x="600" y="796" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">and reruns critical checks?</text>
+      <text x="600" y="812" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CLAIMS ≠ ACCEPTANCE</text>
+
+      <!-- Accepted -->
+      <rect x="500" y="872" width="200" height="48" rx="24" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="600" y="900" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Record review · report result</text>
+
+      <!-- Legend -->
+      <line x1="24" y1="944" x2="1176" y2="944" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <text x="24" y="964" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.16em">LEGEND · SHAPE CARRIES TYPE</text>
+      <rect x="280" y="956" width="24" height="12" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <text x="312" y="968" fill="#4f5d75" font-size="8" font-family="'Geist', sans-serif">Start / outcome</text>
+      <rect x="440" y="956" width="24" height="12" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="472" y="968" fill="#4f5d75" font-size="8" font-family="'Geist', sans-serif">Action</text>
+      <polygon points="584,964 596,956 608,964 596,972" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="616" y="968" fill="#4f5d75" font-size="8" font-family="'Geist', sans-serif">Decision / proof gate</text>
+      <line x1="792" y1="964" x2="824" y2="964" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <text x="832" y="968" fill="#4f5d75" font-size="8" font-family="'Geist', sans-serif">Correction / recovery</text>
+    </svg>
+  </main>
+</body>
+</html>
