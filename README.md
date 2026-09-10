@@ -4,7 +4,7 @@ Let Codex supervise durable DeepSeek Harness (DSH) coding sessions through MCP�
 
 > The product and repository are **Codex DSH Supervisor**. The published package, CLI, MCP endpoints, and state directories retain the `dsh-gate` name for compatibility.
 
-[System workflow](docs/diagrams/dsh-supervision-workflow.html) · [Reviewed control loop](docs/diagrams/reviewed-supervision-control-loop.html) · [中文快速上手](docs/quickstart-zh.md) · [Deployment guide](DEPLOYMENT.md)
+[System workflow](docs/diagrams/dsh-supervision-workflow.svg) · [Reviewed control loop](docs/diagrams/reviewed-supervision-control-loop.svg) · [中文快速上手](docs/quickstart-zh.md) · [Deployment guide](DEPLOYMENT.md)
 
 ## Quick start
 
