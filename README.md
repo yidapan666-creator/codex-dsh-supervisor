@@ -1,154 +1,93 @@
 # Codex DSH Supervisor
 
-**Codex DSH Supervisor** lets Codex supervise long-running DeepSeek Harness sessions through MCP while keeping the DSH Host and sessions independent of the MCP process.
+Let Codex supervise durable DeepSeek Harness (DSH) coding sessions through MCP—with reconnect, bounded execution, token budgets, and independent completion checks.
 
-The published npm package, CLI command, MCP/plugin package names, wire endpoints,
-and state directories retain their existing `dsh-gate` identifiers for backward
-compatibility. The product and repository name are **Codex DSH Supervisor**.
+> The product and repository are **Codex DSH Supervisor**. The published package, CLI, MCP endpoints, and state directories retain the `dsh-gate` name for compatibility.
 
-Workflow diagrams: [system overview](docs/diagrams/dsh-supervision-workflow.html) ·
-[reviewed supervision control loop](docs/diagrams/reviewed-supervision-control-loop.html)
+[System workflow](docs/diagrams/dsh-supervision-workflow.html) · [Reviewed control loop](docs/diagrams/reviewed-supervision-control-loop.html) · [中文快速上手](docs/quickstart-zh.md) · [Deployment guide](DEPLOYMENT.md)
 
-The workspace contains:
-
-- `@dsh-gate/mcp-server`: eleven MCP tools over DSH's public network client and reconnect controller;
-- `@dsh-gate/supervisor-tools`: DSH-side handoff, artifact admission, reported-failure budget, and Host-enforced task-token guard;
-- `@dsh-gate/decision-policy`: dependency-free, explainable intervention policy with locked protocol invariants;
-- `@dsh-gate/rag-context`: standalone retrieval contracts, lexical baseline, and rank fusion; intentionally not connected to MCP or DSH;
-- `@dsh-gate/run-journal`: atomic, model-free terminal run records used as the durable source for future retrieval;
-- two narrow operator skills, example Codex/DSH configuration, and a deterministic bootstrap/doctor/Host workflow.
-
-## Choose a deployment path
-
-Normal users can install the matching checksummed GitHub Release, configure
-Codex, install the skill, start the independent Host, and run live doctor with:
+## Quick start
 
 ```sh
 npx @yidapan666/dsh-gate setup
 ```
 
-`npx` is the simplest path: it downloads and runs the current published CLI
-without permanently installing it. `npm install --global @yidapan666/dsh-gate`
-is optional and only saves the command locally; a global installation stays at
-its installed version until it is upgraded.
+The setup installs the matching release, configures Codex, installs the supervisor skill, starts the independent DSH Host, and runs a live health check. See [all installation and update options](docs/distribution.md).
 
-Published installers intentionally follow versioned releases, not the moving
-`main` branch. The npm CLI downloads the GitHub runtime with the same version;
-the offline kit contains that same version and its checksums. A source checkout
-uses whatever commit is checked out, so clone `main` for current development or
-check out a `vX.Y.Z` tag to reproduce a published release. Therefore all three
-paths provide the same product and workflow, but they contain byte-for-byte
-matching code only when they target the same release version. See the
-[version-channel table](docs/distribution.md#which-version-do-i-get).
+Then ask Codex naturally:
 
-For an offline or reviewed-artifact installation:
+> Use DSH in `/absolute/path/to/project` to fix the failing authentication tests. Use Standard mode with reviewed supervision, allow at most 3 direct child agents, enforce a 60000-token budget, open DSH Web, and report aggregated progress every five minutes.
 
-```sh
-npm exec --offline --yes \
-  --package ./yidapan666-dsh-gate-0.1.3.tgz -- \
-  dsh-gate setup --bundle ./dsh-gate-runtime-0.1.3-darwin-arm64-offline.tar.gz
-```
+The short form is also valid:
 
-See [distribution and lifecycle options](docs/distribution.md) for `upgrade`,
-`uninstall`, retained session state, and release construction.
+> Use DSH in `/absolute/path/to/project` to fix the failing authentication tests.
 
-## Source deployment
+Missing routine constraints are filled without another model call. Standard mode, full-workspace writer scope, focused-then-full verification, material-only escalation, and at most five direct children are the defaults.
 
-```sh
-pnpm bootstrap      # fetch the pinned DSH fork commit, build & link the exact
-                    # network client, install the supervisor plugin into an
-                    # isolated project-local DSH home, and create a private
-                    # Host credential under .dsh-state/ — never starts the Host
-pnpm run doctor     # verify pin, link, built artifacts, and plugin/profile
-pnpm host:start     # start the independent DSH Web Host on http://127.0.0.1:8080
-pnpm run doctor --live  # additionally verify the running Host identity/protocol
-```
+## Choose how DSH works
 
-Install the included Codex supervisor skill into the personal skill directory shown by your Codex installation, then restart Codex:
+| Choice | Best for | Constraint |
+| --- | --- | --- |
+| **Standard** (default) | Coding, fixes, and normal repository work | Supports reviewed or delegated supervision |
+| **PTC** | Broad read-only exploration and batchable searches | Delegated supervision only |
+| **Minimal / Creator** | — | Rejected because they cannot satisfy the safety contract |
+
+| Supervision | Codex involvement |
+| --- | --- |
+| **Reviewed** (default for writers) | Reviews material proposals, can pause/correct work, inspects the actual diff, and reruns relevant verification before acceptance |
+| **Delegated** (default for read-only work) | Observes on the five-minute cadence and validates structured terminal evidence against Host facts |
+
+## What it guarantees
+
+- The DSH Host and sessions survive MCP or Codex restarts and can be rediscovered without replaying the task.
+- A run is completed only after a valid supervisor handoff **and** its matching turn end; a turn end alone is never treated as success.
+- Writers are isolated by Git worktree and checked against their admitted path scope; parallel writers require separate worktrees.
+- Token budgets, child limits, execution leases, and read-only restrictions are enforced by the long-running Host—not only by prompt instructions.
+- Five-minute observations report bounded progress, project activity, verification outcomes, tool counts, and token deltas without forwarding raw reasoning or logs.
+
+<details>
+<summary><strong>Source development setup</strong></summary>
 
 ```sh
+pnpm bootstrap
+pnpm run doctor
+pnpm host:start
+pnpm run doctor --live
 pnpm skill:install -- --target /absolute/path/to/personal/skills
 ```
 
-The installer deliberately requires an explicit absolute target instead of guessing a global directory. Re-running with `--force` preserves the previous installation under the adjacent non-discoverable `skill-backups/codex-dsh-supervisor/` directory and migrates legacy sibling backups, so Codex sees only one active skill.
+Copy `config/codex-mcp.example.toml` into the matching Codex configuration and replace `<workspace-root>` with this checkout's absolute path. The MCP executable is `packages/mcp-server/dist/cli.js`.
 
-Then copy `config/codex-mcp.example.toml` into the matching Codex config and replace the `<workspace-root>` placeholder with this checkout's absolute path — the only machine-specific value. The server executable is `packages/mcp-server/dist/cli.js` — if an older config still points at `dist/index.js`, update it to `dist/cli.js` (the library entry does not start the MCP server). Codex MCP configuration supports stdio servers with command, args, environment, startup timeout, and tool timeout fields.
+The source checkout pins the public DSH fork at commit `68dd149a1834496ced7308de5a7084328855f13e`. Bootstrap verifies that exact compatibility seam and refuses a dirty or mismatched checkout. See [DEPLOYMENT.md](DEPLOYMENT.md) for prerequisites, lifecycle commands, updating the pin, and recovery.
 
-## Use it from Codex
+</details>
 
-You normally invoke Codex DSH Supervisor in natural language rather than calling its MCP tools yourself. For example:
+<details>
+<summary><strong>How the supervision loop works</strong></summary>
 
-> Use DSH in `/absolute/path/to/project` to fix the failing authentication tests. Use Standard mode with reviewed supervision, allow at most 3 direct child agents, enforce a 60000-token task budget, open DSH Web, and report aggregated progress every five minutes.
+1. Codex compiles one bounded task packet and admits it to one durable DSH Root.
+2. DSH investigates and, in reviewed mode, submits material implementation proposals for a blocking Codex decision.
+3. The Host grants only bounded execution phases and records durable identity, budget, lineage, and activity facts.
+4. Codex observes at five-minute boundaries or immediately on approvals, material risk, failure, or protocol events.
+5. Completion requires the worker handoff, matching turn end, Host checks, and Codex's independent diff and verification review.
 
-Supervision strength describes Codex responsibility; currently `reviewed` requires Standard/native tools, while PTC supports `delegated` only. PTC review is rejected before dispatch because its code runtime can time out while awaiting approval. Existing sessions are never silently switched or redispatched. `delegated` keeps ordinary work on the five-minute cadence and accepts bounded structured terminal evidence after reconciling it with Host facts. `reviewed` gives Codex active process responsibility: set technical direction before dispatch, approve or correct material proposals before implementation through a blocking `supervisor_review`, and judge continue/inspect/correct at each five-minute observation. It also surfaces worker-reported high/critical risk immediately and requires Codex to inspect the actual change set and independently rerun relevant verification before accepting a completed handoff. New reviewed runs start with investigation only; Host-owned phase grants bound implementation, pause applies to Root and children, and leases expire after at most ten minutes / 64 effects. Native question answers alone cannot grant execution. Writers default to `reviewed`; read-only runs default to `delegated`. The choice is pinned per run and survives MCP/Codex reconnect. New reviewed runs additionally require a complete final evidence table for every `doneWhen` before the Host accepts a completed handoff; missing or unresolved evidence must use a blocked/failed exit. Codex still independently checks that submission. Delegated runs do not require this table.
+Reconnect uses the durable `sessionId`, `runId`, request receipt, and observation cursor. Interrupted work resumes from a bounded recovery capsule; uncertain effects must be reconciled instead of blindly replayed. See the [protocol contract](docs/protocol.md).
 
-You may also say only: “Use DSH in `/absolute/path/to/project` to fix the failing authentication tests.” The model-free `engineering-v1` task compiler fills missing routine constraints, acceptance, focused-then-full verification, material-only escalation, full-workspace writer scope, and a default maximum of 5 direct children. Explicit values always win, and this compilation consumes no extra model call.
+</details>
 
-For a multi-part request, Codex also compiles one bounded `executionBrief` in its current reasoning turn: 1–5 cohesive workstreams with real dependency edges, observable completion conditions, child-candidate hints, and explicit Root integration duties. Shared files/interfaces stay together, raw conversation and tool data are excluded, and the complete brief is admitted once to one Root. DSH Root chooses the useful child fanout and remains responsible for integration. An atomic request uses an explicit `SINGLE_STREAM_FALLBACK`; multiple writer Roots still require independent worktrees.
+<details>
+<summary><strong>Packages, release model, and advanced components</strong></summary>
 
-Omit the mode for ordinary work and Codex defaults to Standard. Ask for PTC mode when the task is dominated by broad repository exploration, independent reads/searches, or batchable tool sequences. A Root keeps its preset for its entire durable session; changing mode means creating a different Root. See the [Chinese quickstart](docs/quickstart-zh.md) for copyable Standard, PTC, continuation, and reconnect examples.
+- `@dsh-gate/mcp-server` — MCP gateway, reconnect, observation, and control tools.
+- `@dsh-gate/supervisor-tools` — Host-side admission, handoff, Git scope, budget, and execution enforcement.
+- `@dsh-gate/decision-policy` — versioned intervention policy with explain, dry-run, and shadow evaluation.
+- `@dsh-gate/run-journal` — bounded, atomic, model-free terminal run records.
+- `@dsh-gate/rag-context` — standalone retrieval contracts and ranking baseline; not connected to live supervision.
 
-For the full operator guide — prerequisites, the compatibility contract and update policy, Host independence, browser visibility, clean failure recovery, and the official-upstream-PR limitation — read **`DEPLOYMENT.md`**.
+Only the thin `@yidapan666/dsh-gate` installer is published to npm. It downloads an immutable, checksummed GitHub Release. npm, offline bundles, and source installs provide the same workflow when they target the same version; pushing `main` alone does not publish a release.
 
-## The pinned DSH fork commit
+</details>
 
-`@dsh-gate/mcp-server` imports `@deepseek-ai/dsh-client-connection/network-client`, the generic network-client and reconnect-controller exports. Those exports are not part of any published DSH release; they are consumed from the public fork at exactly one commit:
+## Documentation
 
-- fork: `https://github.com/yidapan666-creator/deepseek-harness.git`
-- commit: `68dd149a1834496ced7308de5a7084328855f13e`
-
-The **commit SHA is the compatibility contract** — bootstrap fetches by SHA (never a moving branch), doctor refuses a checkout whose `HEAD` differs or whose remote does not identify the fork, and a dirty checkout is refused without destructive recovery. The link itself is created by the existing `scripts/link-local-dsh.mjs`, reused by bootstrap; it is local-only, and no machine path is committed into package metadata. `dist/cli.js` probes the seam first and prints a clear diagnostic instead of a raw module-resolution error when it is missing.
-
-To update the pin: change `DSH_PINNED_COMMIT` in `scripts/dsh-gate-lib.mjs`, remove `.dsh-state/dsh`, and re-run `pnpm bootstrap`. See `DEPLOYMENT.md` for the policy and for why the fork commit is not claimed as an upstream merge.
-
-## Supervision cadence
-
-`dsh_wait` runs a five-minute aggregated progress cadence: by default it returns about one observation every 300000 ms, and it returns early only when the decision outcome says `timing=immediate`. Terminal states, approval/question, checkpoint, blocker, escalation, and Host/protocol failure are locked protocol boundaries. Worker decision requests carry structured category/impact/blocking facts and are evaluated by the versioned decision policy; low-impact non-blocking requests may stay in the cadence, while sensitive or unauthorized decisions surface immediately. Every observation includes the matched decision action and reason. Ordinary mux event churn is folded from memory and never triggers one HTTP history refresh per event; reconciliation is periodic and mandatory before a visible boundary. Each cadence observation aggregates progress since the previous `asOfSeq` — step delta, tool counts, token deltas — plus a compact, bounded `projectActivity` summary of distinct project files touched by successful recognized edits/writes and targeted verification commands. Activity says whether instrumentation coverage is `complete` or `partial`, and verification evidence reports event-correlated outcomes separately from worker handoff claims. No raw reasoning, logs, diffs, tool arguments, or tool outputs are ever included.
-
-When several Host URLs are configured, reconnect by `sessionId` discovers the existing session and binds the run to that Host. Connection failures are returned as structured `HOST_FAILED` envelopes instead of being flattened into “session not found.” Approval and question answers must echo the current stable `rpcId`, so a replayed or replaced interaction cannot be answered accidentally.
-
-DSH session identity and supervised execution identity are separate. Creating through `dsh_start_or_connect` requires the target project's absolute `cwd`; the gateway resolves it, verifies that it is an existing directory, and sends the canonical path to the Host so the DSH Web session shows the intended workspace. Creation also fixes one qualified agent preset for the durable session: `standard` by default or `code` (the Web UI's PTC mode). PTC's nested SDK calls are folded from DSH's existing durable `tool/code-dispatch-start` / `tool/code-dispatch` records, so strict handoff validation, tool/activity telemetry, and uncertain-effect recovery keep the same semantics as native calls. `minimal` is rejected because its reduced composition cannot guarantee dsh-gate's hard read-only boundary; `cordis`/Creator is rejected because it grants Host-runtime and preset-authoring authority outside ordinary project scope. Unknown custom presets fail closed until qualified. Reconnecting preserves the session's authoritative cwd and preset and rejects a conflicting requested value. The call returns the durable `sessionId` and effective `agentPreset`; every `dsh_task` returns a new UUID `runId`. Wait, answer, steer, cancel, child-observation, and interrupt calls carry both values, so a delayed control for an older run is rejected before it can affect a newer turn in the same session.
-
-Every new dispatch can also carry a caller-minted UUID `requestId`. The Host supervisor plugin serializes admission per session, commits the task into DSH's durable inbox, and returns a stable `runId` receipt. If the MCP response is lost, retrying the exact payload with the same id returns that receipt without queueing the objective twice; reusing the id with a different payload is rejected. A new supervised task is rejected while the session is already running, so an uncommitted next-turn queue can never masquerade as an admitted task. After broader context loss, `dsh_runs` rediscovers root runs from DSH's authoritative sessions and `dsh_recover` reattaches without prompt replay. If a Host restart durably interrupts the active turn, recovery also returns a model-free `recoveryCapsule` capped at 16 KiB. It contains the last accepted Root progress plus bounded baseline, compact project activity, token/budget evidence, and session-scoped `uncertainEffects` folded across the complete affiliated run tree. Tool arguments, outputs, source text, and transcripts are never copied. A continuation must carry both the exact capsule and its `parentRunId`; admission refreshes Host history, proves that the parent is the current interrupted run for that session, recomputes the capsule, and rejects missing, fabricated, stale, cross-session, or child-incomplete evidence before the provider is called. The worker reconciles every uncertain effect and never blindly replays it.
-
-Bootstrap also installs the repository's `dsh-supervised-worker` skill into the isolated `DSH_HOME/skills` catalog. Every admitted task includes DSH's native `/dsh-supervised-worker` gesture, so the Host loads the exact worker contract before the model acts instead of relying on a name mentioned in prose. Doctor and Host startup fail closed when that installed copy is missing or stale.
-
-Writer check-and-admit is atomic in the long-running Host across separate Codex and MCP clients. The critical section scans both attached agents and cold persisted sessions before committing the durable inbox insertion, so an MCP restart or an unloaded Root cannot hide an existing owner. A writer must target a Git worktree. Before its worker can start, the Host independently captures and fsyncs the actual HEAD plus fingerprints of pre-existing dirty paths; it does not trust a caller-reported baseline. `allowedScope`, when supplied for a writer, is interpreted as non-empty workspace-relative path prefixes (`.` means the full session cwd); traversal and absolute paths are rejected. A completed writer handoff recomputes committed and uncommitted task-era changes, checks both sides of renames and executable-bit changes, and independently observes Git-ignored files instead of treating `.gitignore` as a permission grant. Only the explicitly configured Host runtime-state tree and the separately bounded handoff-artifact scanner are excluded from that ignored-file pass. Unchanged user dirt is preserved, while any task-era path outside the allowed prefixes or session cwd rejects completion. A `read_only` admission durably applies DSH's native `sandbox/mode=read-only` together with `approval/policy=never`; filesystem tools and sandboxed commands cannot write or obtain a one-shot elevation, and DSH children inherit the restriction. Writer admission applies `workspace-write` but never broadens the deployment/session approval policy. A deployment configured with more than one Host rejects writer tasks because those Hosts do not share admission authority; read-only work and reconnect discovery still support multiple Hosts. Parallel writers use independent Git worktrees, not a second workspace lock service.
-
-`authority.maxDirectChildren` is also Host-enforced, not merely prompt advice. Before a configured child-start tool runs, the plugin atomically counts persisted direct children created in this run plus concurrent start reservations. Calls inside the cap proceed without another supervisor question; an over-limit call is denied, and failed starts release their slot. Both bundled child tools (`subagent` and `subagent_fork`) are guarded, and DSH's native `maxDepth: 1` forbids grandchildren; renamed or additional child tools belong in the plugin's `directChildToolNames` configuration. DSH root keeps orchestration ownership throughout.
-
-An optional `tokenBudget.maxTokens` (or deployment default `DSH_DEFAULT_TASK_TOKEN_BUDGET`) is fixed in the durable task packet and enforced inside the independent Host across the root/descendant run tree. The Host atomically reserves each request before dispatch: DSH's token meter estimates the complete input envelope (surface, system prompt, and tools), concurrent requests cannot reserve the same remaining budget, and `maxTokens` is capped to the unreserved output allowance (`maxReservedOutputTokensPerRequest`, 8192 by default). Each reservation is first fsynced as its own Host-private ledger record under `DSH_GATE_RESERVATION_DIR` (defaulting below the isolated `DSH_HOME`), so a Host crash cannot erase in-flight budget. Restart reconciliation retains a reservation only when the durable session reached an open request step without durable usage or a terminal step boundary; a record written before DSH's provider checkpoint is reclaimed without charging the run. If even the next input cannot fit, the Host makes no provider call and returns `token-budget-request-rejected` with used, remaining, and required-input figures; this is distinct from an already consumed `token-budget-exhausted` state. Provider-reported disjoint uncached-input, cache-read, cache-write, and output buckets settle admitted reservations only after their session event is durably flushed; a failed flush leaves the reservation charged. Cost estimation is deliberately excluded. This is a reliable cutoff, not a mathematically exact provider-billing cap: final total may cross the limit by tokenizer-estimation or provider-reporting variance, but no longer by multiple concurrent agents or a Host restart each claiming the same remaining allowance. Spawn, fork, nested, and later continuable-child activations are affiliated from DSH's existing durable lineage and accepted-work boundaries, so affiliation adds no model prompt or token charge. Fork seed usage is excluded, streaming/final samples use replacement semantics, and persisted cold descendants are reconciled before every model step and request. Budgeted waits, recovery, and run discovery read the same Host-owned durable run-tree fold and expose cumulative buckets plus counted sessions without a model call. `DSH_USAGE_MONITOR_URL` optionally reads the existing `dsh-usage-monitor` `/api/sessions` bridge for session-lifetime root comparison only; missing rows and monitor downtime are distinct, descendants are not included, and those readings never control the budget.
-
-Decision rules live as immutable, versioned JSON files under `config/decision-policies/`. New runs pin the active policy version plus its canonical SHA-256 digest in the durable task packet; an optional shadow policy is pinned the same way but never controls timing or action. After an MCP restart the gateway resolves the pinned version from the catalog and fails closed if the file is missing or changed. To inspect a decision without running DSH, build once and run `pnpm policy:explain -- --policy config/decision-policies/2026-08-26.v1.json --facts '{"signal":"WORKER_DECISION","category":"information","impact":"low","blocking":false}'`; add `--shadow <file>` for an observer-only comparison. `dry-run` is an equivalent CLI command. The legacy `DSH_DECISION_POLICY_JSON` input remains migration-only; file configuration is preferred.
-
-The queued prompt starts with the human-readable objective and embeds the durable task packet afterward. This keeps protocol validation unchanged while making new supervised sessions recognizable by task name in the DSH Web sidebar.
-
-Bootstrap creates a 256-bit credential at `.dsh-state/host/auth.token` with mode `0600`. The independent Host requires it on every API and WebSocket carrier, and MCP reads it directly from `DSH_HOST_TOKEN_FILE`; neither process prints it. `dsh_start_or_connect` returns a `browserUrl` whose URL fragment lets the local Web client authenticate without sending the credential in the initial HTTP request. Remote Host URLs must use HTTPS; plaintext HTTP is accepted only for loopback.
-
-Always open that exact `browserUrl`: its origin identifies the Host and its fragment authenticates the browser. A bare URL, a default port substituted for the returned port, or a tab from another Host must never be interpreted as an empty session list. The supervisor plugin displays an explicit authentication guard in those cases, and the Codex skill verifies that the newly admitted session is visible before treating Web observability as healthy.
-
-## Long handoff details
-
-`supervisor_handoff.summary` is capped at 2048 characters. File lists (64), verification claims (32), attempted hypotheses (16), artifacts (16), and every model-facing string are bounded too; Host-side input validation rejects overflow, while the MCP fold defensively caps malformed or legacy output and reports the affected fields in `handoffTruncated`. When a task needs a longer report, write it as Markdown under `.dsh-handoff/<runId>/` (legacy v1: taskId) inside the session cwd, pass the relative path in `artifacts`, and reference it from the concise summary. The directory is gitignored. After artifact confinement succeeds, only the exact admitted files inside that run-specific directory are exempted from the writer's ordinary code `allowedScope`; unlisted files, another run's artifacts, and arbitrary paths remain subject to the normal scope check. The handoff tool never writes handoff data itself — in particular, never to `~/.codex` or any other global directory. Artifact admission enforces containment: relative paths only, no traversal, symlinks, hardlinks, or non-regular files, hashed through a validated handle within the session cwd.
-
-## Model-free run journal
-
-At a durable run terminal state, the gateway writes one atomic JSON record under `.dsh-state/memory/runs/`. It reuses the bounded task objective (which may contain user-supplied text), accepted handoff, runtime project activity, verification, failure kind, and bounded decision history; it never calls a model (`modelCallsUsed: 0`) and never records heartbeat narration, reasoning, tool arguments, tool outputs, transcripts, or later chat/steer message bodies. Concurrent terminal writers publish with no-overwrite atomic creation, repeated terminal waits reuse the same run-id record, and the library exposes bounded cursor pages. Default retention is 10,000 records, 180 days, and 256 MiB; deployments can lower these with `DSH_RUN_JOURNAL_MAX_RECORDS`, `DSH_RUN_JOURNAL_MAX_AGE_DAYS`, and `DSH_RUN_JOURNAL_MAX_BYTES`. A journal write failure is reported as a warning on the observation and never changes the DSH outcome. Durable Host failures with a corresponding `turn/end` are recorded; temporary connectivity/protocol failures and stale-run requests are not.
-
-## Release status
-
-The runtime workspace packages remain private implementation details; only the
-thin `@yidapan666/dsh-gate` installer is publishable. It downloads
-immutable GitHub Release bundles carrying the exact public-fork seam, so users
-do not depend on an unpublished upstream network-client package. npm
-publication uses the package's OIDC Trusted Publisher binding for this exact
-repository and `release.yml`. The workflow publishes only after every release
-build and clean-install E2E passes, and only for a pushed `v*` tag.
-
-The public fork pin at `68dd149a1834496ced7308de5a7084328855f13e`
-makes both source and Release deployments reproducible; it is not claimed as an
-upstream merge.
-
-Source installation, build, tests, packaging checks, and the protocol contract are covered by the documented verification workflow.
-
-See `docs/protocol.md` for state semantics, `docs/decision-policy-and-rag-research.md` for the intervention-policy design and unconnected RAG roadmap, `docs/manual-e2e.md` for the acceptance path, `docs/benchmark.md` for the evaluation design, `docs/source-provenance.md` for source and license traceability, and `docs/source-backed-reuse-review.md` for the historical design review. For contributors: `CONTRIBUTING.md`. For vulnerability reporting: `SECURITY.md`.
+[Deployment](DEPLOYMENT.md) · [Distribution](docs/distribution.md) · [Protocol](docs/protocol.md) · [Chinese quickstart](docs/quickstart-zh.md) · [Manual E2E](docs/manual-e2e.md) · [Decision policy and RAG research](docs/decision-policy-and-rag-research.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
